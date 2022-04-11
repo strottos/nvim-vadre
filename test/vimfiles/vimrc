@@ -1,0 +1,15 @@
+syntax on
+let vadre_path = expand('<sfile>:p:h:h:h')
+let vader_path = expand(expand('<sfile>:p:h:h:h:h') . '/vader.vim')
+let &rtp=vadre_path . ',' . vader_path
+set nocompatible
+set tabstop=4
+set softtabstop=4
+set shiftwidth=4
+set expandtab
+set backspace=2
+set nofoldenable
+set foldmethod=syntax
+set foldlevelstart=10
+set foldnestmax=10
+set ttimeoutlen=0
