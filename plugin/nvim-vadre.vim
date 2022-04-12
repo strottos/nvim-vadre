@@ -53,10 +53,15 @@ endfunction
 
 function! s:configureCommands()
     command! VadrePing :call s:ping()
+    command! -nargs=* -complete=file VadreDebug call s:launch(<f-args>)
 endfunction
 
 function! s:ping()
     echom rpcrequest(s:vadreJobId, "ping")
+endfunction
+
+function! s:launch(...)
+    echom rpcrequest(s:vadreJobId, "launch", a:000)
 endfunction
 
 " Initialize RPC
