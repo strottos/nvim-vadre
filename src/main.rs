@@ -6,7 +6,7 @@ use std::{
     collections::HashMap,
     env::{self, consts::EXE_SUFFIX},
     error::Error,
-    fmt::Debug,
+    fmt::{Debug, Display},
     path::Path,
     process::Stdio,
     sync::{
@@ -23,11 +23,14 @@ use nvim_rs::{
 use reqwest::Url;
 use tokio::{
     io::Stdout,
-    net::TcpStream,
+    net::{
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+        TcpStream,
+    },
     process::{Child, Command},
     sync::Mutex,
 };
-use util::get_debuggers_dir;
+use util::{get_debuggers_dir, ret_err};
 
 static VADRE_NEXT_INSTANCE_NUM: AtomicUsize = AtomicUsize::new(1);
 
@@ -55,9 +58,54 @@ impl VadreWindowType {
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum VadreBufferType {
+    Code,
+    Logs,
+}
+
 #[derive(Clone, Debug)]
 enum VadreDebugger {
     CodeLLDB,
+}
+
+#[derive(Clone, Debug)]
+enum VadreLogLevel {
+    CRITICAL,
+    // ERROR,
+    // WARN,
+    INFO,
+    DEBUG,
+}
+
+impl VadreLogLevel {
+    fn log_level(&self) -> u8 {
+        match self {
+            VadreLogLevel::CRITICAL => 1,
+            VadreLogLevel::INFO => 4,
+            VadreLogLevel::DEBUG => 5,
+        }
+    }
+
+    fn should_log(&self, level: &str) -> bool {
+        let level = match level.to_ascii_uppercase().as_ref() {
+            "CRITICAL" => 1,
+            "INFO" => 4,
+            "DEBUG" => 5,
+            _ => match level.parse::<u8>() {
+                Ok(x) => x,
+                Err(_) => 5,
+            },
+        };
+
+        self.log_level() <= level
+    }
+}
+
+impl Display for VadreLogLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
 }
 
 #[derive(Clone)]
@@ -65,7 +113,7 @@ struct NeovimVadreWindow {
     neovim: Neovim<Compat<Stdout>>,
     instance_id: usize,
     windows: HashMap<VadreWindowType, Window<Compat<Stdout>>>,
-    buffers: HashMap<VadreWindowType, Buffer<Compat<Stdout>>>,
+    buffers: HashMap<VadreBufferType, Buffer<Compat<Stdout>>>,
 }
 
 impl NeovimVadreWindow {
@@ -78,7 +126,7 @@ impl NeovimVadreWindow {
         }
     }
 
-    async fn create_ui(&mut self) -> Result<()> {
+    pub async fn create_ui(&mut self) -> Result<()> {
         let eventignore_old = self.neovim.get_var("eventignore").await;
         self.neovim.set_var("eventignore", "all".into()).await?;
 
@@ -112,7 +160,7 @@ impl NeovimVadreWindow {
         self.set_vadre_buffer(&buffer, VadreWindowType::Code)
             .await?;
         self.windows.insert(VadreWindowType::Code, window);
-        self.buffers.insert(VadreWindowType::Code, buffer);
+        self.buffers.insert(VadreBufferType::Code, buffer);
 
         // Window 2 is output
         let window = windows.next().unwrap();
@@ -120,14 +168,64 @@ impl NeovimVadreWindow {
         self.set_vadre_buffer(&buffer, VadreWindowType::Output)
             .await?;
         window.set_height(output_window_height).await?;
+
         self.windows.insert(VadreWindowType::Output, window);
-        self.buffers.insert(VadreWindowType::Output, buffer);
+        self.buffers.insert(VadreBufferType::Logs, buffer);
+
+        // Special first log line to get rid of the annoying
+        self.log_msg(VadreLogLevel::INFO, "Vadre Setup UI").await?;
 
         match eventignore_old {
             Ok(x) => self.neovim.set_var("eventignore", x).await?,
             Err(_) => self.neovim.set_var("eventignore", "".into()).await?,
         };
         self.neovim.command("doautocmd User VadreUICreated").await?;
+
+        Ok(())
+    }
+
+    pub async fn log_msg(&self, level: VadreLogLevel, msg: &str) -> Result<()> {
+        match self.neovim.get_var("vadre_log_level").await {
+            Ok(x) => {
+                if !level.should_log(x.as_str().unwrap()) {
+                    return Ok(());
+                }
+            }
+            Err(_) => {}
+        };
+
+        let buffer = self
+            .buffers
+            .get(&VadreBufferType::Logs)
+            .expect("Logs buffer not found, have you setup the UI?");
+
+        let datetime = chrono::offset::Local::now();
+
+        let msgs = msg
+            .split("\n")
+            .map(move |msg| format!("{} [{}] {}", datetime.format("%a %H:%M:%S%.6f"), level, msg))
+            .collect();
+
+        // Annoying little hack for first log line
+        if buffer.get_lines(0, 1, true).await?.get(0).unwrap() == "" {
+            self.write_to_window(&buffer, 0, 1, msgs).await?;
+        } else {
+            self.write_to_window(&buffer, -1, -1, msgs).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn write_to_window(
+        &self,
+        buffer: &Buffer<Compat<Stdout>>,
+        start_line: i64,
+        end_line: i64,
+        msgs: Vec<String>,
+    ) -> Result<()> {
+        buffer.set_option("modifiable", true.into()).await?;
+        buffer.set_lines(start_line, end_line, false, msgs).await?;
+        buffer.set_option("modifiable", false.into()).await?;
 
         Ok(())
     }
@@ -187,8 +285,9 @@ struct Debugger {
     command: String,
     command_args: Vec<String>,
     neovim_vadre_window: NeovimVadreWindow,
-    process: Arc<Mutex<Option<Child>>>,
-    tcp_conn: Arc<Mutex<Option<TcpStream>>>,
+    process: Arc<Option<Child>>,
+    read_conn: Arc<Option<OwnedReadHalf>>,
+    write_conn: Arc<Option<OwnedWriteHalf>>,
 }
 
 impl Debugger {
@@ -207,39 +306,46 @@ impl Debugger {
             command,
             command_args,
             neovim_vadre_window,
-            process: Arc::new(Mutex::new(None)),
-            tcp_conn: Arc::new(Mutex::new(None)),
+            process: Arc::new(None),
+            read_conn: Arc::new(None),
+            write_conn: Arc::new(None),
         }
     }
 
     #[tracing::instrument(skip(self))]
     async fn setup(&mut self) -> VadreResult {
-        self.neovim_vadre_window
-            .create_ui()
-            .await
-            .expect("Expected UI to setup correctly");
+        ret_err!(
+            self.neovim_vadre_window.create_ui().await,
+            "Error setting up Vadre UI"
+        );
 
         let port = util::get_unused_localhost_port();
 
-        tracing::debug!(
-            "Launching following process with lldb: {:?} -- {:?}",
-            self.command,
-            self.command_args,
+        ret_err!(self.launch(port).await, "Error launching process");
+        ret_err!(
+            self.tcp_connect(port).await,
+            "Error creating TCP connection to process"
+        );
+        ret_err!(self.init_process().await, "Error initialising process");
+        ret_err!(
+            self.neovim_vadre_window
+                .log_msg(VadreLogLevel::INFO, "CodeLLDB launched and setup")
+                .await
         );
 
-        if let Err(e) = self.launch(port).await {
-            return Err(format!("Error launching process: {}", e).into());
-        };
-
-        if let Err(e) = self.tcp_connect(port).await {
-            return Err(format!("Error creating TCP connection to process: {}", e).into());
-        };
-
-        Ok(Value::from("process launched"))
+        Ok(Value::from("CodeLLDB launched and setup"))
     }
 
     #[tracing::instrument(skip(self, port))]
-    async fn launch(&self, port: u16) -> Result<()> {
+    async fn launch(&mut self, port: u16) -> Result<()> {
+        let msg = format!(
+            "Launching process {:?} with lldb and args: {:?}",
+            self.command, self.command_args,
+        );
+        self.neovim_vadre_window
+            .log_msg(VadreLogLevel::DEBUG, &msg)
+            .await?;
+
         self.download_plugin().await?;
 
         let mut path = get_debuggers_dir()?;
@@ -253,7 +359,7 @@ impl Debugger {
         }
 
         tracing::trace!("Spawning processs {:?}", path);
-        *self.process.lock().await = Some(
+        self.process = Arc::new(Some(
             Command::new(path)
                 .args(["--port", &port.to_string()])
                 .stdin(Stdio::piped())
@@ -261,21 +367,35 @@ impl Debugger {
                 .stderr(Stdio::piped())
                 .spawn()
                 .expect("Failed to spawn debugger"),
-        );
-        tracing::trace!("Spawned");
+        ));
+        self.neovim_vadre_window
+            .log_msg(VadreLogLevel::DEBUG, "Process spawned".into())
+            .await?;
 
         Ok(())
     }
 
     #[tracing::instrument(skip(self, port))]
-    async fn tcp_connect(&self, port: u16) -> Result<()> {
+    async fn tcp_connect(&mut self, port: u16) -> Result<()> {
         tracing::trace!("Connecting to port {}", port);
 
         let tcp_conn = TcpStream::connect(format!("127.0.0.1:{}", port)).await?;
-        *self.tcp_conn.lock().await = Some(tcp_conn);
+        let (read_conn, write_conn) = tcp_conn.into_split();
+        self.read_conn = Arc::new(Some(read_conn));
+        self.write_conn = Arc::new(Some(write_conn));
 
-        tracing::trace!("Connected successfully");
+        self.neovim_vadre_window
+            .log_msg(
+                VadreLogLevel::DEBUG,
+                "Process connection established".into(),
+            )
+            .await?;
 
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn init_process(&mut self) -> Result<()> {
         Ok(())
     }
 
@@ -327,7 +447,12 @@ impl Debug for Debugger {
 
 #[derive(Clone, Debug)]
 struct NeovimHandler {
-    debuggers: Arc<Mutex<HashMap<usize, Debugger>>>,
+    // Having two mutexes in one entry sure isn't nice, but without this it's difficult to get
+    // mutable references to either with the way nvim_rs::Handler is setup. Given that we shouldn't
+    // really be using more than one debugger at a time and we try and take the second mutex
+    // sparingly hopefully this won't be too big a performance hit. I'd prefer to take them out
+    // though ideally.
+    debuggers: Arc<Mutex<HashMap<usize, Arc<Mutex<Debugger>>>>>,
 }
 
 impl NeovimHandler {
@@ -390,10 +515,34 @@ impl NeovimHandler {
             debugger_type
         );
 
-        let mut debugger = Debugger::new(debugger_type, instance_id, command, command_args, neovim);
-        debugger.setup().await?;
+        let debugger = Arc::new(Mutex::new(Debugger::new(
+            debugger_type,
+            instance_id,
+            command,
+            command_args,
+            neovim,
+        )));
 
-        self.debuggers.lock().await.insert(instance_id, debugger);
+        self.debuggers
+            .lock()
+            .await
+            .insert(instance_id, debugger.clone());
+
+        tokio::spawn(async move {
+            let debugger = debugger.clone();
+            tracing::trace!("Trying to lock 1");
+            let mut debugger_lock = debugger.lock().await;
+            tracing::trace!("Locked 1");
+            if let Err(e) = debugger_lock.setup().await {
+                let log_msg = format!("Can't setup debugger: {:?}", e);
+                debugger_lock
+                    .neovim_vadre_window
+                    .log_msg(VadreLogLevel::CRITICAL, &log_msg)
+                    .await
+                    .unwrap();
+            }
+            tracing::trace!("Unlocked 1");
+        });
 
         Ok("process launched".into())
     }
