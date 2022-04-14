@@ -167,6 +167,10 @@ impl NeovimVadreWindow {
             .buffers
             .get(&VadreBufferType::Logs)
             .expect("Logs buffer not found, have you setup the UI?");
+        let window = self
+            .windows
+            .get(&VadreWindowType::Output)
+            .expect("Logs window not found, have you setup the UI?");
 
         let datetime = chrono::offset::Local::now();
 
@@ -179,7 +183,18 @@ impl NeovimVadreWindow {
         if buffer.get_lines(0, 1, true).await?.get(0).unwrap() == "" {
             self.write_to_window(&buffer, 0, 1, msgs).await?;
         } else {
+            let mut cursor_at_end = true;
+            let current_cursor = window.get_cursor().await?;
+            let line_count = buffer.line_count().await?;
+
+            if current_cursor.0 < line_count {
+                cursor_at_end = false;
+            }
             self.write_to_window(&buffer, -1, -1, msgs).await?;
+
+            if cursor_at_end {
+                window.set_cursor((line_count + 1, 0)).await?;
+            }
         }
 
         Ok(())

@@ -118,7 +118,7 @@ impl NeovimHandler {
             let mut debugger_lock = debugger.lock().await;
             tracing::trace!("Locked 1");
             if let Err(e) = debugger_lock.setup().await {
-                let log_msg = format!("Can't setup debugger: {:?}", e);
+                let log_msg = format!("Can't setup debugger: {}", e);
                 debugger_lock
                     .neovim_vadre_window()
                     .log_msg(VadreLogLevel::CRITICAL, &log_msg)

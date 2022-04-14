@@ -1,4 +1,15 @@
-use std::{env::consts::EXE_SUFFIX, fmt::Debug, path::Path, process::Stdio, sync::Arc};
+use std::{
+    collections::HashMap,
+    env::{self, consts::EXE_SUFFIX},
+    fmt::Debug,
+    path::Path,
+    process::Stdio,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use crate::{
     neovim::{NeovimVadreWindow, VadreLogLevel},
@@ -11,12 +22,10 @@ use nvim_rs::{compat::tokio::Compat, Neovim, Value};
 use reqwest::Url;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, Stdout},
-    net::{
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-        TcpStream,
-    },
+    net::{tcp::OwnedWriteHalf, TcpStream},
     process::{Child, Command},
-    sync::Mutex,
+    sync::{oneshot, Mutex},
+    time::timeout,
 };
 
 #[derive(Clone, Debug)]
@@ -43,10 +52,11 @@ pub struct CodeLLDBDebugger {
     id: usize,
     command: String,
     command_args: Vec<String>,
+    seq_id: Arc<AtomicU64>,
     pub neovim_vadre_window: NeovimVadreWindow,
     process: Option<Arc<Child>>,
-    read_conn: Arc<Mutex<Option<OwnedReadHalf>>>,
     write_conn: Arc<Mutex<Option<OwnedWriteHalf>>>,
+    response_senders: Arc<Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>>, // TODO: Clear up these, possibly needs a mutex
 }
 
 impl CodeLLDBDebugger {
@@ -62,10 +72,11 @@ impl CodeLLDBDebugger {
             id,
             command,
             command_args,
+            seq_id: Arc::new(AtomicU64::new(100)),
             neovim_vadre_window,
             process: None,
-            read_conn: Arc::new(Mutex::new(None)),
             write_conn: Arc::new(Mutex::new(None)),
+            response_senders: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -146,9 +157,62 @@ impl CodeLLDBDebugger {
     async fn tcp_connect(&mut self, port: u16) -> Result<()> {
         tracing::trace!("Connecting to port {}", port);
 
+        // let neovim_vadre_window = self.neovim_vadre_window.clone();
+
         let tcp_conn = TcpStream::connect(format!("127.0.0.1:{}", port)).await?;
         let (read_conn, write_conn) = tcp_conn.into_split();
-        *self.read_conn.lock().await = Some(read_conn);
+
+        let response_senders = self.response_senders.clone();
+
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            let mut buf_str = String::new();
+            let mut read_conn = read_conn;
+            let mut previous_string_length = 0;
+
+            loop {
+                // If we already have something in buffer try a non-blocking read but try and
+                // process it anyway. Prevents the situation where you read two messages in one
+                // read operation not reading the second immediately. Also keep track of the string
+                // length to make sure something was processed, don't keep trying.
+                let n = if buf_str != "" || previous_string_length > buf_str.len() {
+                    previous_string_length = buf_str.len();
+                    read_conn.try_read(&mut buf).unwrap_or(0)
+                } else {
+                    read_conn.read(&mut buf).await.unwrap()
+                };
+                buf_str += &String::from_utf8(buf[0..n].into()).unwrap();
+
+                tracing::trace!("From CodeLLDB: {:?}", buf_str);
+                let output: Vec<&str> = buf_str.splitn(3, "\r\n").collect();
+                if output.len() < 3 {
+                    continue;
+                }
+                let content_length = output.get(0).unwrap()[16..].parse::<usize>().unwrap();
+                let remainder = output.get(2).unwrap();
+                if remainder.len() < content_length {
+                    continue;
+                }
+
+                let response_json: serde_json::Value =
+                    serde_json::from_str(&remainder[0..content_length]).unwrap();
+
+                // TODO: Can we do this more efficiently somehow? Use the `Bytes` crate and
+                // consume? Is that actually more efficient?
+                buf_str = String::from(&remainder[content_length..]);
+
+                tracing::debug!("JSON from CodeLLDB: {}", response_json);
+
+                if let Some(seq_id) = response_json.get("request_seq") {
+                    let seq_id = seq_id.as_u64().unwrap();
+                    let mut response_senders_lock = response_senders.lock().await;
+                    let sender = response_senders_lock.remove(&seq_id).unwrap();
+                    drop(response_senders_lock);
+                    sender.send(response_json).unwrap();
+                    tracing::trace!("Sent JSON response to request");
+                }
+            }
+        });
         *self.write_conn.lock().await = Some(write_conn);
 
         self.neovim_vadre_window
@@ -163,32 +227,86 @@ impl CodeLLDBDebugger {
 
     #[tracing::instrument(skip(self))]
     async fn init_process(&self) -> Result<()> {
-        self.send_request(
-            r#"{
-                "command": "initialize",
-                "arguments": {
-                    "adapterID": "CodeLLDB",
-                    "clientID": "nvim_vadre",
-                    "clientName": "nvim_vadre",
-                    "linesStartAt1": true,
-                    "columnsStartAt1": true,
-                    "locale": "en_GB",
-                    "pathFormat": "path",
-                    "supportsVariableType": true,
-                    "supportsVariablePaging": false,
-                    "supportsRunInTerminalRequest": true,
-                    "supportsMemoryReferences": true
-                },
-                "seq": 1,
-                "type": "request"
-            }"#,
+        self.send_request_and_retrieve_response(
+            "initialize",
+            serde_json::json!({
+                "adapterID": "CodeLLDB",
+                "clientID": "nvim_vadre",
+                "clientName": "nvim_vadre",
+                "linesStartAt1": true,
+                "columnsStartAt1": true,
+                "locale": "en_GB",
+                "pathFormat": "path",
+                "supportsVariableType": true,
+                "supportsVariablePaging": false,
+                "supportsRunInTerminalRequest": true,
+                "supportsMemoryReferences": true
+            }),
         )
         .await?;
+
+        #[cfg(windows)]
+        let program = dunce::canonicalize(&self.command)?;
+        #[cfg(not(windows))]
+        let program = std::fs::canonicalize(&self.command)?;
+
+        self.send_request(
+            "launch",
+            serde_json::json!({
+                "args": self.command_args,
+                "cargo": {},
+                "cwd": env::current_dir()?,
+                "env": {},
+                "name": "lldb",
+                "terminal": "integrated",
+                "type": "lldb",
+                "request": "launch",
+                "program": program,
+                "stopOnEntry": true
+            }),
+            None,
+        )
+        .await?;
+
+        // self.send_request(
+        //     "setFunctionBreakpoints",
+        //     serde_json::json!({
+        //         "breakpoints": [],
+        //     }),
+        // )
+        // .await?;
+
+        // self.send_request(
+        //     "setExceptionBreakpoints",
+        //     serde_json::json!({
+        //         "filters": []
+        //     }),
+        // )
+        // .await?;
 
         Ok(())
     }
 
-    async fn send_request(&self, msg: &str) -> Result<String> {
+    async fn send_request(
+        &self,
+        command: &str,
+        args: serde_json::Value,
+        mut sender: Option<oneshot::Sender<serde_json::Value>>,
+    ) -> Result<()> {
+        let seq_id = self.seq_id.fetch_add(1, Ordering::SeqCst);
+
+        if let Some(sender) = sender.take() {
+            self.response_senders.lock().await.insert(seq_id, sender);
+        }
+
+        let request = serde_json::json!({
+            "command": command,
+            "arguments": args,
+            "seq": seq_id,
+            "type": "request",
+        });
+        let msg = request.to_string();
+
         let mut write_conn_lock = self.write_conn.lock().await;
         match write_conn_lock.as_mut() {
             Some(write_conn) => {
@@ -202,19 +320,26 @@ impl CodeLLDBDebugger {
             }
         };
 
-        let mut read_conn_lock = self.read_conn.lock().await;
-        match read_conn_lock.as_mut() {
-            Some(read_conn) => {
-                let mut buf = [0u8; 4096];
-                let n = read_conn.read(&mut buf).await.unwrap();
-                let string = String::from_utf8(buf[0..n].into())?;
-                tracing::trace!("Response: {:?}", string);
-                Ok(string)
-            }
-            None => {
-                bail!("Can't find read_conn for CodeLLDB, have you called setup yet?")
-            }
-        }
+        Ok(())
+    }
+
+    async fn send_request_and_retrieve_response(
+        &self,
+        command: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let (sender, receiver) = oneshot::channel();
+
+        self.send_request(command, args, Some(sender)).await?;
+
+        // TODO: configurable timeout
+        let response = match timeout(Duration::new(10, 0), receiver).await {
+            Ok(resp) => resp?,
+            Err(e) => bail!("Timed out waiting for a response: {}", e),
+        };
+        tracing::trace!("Got response: {}", response.to_string());
+
+        Ok(response)
     }
 
     #[tracing::instrument(skip(self))]
