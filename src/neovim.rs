@@ -48,28 +48,40 @@ impl Display for VadreLogLevel {
 enum VadreWindowType {
     Code,
     Output,
-}
-
-impl VadreWindowType {
-    fn buffer_name_prefix(&self) -> &str {
-        match self {
-            VadreWindowType::Code => "Vadre Code",
-            VadreWindowType::Output => "Vadre Output",
-        }
-    }
-
-    fn type_name(&self) -> &str {
-        match self {
-            VadreWindowType::Code => "VadreCode",
-            VadreWindowType::Output => "VadreOutput",
-        }
-    }
+    Program,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum VadreBufferType {
     Code,
     Logs,
+    Terminal,
+}
+
+impl VadreBufferType {
+    fn buffer_name_prefix(&self) -> &str {
+        match self {
+            VadreBufferType::Code => "Vadre Code",
+            VadreBufferType::Logs => "Vadre Output",
+            VadreBufferType::Terminal => "Vadre Program",
+        }
+    }
+
+    fn buffer_post_display(&self) -> &str {
+        match self {
+            VadreBufferType::Code => "",
+            VadreBufferType::Logs => "Logs",
+            VadreBufferType::Terminal => "Terminal",
+        }
+    }
+
+    fn type_name(&self) -> &str {
+        match self {
+            VadreBufferType::Code => "Code",
+            VadreBufferType::Logs => "Logs",
+            VadreBufferType::Terminal => "Terminal",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -116,25 +128,44 @@ impl NeovimVadreWindow {
         self.neovim.command("new").await?;
         let mut windows = current_tabpage.list_wins().await?.into_iter();
         assert_eq!(2, windows.len());
+        let window = windows.next().unwrap();
+        self.neovim.set_current_win(&window).await?;
 
-        // Window 1 is code
+        self.neovim.command("vnew").await?;
+        let mut windows = current_tabpage.list_wins().await?.into_iter();
+        assert_eq!(3, windows.len());
+
+        // Window 1 is Code
         let window = windows.next().unwrap();
         let buffer = window.get_buf().await?;
         self.neovim.set_current_win(&window).await?;
-        self.set_vadre_buffer(&buffer, VadreWindowType::Code)
+        self.set_vadre_buffer(&buffer, VadreBufferType::Code)
             .await?;
+        self.set_keys_for_code_buffer(&buffer).await?;
+
         self.windows.insert(VadreWindowType::Code, window);
         self.buffers.insert(VadreBufferType::Code, buffer);
 
-        // Window 2 is output
+        // Window 2 is Output stuff, logs at the moment
         let window = windows.next().unwrap();
-        let buffer = window.get_buf().await?;
-        self.set_vadre_buffer(&buffer, VadreWindowType::Output)
+        let log_buffer = window.get_buf().await?;
+        self.set_vadre_buffer(&log_buffer, VadreBufferType::Logs)
+            .await?;
+        self.set_keys_for_output_buffer(&log_buffer).await?;
+
+        self.windows.insert(VadreWindowType::Output, window);
+        self.buffers.insert(VadreBufferType::Logs, log_buffer);
+
+        // Window 3 is Output stuff, logs at the moment
+        let window = windows.next().unwrap();
+        let terminal_buffer = window.get_buf().await?;
+        self.set_vadre_buffer(&terminal_buffer, VadreBufferType::Terminal)
             .await?;
         window.set_height(output_window_height).await?;
 
-        self.windows.insert(VadreWindowType::Output, window);
-        self.buffers.insert(VadreBufferType::Logs, buffer);
+        self.windows.insert(VadreWindowType::Program, window);
+        self.buffers
+            .insert(VadreBufferType::Terminal, terminal_buffer);
 
         // Special first log line to get rid of the annoying
         self.log_msg(VadreLogLevel::INFO, "Vadre Setup UI").await?;
@@ -200,6 +231,21 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
+    pub async fn spawn_terminal_command(&self, command: String) -> Result<()> {
+        let original_window = self.neovim.get_current_win().await?;
+
+        let terminal_window = self.windows.get(&VadreWindowType::Program).unwrap();
+        self.neovim.set_current_win(&terminal_window).await?;
+
+        self.neovim
+            .command(&format!("terminal! {}", command))
+            .await?;
+
+        self.neovim.set_current_win(&original_window).await?;
+
+        Ok(())
+    }
+
     async fn write_to_window(
         &self,
         buffer: &Buffer<Compat<Stdout>>,
@@ -243,20 +289,44 @@ impl NeovimVadreWindow {
     async fn set_vadre_buffer(
         &self,
         buffer: &Buffer<Compat<Stdout>>,
-        window_type: VadreWindowType,
+        buffer_type: VadreBufferType,
     ) -> Result<()> {
-        let buffer_name = format!(
-            "{} ({})",
-            window_type.buffer_name_prefix(),
-            self.instance_id
-        );
-        let file_type = window_type.type_name();
+        let post_display = buffer_type.buffer_post_display();
+        let buffer_name = if post_display != "" {
+            format!(
+                "{} ({}) - {}",
+                buffer_type.buffer_name_prefix(),
+                self.instance_id,
+                post_display,
+            )
+        } else {
+            format!(
+                "{} ({})",
+                buffer_type.buffer_name_prefix(),
+                self.instance_id,
+            )
+        };
+        let file_type = buffer_type.type_name();
         buffer.set_name(&buffer_name).await?;
         buffer.set_option("swapfile", false.into()).await?;
         buffer.set_option("buftype", "nofile".into()).await?;
         buffer.set_option("filetype", file_type.into()).await?;
         buffer.set_option("buflisted", false.into()).await?;
         buffer.set_option("modifiable", false.into()).await?;
+
+        Ok(())
+    }
+
+    async fn set_keys_for_code_buffer(&self, buffer: &Buffer<Compat<Stdout>>) -> Result<()> {
+        buffer.set_keymap("n", "r", ":VadreRun<CR>", vec![]).await?; // nnoremap <silent> <buffer> r :PadreRun<cr>
+
+        Ok(())
+    }
+
+    async fn set_keys_for_output_buffer(&self, buffer: &Buffer<Compat<Stdout>>) -> Result<()> {
+        buffer
+            .set_keymap("n", ">", ":VadreNextOutputWindow<CR>", vec![])
+            .await?; // nnoremap <silent> <buffer> r :PadreRun<cr>
 
         Ok(())
     }

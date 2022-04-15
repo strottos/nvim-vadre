@@ -25,7 +25,7 @@ use tokio::{
     net::{tcp::OwnedWriteHalf, TcpStream},
     process::{Child, Command},
     sync::{oneshot, Mutex},
-    time::timeout,
+    time::{sleep, timeout},
 };
 
 #[derive(Clone, Debug)]
@@ -157,9 +157,9 @@ impl CodeLLDBDebugger {
     async fn tcp_connect(&mut self, port: u16) -> Result<()> {
         tracing::trace!("Connecting to port {}", port);
 
-        // let neovim_vadre_window = self.neovim_vadre_window.clone();
+        let neovim_vadre_window = self.neovim_vadre_window.clone();
 
-        let tcp_conn = TcpStream::connect(format!("127.0.0.1:{}", port)).await?;
+        let tcp_conn = self.do_tcp_connect(port).await?;
         let (read_conn, write_conn) = tcp_conn.into_split();
 
         let response_senders = self.response_senders.clone();
@@ -203,13 +203,74 @@ impl CodeLLDBDebugger {
 
                 tracing::debug!("JSON from CodeLLDB: {}", response_json);
 
-                if let Some(seq_id) = response_json.get("request_seq") {
-                    let seq_id = seq_id.as_u64().unwrap();
+                let r#type = response_json.get("type").expect("type should be set");
+                if r#type == "request" {
+                    let command = response_json.get("command").expect("command should be set");
+                    if command == "runInTerminal" {
+                        neovim_vadre_window
+                            .log_msg(
+                                VadreLogLevel::INFO,
+                                "Spawning terminal to communicate with program",
+                            )
+                            .await
+                            .expect("Logging failed");
+
+                        let args = response_json
+                            .get("arguments")
+                            .expect("arguments should be set")
+                            .get("args")
+                            .expect("args should be set")
+                            .as_array()
+                            .expect("should be an array")
+                            .into_iter()
+                            .map(|x| x.to_string())
+                            .collect::<Vec<String>>();
+
+                        neovim_vadre_window
+                            .spawn_terminal_command(args.join(" "))
+                            .await
+                            .expect("Spawning terminal command failed");
+                    } else {
+                        neovim_vadre_window
+                            .log_msg(
+                                VadreLogLevel::INFO,
+                                &format!("Need to code in request: {}", command),
+                            )
+                            .await
+                            .expect("Logging failed");
+                    }
+                } else if r#type == "response" {
+                    let seq_id = response_json
+                        .get("request_seq")
+                        .expect("request_seq should be set")
+                        .as_u64()
+                        .unwrap();
                     let mut response_senders_lock = response_senders.lock().await;
-                    let sender = response_senders_lock.remove(&seq_id).unwrap();
-                    drop(response_senders_lock);
-                    sender.send(response_json).unwrap();
+                    match response_senders_lock.remove(&seq_id) {
+                        Some(sender) => {
+                            sender.send(response_json).unwrap();
+                        }
+                        None => {}
+                    };
                     tracing::trace!("Sent JSON response to request");
+                } else if r#type == "event" {
+                    let event = response_json.get("event").expect("event should be set");
+                    if event == "output" {
+                        neovim_vadre_window
+                            .log_msg(
+                                VadreLogLevel::INFO,
+                                &format!(
+                                    "CodeLLDB: {}",
+                                    response_json
+                                        .get("body")
+                                        .expect("body should be set")
+                                        .get("output")
+                                        .expect("output should be set")
+                                ),
+                            )
+                            .await
+                            .expect("Logging failed");
+                    }
                 }
             }
         });
@@ -223,6 +284,27 @@ impl CodeLLDBDebugger {
             .await?;
 
         Ok(())
+    }
+
+    #[tracing::instrument(skip(self, port))]
+    async fn do_tcp_connect(&mut self, port: u16) -> Result<TcpStream> {
+        let number_attempts = 50;
+
+        for _ in 1..number_attempts {
+            let tcp_stream = TcpStream::connect(format!("127.0.0.1:{}", port)).await;
+            match tcp_stream {
+                Ok(x) => return Ok(x),
+                Err(e) => {
+                    tracing::trace!("Sleeping 100 after error: {}", e);
+                    sleep(Duration::from_millis(100)).await;
+                }
+            };
+        }
+
+        bail!(
+            "Couldn't connect to server after {} attempts, bailing",
+            number_attempts
+        );
     }
 
     #[tracing::instrument(skip(self))]
@@ -268,21 +350,23 @@ impl CodeLLDBDebugger {
         )
         .await?;
 
-        // self.send_request(
-        //     "setFunctionBreakpoints",
-        //     serde_json::json!({
-        //         "breakpoints": [],
-        //     }),
-        // )
-        // .await?;
+        self.send_request(
+            "setFunctionBreakpoints",
+            serde_json::json!({
+                "breakpoints": [],
+            }),
+            None,
+        )
+        .await?;
 
-        // self.send_request(
-        //     "setExceptionBreakpoints",
-        //     serde_json::json!({
-        //         "filters": []
-        //     }),
-        // )
-        // .await?;
+        self.send_request(
+            "setExceptionBreakpoints",
+            serde_json::json!({
+                "filters": []
+            }),
+            None,
+        )
+        .await?;
 
         Ok(())
     }
@@ -348,13 +432,16 @@ impl CodeLLDBDebugger {
         path.push("codelldb");
 
         if !path.exists() {
-            // TODO: Popup informing
+            self.neovim_vadre_window
+                .log_msg(VadreLogLevel::INFO, "Downloading and extracting pLugin")
+                .await?;
 
             let url = Url::parse(&format!(
                 "https://github.com/vadimcn/vscode-lldb/releases/download/{}\
                          /codelldb-x86_64-{}.vsix",
                 "v1.7.0", "windows"
             ))?;
+
             download_extract_zip(path.as_path(), url).await?;
         }
 
