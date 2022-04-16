@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env::{self, consts::EXE_SUFFIX},
     fmt::Debug,
     path::Path,
@@ -22,9 +22,9 @@ use nvim_rs::{compat::tokio::Compat, Neovim, Value};
 use reqwest::Url;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, Stdout},
-    net::{tcp::OwnedWriteHalf, TcpStream},
+    net::TcpStream,
     process::{Child, Command},
-    sync::{oneshot, Mutex},
+    sync::{mpsc, oneshot, Mutex},
     time::{sleep, timeout},
 };
 
@@ -34,9 +34,9 @@ pub enum Debugger {
 }
 
 impl Debugger {
-    pub async fn setup(&mut self) -> VadreResult {
+    pub async fn setup(&mut self, pending_breakpoints: &HashSet<(String, i64)>) -> VadreResult {
         match self {
-            Debugger::CodeLLDB(debugger) => debugger.setup().await,
+            Debugger::CodeLLDB(debugger) => debugger.setup(pending_breakpoints).await,
         }
     }
 
@@ -44,6 +44,28 @@ impl Debugger {
         match self {
             Debugger::CodeLLDB(debugger) => &debugger.neovim_vadre_window,
         }
+    }
+
+    pub async fn set_breakpoint(&self, file_path: &Path, line_number: i64) -> Result<()> {
+        match self {
+            Debugger::CodeLLDB(debugger) => {
+                debugger
+                    .set_breakpoint(file_path, line_number, true)
+                    .await?
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn remove_breakpoint(&self, file_path: &Path, line_number: i64) -> Result<()> {
+        match self {
+            Debugger::CodeLLDB(debugger) => {
+                debugger
+                    .set_breakpoint(file_path, line_number, false)
+                    .await?
+            }
+        }
+        Ok(())
     }
 }
 
@@ -55,8 +77,19 @@ pub struct CodeLLDBDebugger {
     seq_id: Arc<AtomicU64>,
     pub neovim_vadre_window: NeovimVadreWindow,
     process: Option<Arc<Child>>,
-    write_conn: Arc<Mutex<Option<OwnedWriteHalf>>>,
-    response_senders: Arc<Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>>, // TODO: Clear up these, possibly needs a mutex
+
+    write_tx: mpsc::Sender<serde_json::Value>,
+    // Following should be empty most of the time and will be taken by the tcp_connection,
+    // shouldn't be used.
+    //
+    // We use a mutex here and steal it once for performance reasons, rather than have an
+    // unnecessary mutex on the write_tx part if this were created when needed. This just gets
+    // stolen once and we never use the mutex again.
+    write_rx: Arc<Mutex<Option<mpsc::Receiver<serde_json::Value>>>>,
+
+    config_done_rx: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+
+    response_senders: Arc<Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>>,
 }
 
 impl CodeLLDBDebugger {
@@ -68,20 +101,27 @@ impl CodeLLDBDebugger {
     ) -> Self {
         let neovim_vadre_window = NeovimVadreWindow::new(neovim, id);
 
+        let (write_tx, write_rx) = mpsc::channel(1);
+
         CodeLLDBDebugger {
             id,
             command,
             command_args,
-            seq_id: Arc::new(AtomicU64::new(100)),
+            seq_id: Arc::new(AtomicU64::new(1)),
             neovim_vadre_window,
             process: None,
-            write_conn: Arc::new(Mutex::new(None)),
+
+            write_tx,
+            write_rx: Arc::new(Mutex::new(Some(write_rx))),
+
+            config_done_rx: Arc::new(Mutex::new(None)),
+
             response_senders: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     #[tracing::instrument(skip(self))]
-    pub async fn setup(&mut self) -> VadreResult {
+    pub async fn setup(&mut self, pending_breakpoints: &HashSet<(String, i64)>) -> VadreResult {
         log_err!(
             self.neovim_vadre_window.create_ui().await,
             self.neovim_vadre_window,
@@ -101,7 +141,7 @@ impl CodeLLDBDebugger {
             "Error creating TCP connection to process"
         );
         log_err!(
-            self.init_process().await,
+            self.init_process(pending_breakpoints).await,
             self.neovim_vadre_window,
             "Error initialising process"
         );
@@ -112,6 +152,39 @@ impl CodeLLDBDebugger {
         );
 
         Ok(Value::from("CodeLLDB launched and setup"))
+    }
+
+    pub async fn set_breakpoint(
+        &self,
+        file_path: &Path,
+        line_number: i64,
+        adding: bool,
+    ) -> Result<()> {
+        tracing::trace!(
+            "CodeLLDB {} breakpoint at file {:?} and line number {}",
+            if adding { "setting" } else { "removing" },
+            file_path,
+            line_number,
+        );
+
+        if !file_path.exists() {
+            self.neovim_vadre_window
+                .log_msg(
+                    VadreLogLevel::WARN,
+                    &format!(
+                        "Requested to {} breakpoint in file not found: {:?}",
+                        if adding { "add" } else { "remove" },
+                        file_path,
+                    ),
+                )
+                .await?;
+        }
+
+        if adding {
+            self.send_breakpoint_request(file_path, line_number).await?;
+        }
+
+        Ok(())
     }
 
     #[tracing::instrument(skip(self, port))]
@@ -164,11 +237,18 @@ impl CodeLLDBDebugger {
 
         let response_senders = self.response_senders.clone();
 
+        let write_tx = self.write_tx.clone();
+        let seq_id = self.seq_id.clone();
+
+        let (config_done_tx, config_done_rx) = oneshot::channel();
+        *self.config_done_rx.lock().await = Some(config_done_rx);
+
         tokio::spawn(async move {
             let mut buf = [0u8; 4096];
             let mut buf_str = String::new();
             let mut read_conn = read_conn;
             let mut previous_string_length = 0;
+            let mut config_done_tx = Some(config_done_tx);
 
             loop {
                 // If we already have something in buffer try a non-blocking read but try and
@@ -201,7 +281,7 @@ impl CodeLLDBDebugger {
                 // consume? Is that actually more efficient?
                 buf_str = String::from(&remainder[content_length..]);
 
-                tracing::debug!("JSON from CodeLLDB: {}", response_json);
+                tracing::trace!("JSON from CodeLLDB: {}", response_json);
 
                 let r#type = response_json.get("type").expect("type should be set");
                 if r#type == "request" {
@@ -230,6 +310,29 @@ impl CodeLLDBDebugger {
                             .spawn_terminal_command(args.join(" "))
                             .await
                             .expect("Spawning terminal command failed");
+
+                        let resp_id = seq_id.fetch_add(1, Ordering::SeqCst);
+                        let req_id = response_json.get("seq").expect("seq should be set");
+
+                        let response = serde_json::json!({
+                            "seq_id": resp_id,
+                            "type": "response",
+                            "request_seq": req_id,
+                            "command": "runInTerminal",
+                            "body": {
+                            },
+                            "success": true
+                        });
+
+                        tracing::trace!("Sending response to runInTerminal: {}", response);
+
+                        write_tx
+                            .clone()
+                            .send(response)
+                            .await
+                            .expect("Can send to sender for socket");
+
+                        config_done_tx.take().unwrap().send(()).unwrap();
                     } else {
                         neovim_vadre_window
                             .log_msg(
@@ -249,11 +352,12 @@ impl CodeLLDBDebugger {
                     match response_senders_lock.remove(&seq_id) {
                         Some(sender) => {
                             sender.send(response_json).unwrap();
+                            tracing::trace!("Sent JSON response to request");
                         }
                         None => {}
                     };
-                    tracing::trace!("Sent JSON response to request");
                 } else if r#type == "event" {
+                    tracing::debug!("Got event: {}", response_json);
                     let event = response_json.get("event").expect("event should be set");
                     if event == "output" {
                         neovim_vadre_window
@@ -274,7 +378,27 @@ impl CodeLLDBDebugger {
                 }
             }
         });
-        *self.write_conn.lock().await = Some(write_conn);
+
+        let write_rx = self
+            .write_rx
+            .lock()
+            .await
+            .take()
+            .expect("Should have a write_rx to take");
+
+        tokio::spawn(async move {
+            let mut write_rx = write_rx;
+            let mut write_conn = write_conn;
+            while let Some(msg) = write_rx.recv().await {
+                let msg = msg.to_string();
+                let msg = format!("Content-Length: {}\r\n\r\n{}", msg.len(), msg);
+                tracing::trace!("Sending to CodeLLDB: {:?}", msg);
+                write_conn
+                    .write_all(msg.as_bytes())
+                    .await
+                    .expect("write should succeed");
+            }
+        });
 
         self.neovim_vadre_window
             .log_msg(
@@ -308,8 +432,8 @@ impl CodeLLDBDebugger {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn init_process(&self) -> Result<()> {
-        self.send_request_and_retrieve_response(
+    async fn init_process(&self, pending_breakpoints: &HashSet<(String, i64)>) -> Result<()> {
+        self.send_request_and_await_response(
             "initialize",
             serde_json::json!({
                 "adapterID": "CodeLLDB",
@@ -344,7 +468,7 @@ impl CodeLLDBDebugger {
                 "type": "lldb",
                 "request": "launch",
                 "program": program,
-                "stopOnEntry": true
+                "stopOnEntry": false
             }),
             None,
         )
@@ -368,6 +492,17 @@ impl CodeLLDBDebugger {
         )
         .await?;
 
+        let config_done_rx = self.config_done_rx.lock().await.take().unwrap();
+        timeout(Duration::new(10, 0), config_done_rx).await??;
+
+        for breakpoint in pending_breakpoints {
+            self.send_breakpoint_request(Path::new(&breakpoint.0), breakpoint.1)
+                .await?;
+        }
+
+        self.send_request_and_await_response("configurationDone", serde_json::json!({}))
+            .await?;
+
         Ok(())
     }
 
@@ -389,25 +524,14 @@ impl CodeLLDBDebugger {
             "seq": seq_id,
             "type": "request",
         });
-        let msg = request.to_string();
 
-        let mut write_conn_lock = self.write_conn.lock().await;
-        match write_conn_lock.as_mut() {
-            Some(write_conn) => {
-                tracing::trace!("Request: {}", msg);
-                write_conn
-                    .write_all(format!("Content-Length: {}\r\n\r\n{}", msg.len(), msg).as_bytes())
-                    .await?;
-            }
-            None => {
-                bail!("Can't find write_conn for CodeLLDB, have you called setup yet?");
-            }
-        };
+        tracing::debug!("Request: {}", request);
+        self.write_tx.send(request).await?;
 
         Ok(())
     }
 
-    async fn send_request_and_retrieve_response(
+    async fn send_request_and_await_response(
         &self,
         command: &str,
         args: serde_json::Value,
@@ -421,9 +545,32 @@ impl CodeLLDBDebugger {
             Ok(resp) => resp?,
             Err(e) => bail!("Timed out waiting for a response: {}", e),
         };
-        tracing::trace!("Got response: {}", response.to_string());
+        tracing::debug!("Got response: {}", response.to_string());
 
         Ok(response)
+    }
+
+    async fn send_breakpoint_request(&self, file_path: &Path, line_number: i64) -> Result<()> {
+        let file_name = file_path.file_name().unwrap().to_str().unwrap();
+        let file_path = dunce::canonicalize(file_path)?;
+
+        self.send_request(
+            "setBreakpoints",
+            serde_json::json!({
+                "source": {
+                    "name": file_name,
+                    "path": file_path.to_str().unwrap(),
+                },
+                "breakpoints": [{
+                    "line": line_number,
+                }],
+                "sourceModified": false,
+            }),
+            None,
+        )
+        .await?;
+
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]

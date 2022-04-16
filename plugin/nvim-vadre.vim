@@ -54,6 +54,7 @@ endfunction
 function! s:configureCommands()
     command! VadrePing :call s:ping()
     command! -nargs=* -complete=file VadreDebug call s:launch(<f-args>)
+    command! -nargs=0 VadreBreakpoint call s:breakpoint()
 endfunction
 
 function! s:ping()
@@ -64,10 +65,31 @@ function! s:launch(...)
     echom rpcrequest(s:vadreJobId, "launch", a:000)
 endfunction
 
+function! s:breakpoint()
+    echom rpcrequest(s:vadreJobId, "breakpoint", a:000)
+endfunction
+
+" TODO: Make these log to logs if available??
+function! s:OnEvent(job_id, data, event) dict
+    if a:event == 'stdout'
+        echom 'vadre stdout: '.join(a:data)
+    elseif a:event == 'stderr'
+        echom 'vadre stderr: '.join(a:data)
+    else
+        echom 'vadre exited'
+    endif
+endfunction
+
 " Initialize RPC
 function! s:initRpc()
     if s:vadreJobId == 0
-        let jobid = jobstart([s:vadreBinary], { "rpc": v:true })
+        let s:callbacks = {
+        \ 'on_stdout': function('s:OnEvent'),
+        \ 'on_stderr': function('s:OnEvent'),
+        \ 'on_exit': function('s:OnEvent')
+        \ }
+
+        let jobid = jobstart([s:vadreBinary], extend({ "rpc": v:true }, s:callbacks))
         return jobid
     else
         return s:vadreJobId

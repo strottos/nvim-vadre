@@ -9,7 +9,7 @@ use crate::{
 };
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     error::Error,
     fmt::Debug,
@@ -26,6 +26,9 @@ use nvim_rs::{compat::tokio::Compat, create::tokio as create, Handler, Neovim, V
 use tokio::{io::Stdout, sync::Mutex};
 
 static VADRE_NEXT_INSTANCE_NUM: AtomicUsize = AtomicUsize::new(1);
+// Arbitrary number so no clashes with other plugins (hopefully)
+// TODO: Find a better solution
+static VADRE_NEXT_SIGN_ID: AtomicUsize = AtomicUsize::new(1157831);
 
 type VadreResult = Result<Value, Value>;
 
@@ -37,12 +40,15 @@ struct NeovimHandler {
     // sparingly hopefully this won't be too big a performance hit. I'd prefer to take them out
     // though ideally.
     debuggers: Arc<Mutex<HashMap<usize, Arc<Mutex<Debugger>>>>>,
+
+    breakpoints: Arc<Mutex<HashSet<(String, i64)>>>,
 }
 
 impl NeovimHandler {
     fn new() -> Self {
         NeovimHandler {
             debuggers: Arc::new(Mutex::new(HashMap::new())),
+            breakpoints: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -112,12 +118,14 @@ impl NeovimHandler {
             .await
             .insert(instance_id, debugger.clone());
 
+        let pending_breakpoints = self.breakpoints.lock().await.clone();
+
         tokio::spawn(async move {
             let debugger = debugger.clone();
             tracing::trace!("Trying to lock 1");
             let mut debugger_lock = debugger.lock().await;
             tracing::trace!("Locked 1");
-            if let Err(e) = debugger_lock.setup().await {
+            if let Err(e) = debugger_lock.setup(&pending_breakpoints).await {
                 let log_msg = format!("Can't setup debugger: {}", e);
                 debugger_lock
                     .neovim_vadre_window()
@@ -129,6 +137,67 @@ impl NeovimHandler {
         });
 
         Ok("process launched".into())
+    }
+
+    #[tracing::instrument(skip(self, neovim))]
+    async fn breakpoint(&self, neovim: Neovim<Compat<Stdout>>) -> VadreResult {
+        let cursor_position = neovim
+            .get_current_win()
+            .await
+            .expect("could get current window")
+            .get_cursor()
+            .await
+            .expect("could get current cursor position");
+
+        let file_path = neovim
+            .get_current_buf()
+            .await
+            .expect("could get current buffer")
+            .get_name()
+            .await
+            .expect("could get current cursor position");
+
+        let line_number = cursor_position.0;
+        let position = (file_path.clone(), line_number);
+
+        let adding_breakpoint = {
+            let mut breakpoints = self.breakpoints.lock().await;
+
+            if breakpoints.contains(&position) {
+                breakpoints.remove(&position);
+                false
+            } else {
+                breakpoints.insert(position);
+                true
+            }
+        };
+
+        let debuggers = self.debuggers.lock().await;
+
+        for debugger in debuggers.values() {
+            if adding_breakpoint {
+                debugger
+                    .lock()
+                    .await
+                    .set_breakpoint(Path::new(&file_path), cursor_position.0)
+                    .await
+                    .expect("could set breakpoint");
+            } else {
+                debugger
+                    .lock()
+                    .await
+                    .remove_breakpoint(Path::new(&file_path), cursor_position.0)
+                    .await
+                    .expect("could set breakpoint");
+            }
+        }
+
+        Ok((if adding_breakpoint {
+            "breakpoint set"
+        } else {
+            "breakpoint removed"
+        })
+        .into())
     }
 }
 
@@ -162,9 +231,67 @@ impl Handler for NeovimHandler {
                 )
                 .await
             }
+            "breakpoint" => self.breakpoint(neovim).await,
             _ => unimplemented!(),
         }
     }
+}
+
+async fn setup_signs(neovim: &Neovim<Compat<Stdout>>) -> Result<()> {
+    let sign_background_colour_output = neovim.exec("highlight SignColumn", true).await?;
+    let sign_background_colour_output = sign_background_colour_output
+        .split("\n")
+        .collect::<Vec<&str>>();
+    assert_eq!(sign_background_colour_output.len(), 1);
+
+    let mut ctermbg = "";
+    let mut guibg = "";
+
+    for snippet in sign_background_colour_output.get(0).unwrap().split(" ") {
+        if snippet.len() >= 8 && &snippet[0..8] == "ctermbg=" {
+            ctermbg = &snippet[8..];
+        } else if snippet.len() >= 6 && &snippet[0..6] == "guibg=" {
+            guibg = &snippet[6..];
+        }
+    }
+
+    if guibg != "" && ctermbg != "" {
+        neovim
+            .exec(
+                &format!(
+                    "highlight VadreBreakpointHighlight \
+                     guifg=#ff0000 guibg={} ctermfg=red ctermbg={}",
+                    guibg, ctermbg
+                ),
+                false,
+            )
+            .await?;
+        neovim
+            .exec(
+                &format!(
+                    "highlight VadreDebugPointerHighlight \
+                     guifg=#00ff00 guibg={} ctermfg=green ctermbg={}",
+                    guibg, ctermbg
+                ),
+                false,
+            )
+            .await?;
+    } else {
+        neovim
+            .exec(
+                "highlight VadreBreakpointHighlight guifg=#ff0000 ctermfg=red",
+                false,
+            )
+            .await?;
+        neovim
+            .exec(
+                "highlight VadreDebugPointerHighlight guifg=#00ff00 ctermfg=green",
+                false,
+            )
+            .await?;
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -183,7 +310,9 @@ async fn main() -> Result<()> {
 
     tracing::info!("Loading VADRE plugin");
     let handler: NeovimHandler = NeovimHandler::new();
-    let (nvim, io_handler) = create::new_parent(handler).await;
+    let (neovim, io_handler) = create::new_parent(handler).await;
+
+    setup_signs(&neovim).await?;
 
     match io_handler.await {
         Err(joinerr) => tracing::error!("Error joining IO loop: '{}'", joinerr),
@@ -192,7 +321,8 @@ async fn main() -> Result<()> {
             if !err.is_reader_error() {
                 // One last try, since there wasn't an error with writing to the
                 // stream
-                nvim.err_writeln(&format!("Error: '{}'", err))
+                neovim
+                    .err_writeln(&format!("Error: '{}'", err))
                     .await
                     .unwrap_or_else(|e| {
                         // We could inspect this error to see what was happening, and

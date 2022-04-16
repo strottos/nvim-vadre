@@ -8,7 +8,7 @@ use tokio::io::Stdout;
 pub enum VadreLogLevel {
     CRITICAL,
     ERROR,
-    // WARN,
+    WARN,
     INFO,
     DEBUG,
 }
@@ -18,6 +18,7 @@ impl VadreLogLevel {
         match self {
             VadreLogLevel::CRITICAL => 1,
             VadreLogLevel::ERROR => 2,
+            VadreLogLevel::WARN => 2,
             VadreLogLevel::INFO => 4,
             VadreLogLevel::DEBUG => 5,
         }
