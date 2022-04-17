@@ -1,14 +1,24 @@
-use std::{cmp, collections::HashMap, fmt::Display};
+use std::{
+    cmp,
+    collections::HashMap,
+    fmt::Display,
+    path::Path,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use nvim_rs::{compat::tokio::Compat, Buffer, Neovim, Value, Window};
 use tokio::io::Stdout;
+
+// Arbitrary number so no clashes with other plugins (hopefully)
+// TODO: Find a better solution
+static VADRE_NEXT_SIGN_ID: AtomicUsize = AtomicUsize::new(1157831);
 
 #[derive(Clone, Debug)]
 pub enum VadreLogLevel {
     CRITICAL,
     ERROR,
-    // WARN,
+    WARN,
     INFO,
     DEBUG,
 }
@@ -18,7 +28,7 @@ impl VadreLogLevel {
         match self {
             VadreLogLevel::CRITICAL => 1,
             VadreLogLevel::ERROR => 2,
-            // VadreLogLevel::WARN => 2,
+            VadreLogLevel::WARN => 3,
             VadreLogLevel::INFO => 4,
             VadreLogLevel::DEBUG => 5,
         }
@@ -68,11 +78,11 @@ impl VadreBufferType {
         }
     }
 
-    fn buffer_post_display(&self) -> &str {
+    fn buffer_post_display(&self) -> Option<&str> {
         match self {
-            VadreBufferType::Code => "",
-            VadreBufferType::Logs => "Logs",
-            VadreBufferType::Terminal => "Terminal",
+            VadreBufferType::Code => None,
+            VadreBufferType::Logs => Some("Logs"),
+            VadreBufferType::Terminal => Some("Terminal"),
         }
     }
 
@@ -91,6 +101,7 @@ pub struct NeovimVadreWindow {
     instance_id: usize,
     windows: HashMap<VadreWindowType, Window<Compat<Stdout>>>,
     buffers: HashMap<VadreBufferType, Buffer<Compat<Stdout>>>,
+    pointer_sign_id: usize,
 }
 
 impl NeovimVadreWindow {
@@ -100,6 +111,7 @@ impl NeovimVadreWindow {
             instance_id,
             buffers: HashMap::new(),
             windows: HashMap::new(),
+            pointer_sign_id: VADRE_NEXT_SIGN_ID.fetch_add(1, Ordering::SeqCst),
         }
     }
 
@@ -140,7 +152,7 @@ impl NeovimVadreWindow {
         let window = windows.next().unwrap();
         let buffer = window.get_buf().await?;
         self.neovim.set_current_win(&window).await?;
-        self.set_vadre_buffer(&buffer, VadreBufferType::Code)
+        self.set_vadre_buffer_options(&buffer, VadreBufferType::Code)
             .await?;
         self.set_keys_for_code_buffer(&buffer).await?;
 
@@ -150,7 +162,7 @@ impl NeovimVadreWindow {
         // Window 2 is Output stuff, logs at the moment
         let window = windows.next().unwrap();
         let log_buffer = window.get_buf().await?;
-        self.set_vadre_buffer(&log_buffer, VadreBufferType::Logs)
+        self.set_vadre_buffer_options(&log_buffer, VadreBufferType::Logs)
             .await?;
         self.set_keys_for_output_buffer(&log_buffer).await?;
 
@@ -160,7 +172,7 @@ impl NeovimVadreWindow {
         // Window 3 is Output stuff, logs at the moment
         let window = windows.next().unwrap();
         let terminal_buffer = window.get_buf().await?;
-        self.set_vadre_buffer(&terminal_buffer, VadreBufferType::Terminal)
+        self.set_vadre_buffer_options(&terminal_buffer, VadreBufferType::Terminal)
             .await?;
         window.set_height(output_window_height).await?;
 
@@ -247,6 +259,48 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
+    pub async fn set_code_buffer(&self, path: &Path, line_number: u64) -> Result<()> {
+        tracing::trace!("Opening {:?} in code buffer", path);
+
+        if !path.exists() {
+            let path_str = path.to_str().unwrap();
+            self.log_msg(
+                VadreLogLevel::WARN,
+                &format!("Source path {} doesn't exist", path_str),
+            )
+            .await?;
+            bail!("Source {} doesn't exist", path_str);
+        }
+
+        let code_buffer = self.buffers.get(&VadreBufferType::Code).unwrap();
+        let contents = tokio::fs::read_to_string(path)
+            .await?
+            .split("\n")
+            .map(|x| x.to_string())
+            .collect();
+        let line_count = code_buffer.line_count().await?;
+
+        self.write_to_window(&code_buffer, 0, line_count + 1, contents)
+            .await?;
+        let buffer_name = self.get_buffer_name(&VadreBufferType::Code, path.to_str());
+        code_buffer.set_name(&buffer_name).await?;
+
+        let pointer_sign_id = self.pointer_sign_id;
+        self.neovim
+            .exec(
+                &format!(
+                    "sign place {} line={} name=VadreDebugPointer buffer={}",
+                    pointer_sign_id,
+                    line_number,
+                    code_buffer.get_number().await?,
+                ),
+                false,
+            )
+            .await?;
+
+        Ok(())
+    }
+
     async fn write_to_window(
         &self,
         buffer: &Buffer<Compat<Stdout>>,
@@ -287,13 +341,26 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
-    async fn set_vadre_buffer(
+    async fn set_vadre_buffer_options(
         &self,
         buffer: &Buffer<Compat<Stdout>>,
         buffer_type: VadreBufferType,
     ) -> Result<()> {
-        let post_display = buffer_type.buffer_post_display();
-        let buffer_name = if post_display != "" {
+        let buffer_name = self.get_buffer_name(&buffer_type, None);
+        let file_type = buffer_type.type_name();
+        buffer.set_name(&buffer_name).await?;
+        buffer.set_option("swapfile", false.into()).await?;
+        buffer.set_option("buftype", "nofile".into()).await?;
+        buffer.set_option("filetype", file_type.into()).await?;
+        buffer.set_option("buflisted", false.into()).await?;
+        buffer.set_option("modifiable", false.into()).await?;
+
+        Ok(())
+    }
+
+    fn get_buffer_name(&self, buffer_type: &VadreBufferType, post_display: Option<&str>) -> String {
+        let post_display = post_display.or(buffer_type.buffer_post_display());
+        if let Some(post_display) = post_display {
             format!(
                 "{} ({}) - {}",
                 buffer_type.buffer_name_prefix(),
@@ -306,16 +373,7 @@ impl NeovimVadreWindow {
                 buffer_type.buffer_name_prefix(),
                 self.instance_id,
             )
-        };
-        let file_type = buffer_type.type_name();
-        buffer.set_name(&buffer_name).await?;
-        buffer.set_option("swapfile", false.into()).await?;
-        buffer.set_option("buftype", "nofile".into()).await?;
-        buffer.set_option("filetype", file_type.into()).await?;
-        buffer.set_option("buflisted", false.into()).await?;
-        buffer.set_option("modifiable", false.into()).await?;
-
-        Ok(())
+        }
     }
 
     async fn set_keys_for_code_buffer(&self, buffer: &Buffer<Compat<Stdout>>) -> Result<()> {
@@ -331,4 +389,74 @@ impl NeovimVadreWindow {
 
         Ok(())
     }
+}
+
+pub async fn setup_signs(neovim: &Neovim<Compat<Stdout>>) -> Result<()> {
+    let sign_background_colour_output = neovim.exec("highlight SignColumn", true).await?;
+    let sign_background_colour_output = sign_background_colour_output
+        .split("\n")
+        .collect::<Vec<&str>>();
+    assert_eq!(sign_background_colour_output.len(), 1);
+
+    let mut ctermbg = "";
+    let mut guibg = "";
+
+    for snippet in sign_background_colour_output.get(0).unwrap().split(" ") {
+        if snippet.len() >= 8 && &snippet[0..8] == "ctermbg=" {
+            ctermbg = &snippet[8..];
+        } else if snippet.len() >= 6 && &snippet[0..6] == "guibg=" {
+            guibg = &snippet[6..];
+        }
+    }
+
+    if guibg != "" && ctermbg != "" {
+        neovim
+            .exec(
+                &format!(
+                    "highlight VadreBreakpointHighlight \
+                     guifg=#ff0000 guibg={} ctermfg=red ctermbg={}",
+                    guibg, ctermbg
+                ),
+                false,
+            )
+            .await?;
+        neovim
+            .exec(
+                &format!(
+                    "highlight VadreDebugPointerHighlight \
+                     guifg=#00ff00 guibg={} ctermfg=green ctermbg={}",
+                    guibg, ctermbg
+                ),
+                false,
+            )
+            .await?;
+    } else {
+        neovim
+            .exec(
+                "highlight VadreBreakpointHighlight guifg=#ff0000 ctermfg=red",
+                false,
+            )
+            .await?;
+        neovim
+            .exec(
+                "highlight VadreDebugPointerHighlight guifg=#00ff00 ctermfg=green",
+                false,
+            )
+            .await?;
+    }
+
+    neovim
+        .exec(
+            "sign define VadreBreakpoint text=() texthl=VadreBreakpointHighlight",
+            false,
+        )
+        .await?;
+    neovim
+        .exec(
+            "sign define VadreDebugPointer text=-> texthl=VadreDebugPointerHighlight",
+            false,
+        )
+        .await?;
+
+    Ok(())
 }

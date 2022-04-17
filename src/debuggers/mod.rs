@@ -54,7 +54,6 @@ impl Debugger {
         file_path: String,
         line_numbers: &HashSet<i64>,
     ) -> Result<()> {
-        tracing::trace!("HERE1");
         match self {
             Debugger::CodeLLDB(debugger) => {
                 debugger.set_breakpoints(file_path, line_numbers).await?
@@ -216,7 +215,6 @@ impl CodeLLDBDebugger {
         let (read_conn, write_conn) = tcp_conn.into_split();
 
         let response_senders = self.response_senders.clone();
-
         let write_tx = self.write_tx.clone();
         let seq_ids = self.seq_ids.clone();
 
@@ -262,6 +260,7 @@ impl CodeLLDBDebugger {
 
                 let r#type = response_json.get("type").expect("type should be set");
                 if r#type == "request" {
+                    // CodeLLDB is requesting something from us, currently only runTerminal should be received
                     let command = response_json.get("command").expect("command should be set");
                     if command == "runInTerminal" {
                         neovim_vadre_window
@@ -288,7 +287,7 @@ impl CodeLLDBDebugger {
                             .await
                             .expect("Spawning terminal command failed");
 
-                        let seq_id = seq_ids.fetch_add(1, Ordering::SeqCst);
+                        let seq_id = seq_ids.clone().fetch_add(1, Ordering::SeqCst);
                         let req_id = response_json.get("seq").expect("seq should be set");
 
                         let response = serde_json::json!({
@@ -313,8 +312,8 @@ impl CodeLLDBDebugger {
                     } else {
                         neovim_vadre_window
                             .log_msg(
-                                VadreLogLevel::INFO,
-                                &format!("Need to code in request: {}", command),
+                                VadreLogLevel::WARN,
+                                &format!("Unknown request from CodeLLDB: {}", response_json),
                             )
                             .await
                             .expect("Logging failed");
@@ -356,25 +355,25 @@ impl CodeLLDBDebugger {
                             .get("body")
                             .expect("body should be set")
                             .get("threadId")
-                            .expect("threadId should be set");
+                            .expect("threadId should be set")
+                            .as_u64()
+                            .expect("threadId should be u64");
 
-                        tracing::debug!("Thread id {} stopped", thread_id);
+                        let seq_ids = seq_ids.clone();
+                        let write_tx = write_tx.clone();
+                        let response_senders = response_senders.clone();
+                        let neovim_vadre_window = neovim_vadre_window.clone();
 
-                        let req_id = seq_ids.fetch_add(1, Ordering::SeqCst);
-                        let request = serde_json::json!({
-                            "seq": req_id,
-                            "type": "request",
-                            "command": "stackTrace",
-                            "arguments": {
-                                "threadId": thread_id.as_i64(),
-                            },
+                        tokio::spawn(async move {
+                            CodeLLDBDebugger::process_stopped(
+                                thread_id,
+                                seq_ids,
+                                write_tx,
+                                response_senders,
+                                &neovim_vadre_window,
+                            )
+                            .await;
                         });
-
-                        write_tx
-                            .clone()
-                            .send(request)
-                            .await
-                            .expect("Can send to sender for socket");
                     }
                 }
             }
@@ -622,6 +621,8 @@ impl CodeLLDBDebugger {
 
         response_senders.lock().await.insert(seq_id, sender);
 
+        tracing::debug!("Request: {}", request);
+
         write_tx.send(request).await?;
 
         // TODO: configurable timeout
@@ -629,9 +630,58 @@ impl CodeLLDBDebugger {
             Ok(resp) => resp?,
             Err(e) => bail!("Timed out waiting for a response: {}", e),
         };
-        tracing::debug!("Got response: {}", response.to_string());
+        tracing::debug!("Response: {}", response.to_string());
 
         Ok(response)
+    }
+
+    async fn process_stopped(
+        thread_id: u64,
+        seq_ids: Arc<AtomicU64>,
+        write_tx: mpsc::Sender<serde_json::Value>,
+        response_senders: Arc<Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>>,
+        neovim_vadre_window: &NeovimVadreWindow,
+    ) {
+        tracing::debug!("Thread id {} stopped", thread_id);
+
+        let seq_id = seq_ids.clone().fetch_add(1, Ordering::SeqCst);
+
+        let stack_response = CodeLLDBDebugger::do_send_request_and_await_response(
+            seq_id,
+            "stackTrace",
+            serde_json::json!({ "threadId": thread_id }),
+            write_tx.clone(),
+            response_senders.clone(),
+        )
+        .await
+        .expect("received response");
+
+        let stack = stack_response
+            .get("body")
+            .expect("should have body")
+            .get("stackFrames")
+            .expect("should have stackFrames");
+        let current_frame = stack.get(0).expect("should have a top frame");
+        let source_file = current_frame
+            .get("source")
+            .expect("should have a source")
+            .get("path")
+            .expect("should have a path")
+            .as_str()
+            .expect("path is a string");
+        let source_file = Path::new(&source_file);
+        let line_number = current_frame
+            .get("line")
+            .expect("should have a line")
+            .as_u64()
+            .expect("line should be a u64");
+
+        tracing::trace!("Stop at {:?}:{}", source_file, line_number);
+
+        neovim_vadre_window
+            .set_code_buffer(&source_file, line_number)
+            .await
+            .expect("can set source file in buffer");
     }
 }
 

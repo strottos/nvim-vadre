@@ -26,9 +26,6 @@ use nvim_rs::{compat::tokio::Compat, create::tokio as create, Handler, Neovim, V
 use tokio::{io::Stdout, sync::Mutex};
 
 static VADRE_NEXT_INSTANCE_NUM: AtomicUsize = AtomicUsize::new(1);
-// Arbitrary number so no clashes with other plugins (hopefully)
-// TODO: Find a better solution
-static VADRE_NEXT_SIGN_ID: AtomicUsize = AtomicUsize::new(1157831);
 
 type VadreResult = Result<Value, Value>;
 
@@ -254,63 +251,6 @@ impl Handler for NeovimHandler {
     }
 }
 
-async fn setup_signs(neovim: &Neovim<Compat<Stdout>>) -> Result<()> {
-    let sign_background_colour_output = neovim.exec("highlight SignColumn", true).await?;
-    let sign_background_colour_output = sign_background_colour_output
-        .split("\n")
-        .collect::<Vec<&str>>();
-    assert_eq!(sign_background_colour_output.len(), 1);
-
-    let mut ctermbg = "";
-    let mut guibg = "";
-
-    for snippet in sign_background_colour_output.get(0).unwrap().split(" ") {
-        if snippet.len() >= 8 && &snippet[0..8] == "ctermbg=" {
-            ctermbg = &snippet[8..];
-        } else if snippet.len() >= 6 && &snippet[0..6] == "guibg=" {
-            guibg = &snippet[6..];
-        }
-    }
-
-    if guibg != "" && ctermbg != "" {
-        neovim
-            .exec(
-                &format!(
-                    "highlight VadreBreakpointHighlight \
-                     guifg=#ff0000 guibg={} ctermfg=red ctermbg={}",
-                    guibg, ctermbg
-                ),
-                false,
-            )
-            .await?;
-        neovim
-            .exec(
-                &format!(
-                    "highlight VadreDebugPointerHighlight \
-                     guifg=#00ff00 guibg={} ctermfg=green ctermbg={}",
-                    guibg, ctermbg
-                ),
-                false,
-            )
-            .await?;
-    } else {
-        neovim
-            .exec(
-                "highlight VadreBreakpointHighlight guifg=#ff0000 ctermfg=red",
-                false,
-            )
-            .await?;
-        neovim
-            .exec(
-                "highlight VadreDebugPointerHighlight guifg=#00ff00 ctermfg=green",
-                false,
-            )
-            .await?;
-    }
-
-    Ok(())
-}
-
 #[tokio::main]
 #[tracing::instrument]
 async fn main() -> Result<()> {
@@ -329,7 +269,7 @@ async fn main() -> Result<()> {
     let handler: NeovimHandler = NeovimHandler::new();
     let (neovim, io_handler) = create::new_parent(handler).await;
 
-    setup_signs(&neovim).await?;
+    crate::neovim::setup_signs(&neovim).await?;
 
     match io_handler.await {
         Err(joinerr) => tracing::error!("Error joining IO loop: '{}'", joinerr),
