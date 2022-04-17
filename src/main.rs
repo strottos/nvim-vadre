@@ -155,8 +155,10 @@ impl NeovimHandler {
             .expect("could get current cursor position");
 
         let line_number = cursor_position.0;
-        let file_path = dunce::canonicalize(Path::new(&file_path))
-            .expect("should be able to find canonical path");
+        let file_path = match dunce::canonicalize(Path::new(&file_path)) {
+            Ok(x) => x,
+            Err(_) => return Err("Path not found for setting breakpoint".into()),
+        };
 
         if !file_path.exists() {
             // TODO: Better erroring
@@ -207,8 +209,14 @@ impl NeovimHandler {
         }
 
         Ok((if adding_breakpoint {
+            crate::neovim::add_breakpoint_sign(&neovim, line_number)
+                .await
+                .expect("breakpoint sign should place");
             "breakpoint set"
         } else {
+            crate::neovim::remove_breakpoint_sign(&neovim, file_path, line_number)
+                .await
+                .expect("breakpoint sign should place");
             "breakpoint removed"
         })
         .into())

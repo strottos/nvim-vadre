@@ -460,3 +460,58 @@ pub async fn setup_signs(neovim: &Neovim<Compat<Stdout>>) -> Result<()> {
 
     Ok(())
 }
+
+pub async fn add_breakpoint_sign(neovim: &Neovim<Compat<Stdout>>, line_number: i64) -> Result<()> {
+    let buffer_number = neovim.get_current_buf().await?.get_number().await?;
+    let pointer_sign_id = VADRE_NEXT_SIGN_ID.fetch_add(1, Ordering::SeqCst);
+
+    neovim
+        .exec(
+            &format!(
+                "sign place {} line={} name=VadreBreakpoint buffer={}",
+                pointer_sign_id, line_number, buffer_number,
+            ),
+            false,
+        )
+        .await?;
+
+    Ok(())
+}
+
+pub async fn remove_breakpoint_sign(
+    neovim: &Neovim<Compat<Stdout>>,
+    file_name: String,
+    line_number: i64,
+) -> Result<()> {
+    let signs_in_file = neovim
+        .exec(&format!("sign place file={}", file_name), true)
+        .await?;
+    let signs_in_file_on_line = signs_in_file
+        .split("\n")
+        .into_iter()
+        .filter(|line| {
+            line.contains("name=VadreBreakpoint") && line.contains(&format!("line={}", line_number))
+        })
+        .collect::<Vec<&str>>();
+
+    assert_eq!(signs_in_file_on_line.len(), 1);
+
+    let signs_in_file_on_line = signs_in_file_on_line.get(0).unwrap();
+    let mut breakpoint_id = 0;
+    for snippet in signs_in_file_on_line.split(" ") {
+        if snippet.len() >= 3 && &snippet[0..3] == "id=" {
+            breakpoint_id = snippet[3..].parse::<u64>().expect("id is a u64");
+        }
+    }
+
+    tracing::trace!("breakpoint_id: {:?}", breakpoint_id);
+
+    neovim
+        .exec(
+            &format!("sign unplace {} file={}", breakpoint_id, file_name),
+            false,
+        )
+        .await?;
+
+    Ok(())
+}
