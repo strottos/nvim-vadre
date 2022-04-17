@@ -41,14 +41,14 @@ struct NeovimHandler {
     // though ideally.
     debuggers: Arc<Mutex<HashMap<usize, Arc<Mutex<Debugger>>>>>,
 
-    breakpoints: Arc<Mutex<HashSet<(String, i64)>>>,
+    breakpoints: Arc<Mutex<HashMap<String, HashSet<i64>>>>,
 }
 
 impl NeovimHandler {
     fn new() -> Self {
         NeovimHandler {
             debuggers: Arc::new(Mutex::new(HashMap::new())),
-            breakpoints: Arc::new(Mutex::new(HashSet::new())),
+            breakpoints: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -158,38 +158,55 @@ impl NeovimHandler {
             .expect("could get current cursor position");
 
         let line_number = cursor_position.0;
-        let position = (file_path.clone(), line_number);
+        let file_path = dunce::canonicalize(Path::new(&file_path))
+            .expect("should be able to find canonical path");
 
-        let adding_breakpoint = {
-            let mut breakpoints = self.breakpoints.lock().await;
+        if !file_path.exists() {
+            // TODO: Better erroring
+            panic!(
+                "Requested to set breakpoints in non-existent file: {:?}",
+                file_path,
+            );
+        }
 
-            if breakpoints.contains(&position) {
-                breakpoints.remove(&position);
-                false
-            } else {
-                breakpoints.insert(position);
-                true
-            }
-        };
+        let file_path = file_path.to_str().unwrap().to_string();
+
+        let line_numbers;
+        let mut adding_breakpoint = true;
+
+        {
+            let mut breakpoints_lock = self.breakpoints.lock().await;
+
+            match breakpoints_lock.remove(&file_path) {
+                Some(mut line_numbers) => {
+                    if line_numbers.contains(&line_number) {
+                        line_numbers.remove(&line_number);
+                        adding_breakpoint = false;
+                    } else {
+                        line_numbers.insert(line_number);
+                    }
+                    breakpoints_lock.insert(file_path.clone(), line_numbers);
+                }
+                None => {
+                    let mut line_numbers = HashSet::new();
+                    line_numbers.insert(line_number);
+                    breakpoints_lock.insert(file_path.clone(), line_numbers);
+                }
+            };
+            line_numbers = breakpoints_lock.get(&file_path).unwrap().clone();
+        }
+
+        tracing::trace!("Breakpoints: {:?} {:?}", file_path, line_numbers);
 
         let debuggers = self.debuggers.lock().await;
 
         for debugger in debuggers.values() {
-            if adding_breakpoint {
-                debugger
-                    .lock()
-                    .await
-                    .set_breakpoint(Path::new(&file_path), cursor_position.0)
-                    .await
-                    .expect("could set breakpoint");
-            } else {
-                debugger
-                    .lock()
-                    .await
-                    .remove_breakpoint(Path::new(&file_path), cursor_position.0)
-                    .await
-                    .expect("could set breakpoint");
-            }
+            debugger
+                .lock()
+                .await
+                .set_source_breakpoints(file_path.clone(), &line_numbers)
+                .await
+                .expect("could set breakpoints");
         }
 
         Ok((if adding_breakpoint {

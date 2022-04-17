@@ -34,7 +34,10 @@ pub enum Debugger {
 }
 
 impl Debugger {
-    pub async fn setup(&mut self, pending_breakpoints: &HashSet<(String, i64)>) -> VadreResult {
+    pub async fn setup(
+        &mut self,
+        pending_breakpoints: &HashMap<String, HashSet<i64>>,
+    ) -> VadreResult {
         match self {
             Debugger::CodeLLDB(debugger) => debugger.setup(pending_breakpoints).await,
         }
@@ -46,23 +49,15 @@ impl Debugger {
         }
     }
 
-    pub async fn set_breakpoint(&self, file_path: &Path, line_number: i64) -> Result<()> {
+    pub async fn set_source_breakpoints(
+        &self,
+        file_path: String,
+        line_numbers: &HashSet<i64>,
+    ) -> Result<()> {
+        tracing::trace!("HERE1");
         match self {
             Debugger::CodeLLDB(debugger) => {
-                debugger
-                    .set_breakpoint(file_path, line_number, true)
-                    .await?
-            }
-        }
-        Ok(())
-    }
-
-    pub async fn remove_breakpoint(&self, file_path: &Path, line_number: i64) -> Result<()> {
-        match self {
-            Debugger::CodeLLDB(debugger) => {
-                debugger
-                    .set_breakpoint(file_path, line_number, false)
-                    .await?
+                debugger.set_breakpoints(file_path, line_numbers).await?
             }
         }
         Ok(())
@@ -74,7 +69,7 @@ pub struct CodeLLDBDebugger {
     id: usize,
     command: String,
     command_args: Vec<String>,
-    seq_id: Arc<AtomicU64>,
+    seq_ids: Arc<AtomicU64>,
     pub neovim_vadre_window: NeovimVadreWindow,
     process: Option<Arc<Child>>,
 
@@ -86,8 +81,6 @@ pub struct CodeLLDBDebugger {
     // unnecessary mutex on the write_tx part if this were created when needed. This just gets
     // stolen once and we never use the mutex again.
     write_rx: Arc<Mutex<Option<mpsc::Receiver<serde_json::Value>>>>,
-
-    config_done_rx: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
 
     response_senders: Arc<Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>>,
 }
@@ -107,21 +100,22 @@ impl CodeLLDBDebugger {
             id,
             command,
             command_args,
-            seq_id: Arc::new(AtomicU64::new(1)),
+            seq_ids: Arc::new(AtomicU64::new(1)),
             neovim_vadre_window,
             process: None,
 
             write_tx,
             write_rx: Arc::new(Mutex::new(Some(write_rx))),
 
-            config_done_rx: Arc::new(Mutex::new(None)),
-
             response_senders: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     #[tracing::instrument(skip(self))]
-    pub async fn setup(&mut self, pending_breakpoints: &HashSet<(String, i64)>) -> VadreResult {
+    pub async fn setup(
+        &mut self,
+        pending_breakpoints: &HashMap<String, HashSet<i64>>,
+    ) -> VadreResult {
         log_err!(
             self.neovim_vadre_window.create_ui().await,
             self.neovim_vadre_window,
@@ -135,13 +129,15 @@ impl CodeLLDBDebugger {
             self.neovim_vadre_window,
             "Error launching process"
         );
+
+        let (config_done_tx, config_done_rx) = oneshot::channel();
         log_err!(
-            self.tcp_connect(port).await,
+            self.tcp_connect(port, config_done_tx).await,
             self.neovim_vadre_window,
             "Error creating TCP connection to process"
         );
         log_err!(
-            self.init_process(pending_breakpoints).await,
+            self.init_process(pending_breakpoints, config_done_rx).await,
             self.neovim_vadre_window,
             "Error initialising process"
         );
@@ -154,35 +150,19 @@ impl CodeLLDBDebugger {
         Ok(Value::from("CodeLLDB launched and setup"))
     }
 
-    pub async fn set_breakpoint(
+    pub async fn set_breakpoints(
         &self,
-        file_path: &Path,
-        line_number: i64,
-        adding: bool,
+        file_path: String,
+        line_numbers: &HashSet<i64>,
     ) -> Result<()> {
         tracing::trace!(
-            "CodeLLDB {} breakpoint at file {:?} and line number {}",
-            if adding { "setting" } else { "removing" },
+            "CodeLLDB setting breakpoints in file {:?} on lines {:?}",
             file_path,
-            line_number,
+            line_numbers,
         );
 
-        if !file_path.exists() {
-            self.neovim_vadre_window
-                .log_msg(
-                    VadreLogLevel::WARN,
-                    &format!(
-                        "Requested to {} breakpoint in file not found: {:?}",
-                        if adding { "add" } else { "remove" },
-                        file_path,
-                    ),
-                )
-                .await?;
-        }
-
-        if adding {
-            self.send_breakpoint_request(file_path, line_number).await?;
-        }
+        self.send_breakpoints_request(file_path, line_numbers)
+            .await?;
 
         Ok(())
     }
@@ -227,7 +207,7 @@ impl CodeLLDBDebugger {
     }
 
     #[tracing::instrument(skip(self, port))]
-    async fn tcp_connect(&mut self, port: u16) -> Result<()> {
+    async fn tcp_connect(&mut self, port: u16, config_done_tx: oneshot::Sender<()>) -> Result<()> {
         tracing::trace!("Connecting to port {}", port);
 
         let neovim_vadre_window = self.neovim_vadre_window.clone();
@@ -238,10 +218,7 @@ impl CodeLLDBDebugger {
         let response_senders = self.response_senders.clone();
 
         let write_tx = self.write_tx.clone();
-        let seq_id = self.seq_id.clone();
-
-        let (config_done_tx, config_done_rx) = oneshot::channel();
-        *self.config_done_rx.lock().await = Some(config_done_rx);
+        let seq_ids = self.seq_ids.clone();
 
         tokio::spawn(async move {
             let mut buf = [0u8; 4096];
@@ -311,11 +288,11 @@ impl CodeLLDBDebugger {
                             .await
                             .expect("Spawning terminal command failed");
 
-                        let resp_id = seq_id.fetch_add(1, Ordering::SeqCst);
+                        let seq_id = seq_ids.fetch_add(1, Ordering::SeqCst);
                         let req_id = response_json.get("seq").expect("seq should be set");
 
                         let response = serde_json::json!({
-                            "seq_id": resp_id,
+                            "seq_id": seq_id,
                             "type": "response",
                             "request_seq": req_id,
                             "command": "runInTerminal",
@@ -374,6 +351,30 @@ impl CodeLLDBDebugger {
                             )
                             .await
                             .expect("Logging failed");
+                    } else if event == "stopped" {
+                        let thread_id = response_json
+                            .get("body")
+                            .expect("body should be set")
+                            .get("threadId")
+                            .expect("threadId should be set");
+
+                        tracing::debug!("Thread id {} stopped", thread_id);
+
+                        let req_id = seq_ids.fetch_add(1, Ordering::SeqCst);
+                        let request = serde_json::json!({
+                            "seq": req_id,
+                            "type": "request",
+                            "command": "stackTrace",
+                            "arguments": {
+                                "threadId": thread_id.as_i64(),
+                            },
+                        });
+
+                        write_tx
+                            .clone()
+                            .send(request)
+                            .await
+                            .expect("Can send to sender for socket");
                     }
                 }
             }
@@ -432,7 +433,11 @@ impl CodeLLDBDebugger {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn init_process(&self, pending_breakpoints: &HashSet<(String, i64)>) -> Result<()> {
+    async fn init_process(
+        &self,
+        pending_breakpoints: &HashMap<String, HashSet<i64>>,
+        config_done_rx: oneshot::Receiver<()>,
+    ) -> Result<()> {
         self.send_request_and_await_response(
             "initialize",
             serde_json::json!({
@@ -492,13 +497,12 @@ impl CodeLLDBDebugger {
         )
         .await?;
 
-        let config_done_rx = self.config_done_rx.lock().await.take().unwrap();
-        timeout(Duration::new(10, 0), config_done_rx).await??;
-
         for breakpoint in pending_breakpoints {
-            self.send_breakpoint_request(Path::new(&breakpoint.0), breakpoint.1)
+            self.send_breakpoints_request(breakpoint.0.clone(), breakpoint.1)
                 .await?;
         }
+
+        timeout(Duration::new(10, 0), config_done_rx).await??;
 
         self.send_request_and_await_response("configurationDone", serde_json::json!({}))
             .await?;
@@ -512,7 +516,7 @@ impl CodeLLDBDebugger {
         args: serde_json::Value,
         mut sender: Option<oneshot::Sender<serde_json::Value>>,
     ) -> Result<()> {
-        let seq_id = self.seq_id.fetch_add(1, Ordering::SeqCst);
+        let seq_id = self.seq_ids.fetch_add(1, Ordering::SeqCst);
 
         if let Some(sender) = sender.take() {
             self.response_senders.lock().await.insert(seq_id, sender);
@@ -536,34 +540,39 @@ impl CodeLLDBDebugger {
         command: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let (sender, receiver) = oneshot::channel();
+        let seq_id = self.seq_ids.fetch_add(1, Ordering::SeqCst);
 
-        self.send_request(command, args, Some(sender)).await?;
-
-        // TODO: configurable timeout
-        let response = match timeout(Duration::new(10, 0), receiver).await {
-            Ok(resp) => resp?,
-            Err(e) => bail!("Timed out waiting for a response: {}", e),
-        };
-        tracing::debug!("Got response: {}", response.to_string());
-
-        Ok(response)
+        CodeLLDBDebugger::do_send_request_and_await_response(
+            seq_id,
+            command,
+            args,
+            self.write_tx.clone(),
+            self.response_senders.clone(),
+        )
+        .await
     }
 
-    async fn send_breakpoint_request(&self, file_path: &Path, line_number: i64) -> Result<()> {
-        let file_name = file_path.file_name().unwrap().to_str().unwrap();
-        let file_path = dunce::canonicalize(file_path)?;
+    async fn send_breakpoints_request(
+        &self,
+        file_path: String,
+        line_numbers: &HashSet<i64>,
+    ) -> Result<()> {
+        let file_name = Path::new(&file_path).file_name().unwrap().to_str().unwrap();
+
+        let breakpoints = line_numbers
+            .into_iter()
+            .map(|x| return serde_json::json!({ "line": x }))
+            .collect::<Vec<serde_json::Value>>();
+        let breakpoints = serde_json::json!(breakpoints);
 
         self.send_request(
             "setBreakpoints",
             serde_json::json!({
                 "source": {
                     "name": file_name,
-                    "path": file_path.to_str().unwrap(),
+                    "path": file_path,
                 },
-                "breakpoints": [{
-                    "line": line_number,
-                }],
+                "breakpoints": breakpoints,
                 "sourceModified": false,
             }),
             None,
@@ -593,6 +602,36 @@ impl CodeLLDBDebugger {
         }
 
         Ok(())
+    }
+
+    async fn do_send_request_and_await_response(
+        seq_id: u64,
+        command: &str,
+        args: serde_json::Value,
+        write_tx: mpsc::Sender<serde_json::Value>,
+        response_senders: Arc<Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>>,
+    ) -> Result<serde_json::Value> {
+        let (sender, receiver) = oneshot::channel();
+
+        let request = serde_json::json!({
+            "command": command,
+            "arguments": args,
+            "seq": seq_id,
+            "type": "request",
+        });
+
+        response_senders.lock().await.insert(seq_id, sender);
+
+        write_tx.send(request).await?;
+
+        // TODO: configurable timeout
+        let response = match timeout(Duration::new(10, 0), receiver).await {
+            Ok(resp) => resp?,
+            Err(e) => bail!("Timed out waiting for a response: {}", e),
+        };
+        tracing::debug!("Got response: {}", response.to_string());
+
+        Ok(response)
     }
 }
 
