@@ -701,8 +701,8 @@ impl CodeLLDBDebugger {
         let line_number = current_frame
             .get("line")
             .expect("should have a line")
-            .as_u64()
-            .expect("line should be a u64");
+            .as_i64()
+            .expect("line should be an i64");
 
         tracing::trace!("Stop at {:?}:{}", source_file, line_number);
 

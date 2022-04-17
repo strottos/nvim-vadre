@@ -783,6 +783,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "dunce",
+ "lazy_static",
  "nvim-rs",
  "reqwest",
  "serde",

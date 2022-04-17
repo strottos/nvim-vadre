@@ -14,6 +14,17 @@ use tokio::io::Stdout;
 // TODO: Find a better solution
 static VADRE_NEXT_SIGN_ID: AtomicUsize = AtomicUsize::new(1157831);
 
+lazy_static! {
+    static ref VIM_FILE_TYPES: HashMap<&'static str, &'static str> = {
+        let mut m = HashMap::new();
+        m.insert("rs", "rust");
+        m.insert("c", "c");
+        m.insert("cpp", "cpp");
+        m.insert("py", "python");
+        m
+    };
+}
+
 #[derive(Clone, Debug)]
 pub enum VadreLogLevel {
     CRITICAL,
@@ -259,7 +270,7 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
-    pub async fn set_code_buffer(&self, path: &Path, line_number: u64) -> Result<()> {
+    pub async fn set_code_buffer(&self, path: &Path, line_number: i64) -> Result<()> {
         tracing::trace!("Opening {:?} in code buffer", path);
 
         if !path.exists() {
@@ -272,20 +283,49 @@ impl NeovimVadreWindow {
             bail!("Source {} doesn't exist", path_str);
         }
 
-        let code_buffer = self.buffers.get(&VadreBufferType::Code).unwrap();
-        let contents = tokio::fs::read_to_string(path)
-            .await?
-            .split("\n")
-            .map(|x| x.to_string())
-            .collect();
-        let line_count = code_buffer.line_count().await?;
-
-        self.write_to_window(&code_buffer, 0, line_count + 1, contents)
-            .await?;
         let buffer_name = self.get_buffer_name(&VadreBufferType::Code, path.to_str());
-        code_buffer.set_name(&buffer_name).await?;
+        let code_buffer = self.buffers.get(&VadreBufferType::Code).unwrap();
+        let old_buffer_name = code_buffer.get_name().await?;
+
+        tracing::trace!("{} != {}", old_buffer_name, buffer_name);
+        if !old_buffer_name.ends_with(&buffer_name) {
+            tracing::trace!("Resetting file to {:?}", path);
+
+            let contents = tokio::fs::read_to_string(path)
+                .await?
+                .split("\n")
+                .map(|x| x.to_string())
+                .collect();
+            let line_count = code_buffer.line_count().await?;
+
+            self.write_to_window(&code_buffer, 0, line_count + 1, contents)
+                .await?;
+
+            match path.extension() {
+                Some(ext) => {
+                    let ext = ext.to_str().unwrap();
+                    match VIM_FILE_TYPES.get(ext) {
+                        Some(file_type) => {
+                            self.neovim
+                                .command(&format!("set filetype={}", file_type))
+                                .await?;
+                            self.neovim
+                                .command(&format!("set filetype={}", file_type))
+                                .await?;
+                        }
+                        None => {}
+                    };
+                }
+                None => {}
+            };
+            code_buffer.set_name(&buffer_name).await?;
+        }
 
         let pointer_sign_id = self.pointer_sign_id;
+        self.neovim
+            .exec(&format!("sign unplace {}", pointer_sign_id), false)
+            .await?;
+
         self.neovim
             .exec(
                 &format!(
@@ -297,6 +337,9 @@ impl NeovimVadreWindow {
                 false,
             )
             .await?;
+
+        let code_window = self.windows.get(&VadreWindowType::Code).unwrap();
+        code_window.set_cursor((line_number, 0)).await?;
 
         Ok(())
     }
