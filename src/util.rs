@@ -12,12 +12,12 @@ use anyhow::Result;
 macro_rules! ret_err {
     ($e:expr) => {
         if let Err(e) = $e {
-            return Err(format!("Generic error: {}", e).into());
+            bail!("Generic error: {}", e);
         }
     };
     ($e:expr, $msg:expr) => {
         if let Err(e) = $e {
-            return Err(format!("{}: {}", $msg, e).into());
+            bail!("{}: {}", $msg, e);
         }
     };
 }
@@ -30,14 +30,14 @@ macro_rules! log_err {
         if let Err(e) = $e {
             let msg = format!("Generic error: {}", e);
             ret_err!($logger.log_msg(VadreLogLevel::ERROR, &msg).await);
-            return Err(msg.into());
+            bail!("{}", msg);
         }
     };
     ($e:expr, $logger:expr, $msg:expr) => {
         if let Err(e) = $e {
             let msg = format!("{}: {}", $msg, e);
             ret_err!($logger.log_msg(VadreLogLevel::ERROR, &msg).await);
-            return Err(msg.into());
+            bail!("{}", msg);
         }
     };
 }

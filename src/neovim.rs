@@ -377,7 +377,47 @@ impl NeovimVadreWindow {
     }
 
     async fn set_keys_for_code_buffer(&self, buffer: &Buffer<Compat<Stdout>>) -> Result<()> {
-        buffer.set_keymap("n", "r", ":VadreRun<CR>", vec![]).await?; // nnoremap <silent> <buffer> r :PadreRun<cr>
+        // TODO: Configurable?
+        buffer
+            .set_keymap(
+                "n",
+                "S",
+                &format!(":VadreStepIn {}<CR>", self.instance_id),
+                vec![],
+            )
+            .await?; // nnoremap <silent> <buffer> r :PadreRun<cr>
+        buffer
+            .set_keymap(
+                "n",
+                "s",
+                &format!(":VadreStepOver {}<CR>", self.instance_id),
+                vec![],
+            )
+            .await?; // nnoremap <silent> <buffer> r :PadreRun<cr>
+        buffer
+            .set_keymap(
+                "n",
+                "n",
+                &format!(":VadreStepOver {}<CR>", self.instance_id),
+                vec![],
+            )
+            .await?; // nnoremap <silent> <buffer> r :PadreRun<cr>
+        buffer
+            .set_keymap(
+                "n",
+                "c",
+                &format!(":VadreContinue {}<CR>", self.instance_id),
+                vec![],
+            )
+            .await?; // nnoremap <silent> <buffer> r :PadreRun<cr>
+        buffer
+            .set_keymap(
+                "n",
+                "C",
+                &format!(":VadreContinue {}<CR>", self.instance_id),
+                vec![],
+            )
+            .await?; // nnoremap <silent> <buffer> r :PadreRun<cr>
 
         Ok(())
     }

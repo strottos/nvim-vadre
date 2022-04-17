@@ -55,6 +55,9 @@ function! s:configureCommands()
     command! VadrePing :call s:ping()
     command! -nargs=* -complete=file VadreDebug call s:launch(<f-args>)
     command! -nargs=0 VadreBreakpoint call s:breakpoint()
+    command! -nargs=1 VadreStepIn call s:step_in(<f-args>)
+    command! -nargs=1 VadreStepOver call s:step_over(<f-args>)
+    command! -nargs=1 VadreContinue call s:continue(<f-args>)
 endfunction
 
 function! s:ping()
@@ -66,7 +69,19 @@ function! s:launch(...)
 endfunction
 
 function! s:breakpoint()
-    echom rpcrequest(s:vadreJobId, "breakpoint", a:000)
+    echom rpcrequest(s:vadreJobId, "breakpoint")
+endfunction
+
+function! s:step_in(instance_id)
+    call rpcrequest(s:vadreJobId, "step_in", a:instance_id)
+endfunction
+
+function! s:step_over(instance_id)
+    call rpcrequest(s:vadreJobId, "step_over", a:instance_id)
+endfunction
+
+function! s:continue(instance_id)
+    call rpcrequest(s:vadreJobId, "continue", a:instance_id)
 endfunction
 
 " TODO: Make these log to logs if available??

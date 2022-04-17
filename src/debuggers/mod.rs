@@ -14,11 +14,10 @@ use std::{
 use crate::{
     neovim::{NeovimVadreWindow, VadreLogLevel},
     util::{self, get_debuggers_dir, log_err, ret_err},
-    VadreResult,
 };
 
 use anyhow::{bail, Result};
-use nvim_rs::{compat::tokio::Compat, Neovim, Value};
+use nvim_rs::{compat::tokio::Compat, Neovim};
 use reqwest::Url;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, Stdout},
@@ -29,6 +28,13 @@ use tokio::{
 };
 
 #[derive(Clone, Debug)]
+pub enum DebuggerStepType {
+    Over,
+    In,
+    Continue,
+}
+
+#[derive(Clone, Debug)]
 pub enum Debugger {
     CodeLLDB(CodeLLDBDebugger),
 }
@@ -37,7 +43,7 @@ impl Debugger {
     pub async fn setup(
         &mut self,
         pending_breakpoints: &HashMap<String, HashSet<i64>>,
-    ) -> VadreResult {
+    ) -> Result<()> {
         match self {
             Debugger::CodeLLDB(debugger) => debugger.setup(pending_breakpoints).await,
         }
@@ -58,6 +64,13 @@ impl Debugger {
             Debugger::CodeLLDB(debugger) => {
                 debugger.set_breakpoints(file_path, line_numbers).await?
             }
+        }
+        Ok(())
+    }
+
+    pub async fn do_step(&self, step_type: DebuggerStepType) -> Result<()> {
+        match self {
+            Debugger::CodeLLDB(debugger) => debugger.do_step(step_type).await?,
         }
         Ok(())
     }
@@ -82,6 +95,8 @@ pub struct CodeLLDBDebugger {
     write_rx: Arc<Mutex<Option<mpsc::Receiver<serde_json::Value>>>>,
 
     response_senders: Arc<Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>>,
+
+    main_thread_id: Arc<Mutex<Option<u64>>>,
 }
 
 impl CodeLLDBDebugger {
@@ -107,14 +122,16 @@ impl CodeLLDBDebugger {
             write_rx: Arc::new(Mutex::new(Some(write_rx))),
 
             response_senders: Arc::new(Mutex::new(HashMap::new())),
+
+            main_thread_id: Arc::new(Mutex::new(None)),
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self, pending_breakpoints))]
     pub async fn setup(
         &mut self,
         pending_breakpoints: &HashMap<String, HashSet<i64>>,
-    ) -> VadreResult {
+    ) -> Result<()> {
         log_err!(
             self.neovim_vadre_window.create_ui().await,
             self.neovim_vadre_window,
@@ -146,7 +163,7 @@ impl CodeLLDBDebugger {
                 .await
         );
 
-        Ok(Value::from("CodeLLDB launched and setup"))
+        Ok(())
     }
 
     pub async fn set_breakpoints(
@@ -162,6 +179,27 @@ impl CodeLLDBDebugger {
 
         self.send_breakpoints_request(file_path, line_numbers)
             .await?;
+
+        Ok(())
+    }
+
+    pub async fn do_step(&self, step_type: DebuggerStepType) -> Result<()> {
+        let thread_id = self.main_thread_id.lock().await.unwrap();
+
+        let command = match step_type {
+            DebuggerStepType::Over => "next",
+            DebuggerStepType::In => "stepIn",
+            DebuggerStepType::Continue => "continue",
+        };
+
+        self.send_request(
+            command,
+            serde_json::json!({
+                "threadId": thread_id,
+                "singleThread": false,
+            }),
+        )
+        .await?;
 
         Ok(())
     }
@@ -217,6 +255,7 @@ impl CodeLLDBDebugger {
         let response_senders = self.response_senders.clone();
         let write_tx = self.write_tx.clone();
         let seq_ids = self.seq_ids.clone();
+        let main_thread_id = self.main_thread_id.clone();
 
         tokio::spawn(async move {
             let mut buf = [0u8; 4096];
@@ -359,6 +398,8 @@ impl CodeLLDBDebugger {
                             .as_u64()
                             .expect("threadId should be u64");
 
+                        *main_thread_id.lock().await = Some(thread_id);
+
                         let seq_ids = seq_ids.clone();
                         let write_tx = write_tx.clone();
                         let response_senders = response_senders.clone();
@@ -474,7 +515,6 @@ impl CodeLLDBDebugger {
                 "program": program,
                 "stopOnEntry": false
             }),
-            None,
         )
         .await?;
 
@@ -483,7 +523,6 @@ impl CodeLLDBDebugger {
             serde_json::json!({
                 "breakpoints": [],
             }),
-            None,
         )
         .await?;
 
@@ -492,7 +531,6 @@ impl CodeLLDBDebugger {
             serde_json::json!({
                 "filters": []
             }),
-            None,
         )
         .await?;
 
@@ -509,17 +547,8 @@ impl CodeLLDBDebugger {
         Ok(())
     }
 
-    async fn send_request(
-        &self,
-        command: &str,
-        args: serde_json::Value,
-        mut sender: Option<oneshot::Sender<serde_json::Value>>,
-    ) -> Result<()> {
+    async fn send_request(&self, command: &str, args: serde_json::Value) -> Result<()> {
         let seq_id = self.seq_ids.fetch_add(1, Ordering::SeqCst);
-
-        if let Some(sender) = sender.take() {
-            self.response_senders.lock().await.insert(seq_id, sender);
-        }
 
         let request = serde_json::json!({
             "command": command,
@@ -574,7 +603,6 @@ impl CodeLLDBDebugger {
                 "breakpoints": breakpoints,
                 "sourceModified": false,
             }),
-            None,
         )
         .await?;
 

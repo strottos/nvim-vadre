@@ -22,6 +22,7 @@ use std::{
 
 use anyhow::Result;
 use async_trait::async_trait;
+use debuggers::DebuggerStepType;
 use nvim_rs::{compat::tokio::Compat, create::tokio as create, Handler, Neovim, Value};
 use tokio::{io::Stdout, sync::Mutex};
 
@@ -221,6 +222,21 @@ impl NeovimHandler {
         })
         .into())
     }
+
+    async fn do_step(&self, step_type: DebuggerStepType, instance_id: usize) -> VadreResult {
+        let debuggers = self.debuggers.lock().await;
+
+        let debugger = debuggers.get(&instance_id).expect("debugger should exist");
+
+        debugger
+            .lock()
+            .await
+            .do_step(step_type)
+            .await
+            .expect("Could do code step");
+
+        Ok("".into())
+    }
 }
 
 #[async_trait]
@@ -254,6 +270,40 @@ impl Handler for NeovimHandler {
                 .await
             }
             "breakpoint" => self.breakpoint(neovim).await,
+            "step_in" => {
+                tracing::trace!("Args: {:?}", args);
+                let instance_id: usize = args
+                    .get(0)
+                    .expect("instance_id should be supplied")
+                    .as_str()
+                    .expect("instance_id is string")
+                    .parse::<usize>()
+                    .expect("instance_id is usize");
+
+                self.do_step(DebuggerStepType::In, instance_id).await
+            }
+            "step_over" => {
+                let instance_id: usize = args
+                    .get(0)
+                    .expect("instance_id should be supplied")
+                    .as_str()
+                    .expect("instance_id is string")
+                    .parse::<usize>()
+                    .expect("instance_id is usize");
+
+                self.do_step(DebuggerStepType::Over, instance_id).await
+            }
+            "continue" => {
+                let instance_id: usize = args
+                    .get(0)
+                    .expect("instance_id should be supplied")
+                    .as_str()
+                    .expect("instance_id is string")
+                    .parse::<usize>()
+                    .expect("instance_id is usize");
+
+                self.do_step(DebuggerStepType::Continue, instance_id).await
+            }
             _ => unimplemented!(),
         }
     }
