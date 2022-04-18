@@ -106,6 +106,12 @@ impl VadreBufferType {
     }
 }
 
+#[derive(Debug)]
+pub enum CodeBufferContent<'a> {
+    File(&'a str),
+    Content(String),
+}
+
 #[derive(Clone)]
 pub struct NeovimVadreWindow {
     neovim: Neovim<Compat<Stdout>>,
@@ -270,56 +276,63 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
-    pub async fn set_code_buffer(&self, path: &Path, line_number: i64) -> Result<()> {
-        tracing::trace!("Opening {:?} in code buffer", path);
+    pub async fn set_code_buffer<'a>(
+        &self,
+        content: CodeBufferContent<'a>,
+        line_number: i64,
+        buffer_name: &str,
+        force_replace: bool,
+    ) -> Result<()> {
+        tracing::trace!("Opening in code buffer: {:?}", content);
 
-        if !path.exists() {
-            let path_str = path.to_str().unwrap();
-            self.log_msg(
-                VadreLogLevel::WARN,
-                &format!("Source path {} doesn't exist", path_str),
-            )
-            .await?;
-            bail!("Source {} doesn't exist", path_str);
-        }
-
-        let buffer_name = self.get_buffer_name(&VadreBufferType::Code, path.to_str());
         let code_buffer = self.buffers.get(&VadreBufferType::Code).unwrap();
+
         let old_buffer_name = code_buffer.get_name().await?;
+        let buffer_name = self.get_buffer_name(&VadreBufferType::Code, Some(buffer_name));
 
-        tracing::trace!("{} != {}", old_buffer_name, buffer_name);
-        if !old_buffer_name.ends_with(&buffer_name) {
-            tracing::trace!("Resetting file to {:?}", path);
+        let line_count = code_buffer.line_count().await?;
 
-            let contents = tokio::fs::read_to_string(path)
-                .await?
-                .split("\n")
-                .map(|x| x.to_string())
-                .collect();
-            let line_count = code_buffer.line_count().await?;
+        if !old_buffer_name.ends_with(&buffer_name) || force_replace {
+            let content = match &content {
+                CodeBufferContent::File(path_name) => {
+                    let path = Path::new(&path_name);
 
-            self.write_to_window(&code_buffer, 0, line_count + 1, contents)
+                    tracing::trace!("Resetting file to {:?}", path);
+
+                    if !path.exists() {
+                        bail!("Source path {:?} doesn't exist", path_name);
+                    }
+
+                    if let Some(file_type) = path.extension().map(|x| x.to_str().unwrap()) {
+                        match VIM_FILE_TYPES.get(&file_type) {
+                            Some(file_type) => {
+                                self.neovim
+                                    .command(&format!("set filetype={}", file_type))
+                                    .await?;
+                                self.neovim
+                                    .command(&format!("set filetype={}", file_type))
+                                    .await?;
+                            }
+                            None => {}
+                        };
+                    }
+
+                    tokio::fs::read_to_string(path)
+                        .await?
+                        .split("\n")
+                        .map(|x| x.to_string())
+                        .collect()
+                }
+                CodeBufferContent::Content(content) => {
+                    content.split("\n").map(|x| x.to_string()).collect()
+                }
+            };
+
+            self.write_to_window(&code_buffer, 0, line_count + 1, content)
                 .await?;
 
-            match path.extension() {
-                Some(ext) => {
-                    let ext = ext.to_str().unwrap();
-                    match VIM_FILE_TYPES.get(ext) {
-                        Some(file_type) => {
-                            self.neovim
-                                .command(&format!("set filetype={}", file_type))
-                                .await?;
-                            self.neovim
-                                .command(&format!("set filetype={}", file_type))
-                                .await?;
-                        }
-                        None => {}
-                    };
-                }
-                None => {}
-            };
             code_buffer.set_name(&buffer_name).await?;
-        }
+        };
 
         let pointer_sign_id = self.pointer_sign_id;
         self.neovim

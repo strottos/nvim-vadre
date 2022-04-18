@@ -12,7 +12,7 @@ use std::{
 };
 
 use crate::{
-    neovim::{NeovimVadreWindow, VadreLogLevel},
+    neovim::{CodeBufferContent, NeovimVadreWindow, VadreLogLevel},
     util::{self, get_debuggers_dir, log_err, ret_err},
 };
 
@@ -406,14 +406,26 @@ impl CodeLLDBDebugger {
                         let neovim_vadre_window = neovim_vadre_window.clone();
 
                         tokio::spawn(async move {
-                            CodeLLDBDebugger::process_stopped(
+                            if let Err(e) = CodeLLDBDebugger::process_stopped(
                                 thread_id,
                                 seq_ids,
                                 write_tx,
                                 response_senders,
                                 &neovim_vadre_window,
                             )
-                            .await;
+                            .await
+                            {
+                                neovim_vadre_window
+                                    .log_msg(
+                                        VadreLogLevel::WARN,
+                                        &format!(
+                                            "An error occurred while displaying code pointer: {}",
+                                            e
+                                        ),
+                                    )
+                                    .await
+                                    .expect("Can log to Vadre");
+                            };
                         });
                     }
                 }
@@ -513,7 +525,7 @@ impl CodeLLDBDebugger {
                 "type": "lldb",
                 "request": "launch",
                 "program": program,
-                "stopOnEntry": false
+                "stopOnEntry": true,
             }),
         )
         .await?;
@@ -625,7 +637,7 @@ impl CodeLLDBDebugger {
                 "v1.7.0", "windows"
             ))?;
 
-            download_extract_zip(path.as_path(), url).await?;
+            CodeLLDBDebugger::download_extract_zip(path.as_path(), url).await?;
         }
 
         Ok(())
@@ -669,7 +681,7 @@ impl CodeLLDBDebugger {
         write_tx: mpsc::Sender<serde_json::Value>,
         response_senders: Arc<Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>>,
         neovim_vadre_window: &NeovimVadreWindow,
-    ) {
+    ) -> Result<()> {
         tracing::debug!("Thread id {} stopped", thread_id);
 
         let seq_id = seq_ids.clone().fetch_add(1, Ordering::SeqCst);
@@ -681,8 +693,7 @@ impl CodeLLDBDebugger {
             write_tx.clone(),
             response_senders.clone(),
         )
-        .await
-        .expect("received response");
+        .await?;
 
         let stack = stack_response
             .get("body")
@@ -690,42 +701,85 @@ impl CodeLLDBDebugger {
             .get("stackFrames")
             .expect("should have stackFrames");
         let current_frame = stack.get(0).expect("should have a top frame");
-        let source_file = current_frame
-            .get("source")
-            .expect("should have a source")
-            .get("path")
-            .expect("should have a path")
-            .as_str()
-            .expect("path is a string");
-        let source_file = Path::new(&source_file);
+        let source = current_frame.get("source").expect("should have a source");
         let line_number = current_frame
             .get("line")
             .expect("should have a line")
             .as_i64()
             .expect("line should be an i64");
 
-        tracing::trace!("Stop at {:?}:{}", source_file, line_number);
+        tracing::trace!("Stop at {:?}:{}", source, line_number);
 
-        neovim_vadre_window
-            .set_code_buffer(&source_file, line_number)
-            .await
-            .expect("can set source file in buffer");
+        if let Some(source_file) = source.get("path") {
+            let source_file = source_file.as_str().expect("path is a string").to_string();
+            neovim_vadre_window
+                .set_code_buffer(
+                    CodeBufferContent::File(&source_file),
+                    line_number,
+                    &source_file,
+                    false,
+                )
+                .await?;
+        } else if let Some(source_reference_id) = current_frame
+            .get("source")
+            .expect("should have a source")
+            .get("sourceReference")
+        {
+            let seq_id = seq_ids.clone().fetch_add(1, Ordering::SeqCst);
+
+            let source_reference_response = CodeLLDBDebugger::do_send_request_and_await_response(
+                seq_id,
+                "source",
+                serde_json::json!({
+                    "source": { "sourceReference": source_reference_id },
+                    "sourceReference": source_reference_id
+                }),
+                write_tx.clone(),
+                response_senders.clone(),
+            )
+            .await?;
+
+            tracing::trace!("source reference {}", source_reference_response);
+
+            let content = source_reference_response
+                .get("body")
+                .expect("body should be set")
+                .get("content")
+                .expect("content should be set")
+                .as_str()
+                .expect("content should be a string")
+                .to_string();
+
+            neovim_vadre_window
+                .set_code_buffer(
+                    CodeBufferContent::Content(content),
+                    line_number,
+                    &format!("Disassembled Code {}", source_reference_id),
+                    // TODO: Do we need to reset this every time, feels like it might update...
+                    true,
+                )
+                .await?;
+        } else {
+            bail!("Can't find any source to display");
+        }
+
+        Ok(())
     }
-}
 
-// We just make this synchronous because although it slows things down, it makes it much
-// easier to do. If anyone wants to make this async and cool be my guest but it seems not
-// easy.
-async fn download_extract_zip(full_path: &Path, url: Url) -> Result<()> {
-    tracing::trace!("Downloading {} and unzipping to {:?}", url, full_path);
-    let zip_contents = reqwest::get(url).await?.bytes().await?;
+    // We just make this synchronous because although it slows things down, it makes it much
+    // easier to do. If anyone wants to make this async and cool be my guest but it seems not
+    // easy.
+    async fn download_extract_zip(full_path: &Path, url: Url) -> Result<()> {
+        tracing::trace!("Downloading {} and unzipping to {:?}", url, full_path);
+        let zip_contents = reqwest::get(url).await?.bytes().await?;
 
-    let reader = std::io::Cursor::new(zip_contents);
-    let mut zip = zip::ZipArchive::new(reader)?;
+        let reader = std::io::Cursor::new(zip_contents);
+        let mut zip = zip::ZipArchive::new(reader)?;
 
-    zip.extract(full_path)?;
+        zip.extract(full_path)?;
 
-    Ok(())
+        Ok(())
+    }
 }
 
 impl Debug for CodeLLDBDebugger {
