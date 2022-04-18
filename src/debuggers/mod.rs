@@ -13,7 +13,7 @@ use std::{
 
 use crate::{
     neovim::{CodeBufferContent, NeovimVadreWindow, VadreLogLevel},
-    util::{self, get_debuggers_dir, log_err, ret_err},
+    util::{self, get_debuggers_dir, log_err, log_ret_err, ret_err},
 };
 
 use anyhow::{bail, Result};
@@ -40,6 +40,7 @@ pub enum Debugger {
 }
 
 impl Debugger {
+    #[tracing::instrument(skip(self))]
     pub async fn setup(
         &mut self,
         pending_breakpoints: &HashMap<String, HashSet<i64>>,
@@ -49,31 +50,50 @@ impl Debugger {
         }
     }
 
+    #[tracing::instrument(skip(self))]
     pub fn neovim_vadre_window(&self) -> &NeovimVadreWindow {
         match self {
             Debugger::CodeLLDB(debugger) => &debugger.neovim_vadre_window,
         }
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn set_source_breakpoints(
         &self,
         file_path: String,
         line_numbers: &HashSet<i64>,
     ) -> Result<()> {
         match self {
-            Debugger::CodeLLDB(debugger) => {
-                debugger.set_breakpoints(file_path, line_numbers).await?
-            }
+            Debugger::CodeLLDB(debugger) => debugger.set_breakpoints(file_path, line_numbers).await,
         }
-        Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn do_step(&self, step_type: DebuggerStepType) -> Result<()> {
         match self {
-            Debugger::CodeLLDB(debugger) => debugger.do_step(step_type).await?,
+            Debugger::CodeLLDB(debugger) => debugger.do_step(step_type).await,
         }
-        Ok(())
     }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn print_variable(&self, variable_name: &str) -> Result<()> {
+        match self {
+            Debugger::CodeLLDB(debugger) => debugger.print_variable(variable_name).await,
+        }
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn change_output_window(&self, ascending: bool) -> Result<()> {
+        match self {
+            Debugger::CodeLLDB(debugger) => debugger.change_output_window(ascending).await,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct CodeLLDBDebuggerData {
+    current_thread_id: Option<u64>,
+    current_frame_id: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -96,10 +116,11 @@ pub struct CodeLLDBDebugger {
 
     response_senders: Arc<Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>>,
 
-    main_thread_id: Arc<Mutex<Option<u64>>>,
+    codelldb_data: Arc<Mutex<CodeLLDBDebuggerData>>,
 }
 
 impl CodeLLDBDebugger {
+    #[tracing::instrument(skip(neovim))]
     pub fn new(
         id: usize,
         command: String,
@@ -123,7 +144,7 @@ impl CodeLLDBDebugger {
 
             response_senders: Arc::new(Mutex::new(HashMap::new())),
 
-            main_thread_id: Arc::new(Mutex::new(None)),
+            codelldb_data: Arc::new(Mutex::new(CodeLLDBDebuggerData::default())),
         }
     }
 
@@ -132,7 +153,7 @@ impl CodeLLDBDebugger {
         &mut self,
         pending_breakpoints: &HashMap<String, HashSet<i64>>,
     ) -> Result<()> {
-        log_err!(
+        log_ret_err!(
             self.neovim_vadre_window.create_ui().await,
             self.neovim_vadre_window,
             "Error setting up Vadre UI"
@@ -140,19 +161,19 @@ impl CodeLLDBDebugger {
 
         let port = util::get_unused_localhost_port();
 
-        log_err!(
+        log_ret_err!(
             self.launch(port).await,
             self.neovim_vadre_window,
             "Error launching process"
         );
 
         let (config_done_tx, config_done_rx) = oneshot::channel();
-        log_err!(
+        log_ret_err!(
             self.tcp_connect(port, config_done_tx).await,
             self.neovim_vadre_window,
             "Error creating TCP connection to process"
         );
-        log_err!(
+        log_ret_err!(
             self.init_process(pending_breakpoints, config_done_rx).await,
             self.neovim_vadre_window,
             "Error initialising process"
@@ -166,6 +187,7 @@ impl CodeLLDBDebugger {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn set_breakpoints(
         &self,
         file_path: String,
@@ -183,8 +205,9 @@ impl CodeLLDBDebugger {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn do_step(&self, step_type: DebuggerStepType) -> Result<()> {
-        let thread_id = self.main_thread_id.lock().await.unwrap();
+        let codelldb_data = self.codelldb_data.lock().await;
 
         let command = match step_type {
             DebuggerStepType::Over => "next",
@@ -195,13 +218,31 @@ impl CodeLLDBDebugger {
         self.send_request(
             command,
             serde_json::json!({
-                "threadId": thread_id,
+                "threadId": codelldb_data.current_thread_id.unwrap(),
                 "singleThread": false,
             }),
         )
         .await?;
 
         Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn print_variable(&self, variable_name: &str) -> Result<()> {
+        self.send_request(
+            "evaluate",
+            serde_json::json!({ "expression": &format!("/se frame evaluate {}", variable_name) }),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub async fn change_output_window(&self, ascending: bool) -> Result<()> {
+        self.neovim_vadre_window
+            .change_output_window(ascending)
+            .await
     }
 
     #[tracing::instrument(skip(self, port))]
@@ -255,7 +296,7 @@ impl CodeLLDBDebugger {
         let response_senders = self.response_senders.clone();
         let write_tx = self.write_tx.clone();
         let seq_ids = self.seq_ids.clone();
-        let main_thread_id = self.main_thread_id.clone();
+        let codelldb_data = self.codelldb_data.clone();
 
         tokio::spawn(async move {
             let mut buf = [0u8; 4096];
@@ -288,145 +329,65 @@ impl CodeLLDBDebugger {
                     continue;
                 }
 
-                let response_json: serde_json::Value =
+                let incoming_json: serde_json::Value =
                     serde_json::from_str(&remainder[0..content_length]).unwrap();
 
                 // TODO: Can we do this more efficiently somehow? Use the `Bytes` crate and
                 // consume? Is that actually more efficient?
                 buf_str = String::from(&remainder[content_length..]);
 
-                tracing::trace!("JSON from CodeLLDB: {}", response_json);
+                tracing::debug!("<-- {}", incoming_json);
 
-                let r#type = response_json.get("type").expect("type should be set");
+                let r#type = incoming_json.get("type").expect("type should be set");
                 if r#type == "request" {
-                    // CodeLLDB is requesting something from us, currently only runTerminal should be received
-                    let command = response_json.get("command").expect("command should be set");
-                    if command == "runInTerminal" {
+                    let config_done_tx = config_done_tx.take().unwrap();
+                    if let Err(e) = CodeLLDBDebugger::handle_codelldb_request(
+                        incoming_json,
+                        seq_ids.clone(),
+                        &neovim_vadre_window,
+                        write_tx.clone(),
+                        Some(config_done_tx),
+                    )
+                    .await
+                    {
+                        let msg = format!("CodeLLDB Request Error: {}", e);
+                        tracing::error!("{}", msg);
                         neovim_vadre_window
-                            .log_msg(
-                                VadreLogLevel::INFO,
-                                "Spawning terminal to communicate with program",
-                            )
-                            .await
-                            .expect("Logging failed");
-
-                        let args = response_json
-                            .get("arguments")
-                            .expect("arguments should be set")
-                            .get("args")
-                            .expect("args should be set")
-                            .as_array()
-                            .expect("should be an array")
-                            .into_iter()
-                            .map(|x| x.to_string())
-                            .collect::<Vec<String>>();
-
-                        neovim_vadre_window
-                            .spawn_terminal_command(args.join(" "))
-                            .await
-                            .expect("Spawning terminal command failed");
-
-                        let seq_id = seq_ids.clone().fetch_add(1, Ordering::SeqCst);
-                        let req_id = response_json.get("seq").expect("seq should be set");
-
-                        let response = serde_json::json!({
-                            "seq_id": seq_id,
-                            "type": "response",
-                            "request_seq": req_id,
-                            "command": "runInTerminal",
-                            "body": {
-                            },
-                            "success": true
-                        });
-
-                        tracing::trace!("Sending response to runInTerminal: {}", response);
-
-                        write_tx
-                            .clone()
-                            .send(response)
-                            .await
-                            .expect("Can send to sender for socket");
-
-                        config_done_tx.take().unwrap().send(()).unwrap();
-                    } else {
-                        neovim_vadre_window
-                            .log_msg(
-                                VadreLogLevel::WARN,
-                                &format!("Unknown request from CodeLLDB: {}", response_json),
-                            )
+                            .log_msg(VadreLogLevel::WARN, &msg)
                             .await
                             .expect("Logging failed");
                     }
                 } else if r#type == "response" {
-                    let seq_id = response_json
-                        .get("request_seq")
-                        .expect("request_seq should be set")
-                        .as_u64()
-                        .unwrap();
-                    let mut response_senders_lock = response_senders.lock().await;
-                    match response_senders_lock.remove(&seq_id) {
-                        Some(sender) => {
-                            sender.send(response_json).unwrap();
-                            tracing::trace!("Sent JSON response to request");
-                        }
-                        None => {}
-                    };
-                } else if r#type == "event" {
-                    tracing::debug!("Got event: {}", response_json);
-                    let event = response_json.get("event").expect("event should be set");
-                    if event == "output" {
+                    if let Err(e) = CodeLLDBDebugger::handle_codelldb_response(
+                        incoming_json,
+                        response_senders.clone(),
+                    )
+                    .await
+                    {
+                        let msg = format!("CodeLLDB Response Error: {}", e);
+                        tracing::error!("{}", msg);
                         neovim_vadre_window
-                            .log_msg(
-                                VadreLogLevel::INFO,
-                                &format!(
-                                    "CodeLLDB: {}",
-                                    response_json
-                                        .get("body")
-                                        .expect("body should be set")
-                                        .get("output")
-                                        .expect("output should be set")
-                                ),
-                            )
+                            .log_msg(VadreLogLevel::WARN, &msg)
                             .await
                             .expect("Logging failed");
-                    } else if event == "stopped" {
-                        let thread_id = response_json
-                            .get("body")
-                            .expect("body should be set")
-                            .get("threadId")
-                            .expect("threadId should be set")
-                            .as_u64()
-                            .expect("threadId should be u64");
-
-                        *main_thread_id.lock().await = Some(thread_id);
-
-                        let seq_ids = seq_ids.clone();
-                        let write_tx = write_tx.clone();
-                        let response_senders = response_senders.clone();
-                        let neovim_vadre_window = neovim_vadre_window.clone();
-
-                        tokio::spawn(async move {
-                            if let Err(e) = CodeLLDBDebugger::process_stopped(
-                                thread_id,
-                                seq_ids,
-                                write_tx,
-                                response_senders,
-                                &neovim_vadre_window,
-                            )
+                    }
+                } else if r#type == "event" {
+                    if let Err(e) = CodeLLDBDebugger::handle_codelldb_event(
+                        incoming_json,
+                        seq_ids.clone(),
+                        &neovim_vadre_window,
+                        write_tx.clone(),
+                        response_senders.clone(),
+                        codelldb_data.clone(),
+                    )
+                    .await
+                    {
+                        let msg = format!("CodeLLDB Event Error: {}", e);
+                        tracing::error!("{}", msg);
+                        neovim_vadre_window
+                            .log_msg(VadreLogLevel::WARN, &msg)
                             .await
-                            {
-                                neovim_vadre_window
-                                    .log_msg(
-                                        VadreLogLevel::WARN,
-                                        &format!(
-                                            "An error occurred while displaying code pointer: {}",
-                                            e
-                                        ),
-                                    )
-                                    .await
-                                    .expect("Can log to Vadre");
-                            };
-                        });
+                            .expect("Logging failed");
                     }
                 }
             }
@@ -484,7 +445,7 @@ impl CodeLLDBDebugger {
         );
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self, pending_breakpoints, config_done_rx))]
     async fn init_process(
         &self,
         pending_breakpoints: &HashMap<String, HashSet<i64>>,
@@ -525,7 +486,6 @@ impl CodeLLDBDebugger {
                 "type": "lldb",
                 "request": "launch",
                 "program": program,
-                "stopOnEntry": true,
             }),
         )
         .await?;
@@ -559,31 +519,21 @@ impl CodeLLDBDebugger {
         Ok(())
     }
 
+    #[tracing::instrument(skip(self, args))]
     async fn send_request(&self, command: &str, args: serde_json::Value) -> Result<()> {
         let seq_id = self.seq_ids.fetch_add(1, Ordering::SeqCst);
 
-        let request = serde_json::json!({
-            "command": command,
-            "arguments": args,
-            "seq": seq_id,
-            "type": "request",
-        });
-
-        tracing::debug!("Request: {}", request);
-        self.write_tx.send(request).await?;
-
-        Ok(())
+        CodeLLDBDebugger::do_send_request(seq_id, command, args, self.write_tx.clone()).await
     }
 
+    #[tracing::instrument(skip(self, args))]
     async fn send_request_and_await_response(
         &self,
         command: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let seq_id = self.seq_ids.fetch_add(1, Ordering::SeqCst);
-
         CodeLLDBDebugger::do_send_request_and_await_response(
-            seq_id,
+            self.seq_ids.clone(),
             command,
             args,
             self.write_tx.clone(),
@@ -592,6 +542,7 @@ impl CodeLLDBDebugger {
         .await
     }
 
+    #[tracing::instrument(skip(self))]
     async fn send_breakpoints_request(
         &self,
         file_path: String,
@@ -627,14 +578,20 @@ impl CodeLLDBDebugger {
         path.push("codelldb");
 
         if !path.exists() {
+            let (os, arch) = util::get_os_and_cpu_architecture();
+            let version = "v1.7.0";
+
             self.neovim_vadre_window
-                .log_msg(VadreLogLevel::INFO, "Downloading and extracting pLugin")
+                .log_msg(
+                    VadreLogLevel::INFO,
+                    &format!("Downloading and extracting {} plugin for {}", os, arch),
+                )
                 .await?;
 
             let url = Url::parse(&format!(
                 "https://github.com/vadimcn/vscode-lldb/releases/download/{}\
-                         /codelldb-x86_64-{}.vsix",
-                "v1.7.0", "windows"
+                         /codelldb-{}-{}.vsix",
+                version, arch, os
             ))?;
 
             CodeLLDBDebugger::download_extract_zip(path.as_path(), url).await?;
@@ -643,15 +600,259 @@ impl CodeLLDBDebugger {
         Ok(())
     }
 
-    async fn do_send_request_and_await_response(
+    // These functions going forward are useful as they don't have a `self` parameter and thus can
+    // be used by tokio spawned async functions, though more parameters need passing in to be
+    // useful of course.
+    /// Handle a request from CodeLLDB
+    #[tracing::instrument(skip(json, seq_ids, neovim_vadre_window, write_tx, config_done_tx))]
+    async fn handle_codelldb_request(
+        json: serde_json::Value,
+        seq_ids: Arc<AtomicU64>,
+        neovim_vadre_window: &NeovimVadreWindow,
+        write_tx: mpsc::Sender<serde_json::Value>,
+        mut config_done_tx: Option<oneshot::Sender<()>>,
+    ) -> Result<()> {
+        // CodeLLDB is requesting something from us, currently only runTerminal should be received
+        let command = json.get("command").expect("command should be set");
+        if command != "runInTerminal" {
+            bail!("Unknown request from CodeLLDB: {}", json);
+        }
+
+        neovim_vadre_window
+            .log_msg(
+                VadreLogLevel::INFO,
+                "Spawning terminal to communicate with program",
+            )
+            .await?;
+
+        let args = json
+            .get("arguments")
+            .expect("arguments should be set")
+            .get("args")
+            .expect("args should be set")
+            .as_array()
+            .expect("should be an array")
+            .into_iter()
+            .map(|x| x.to_string())
+            .collect::<Vec<String>>();
+
+        neovim_vadre_window
+            .spawn_terminal_command(args.join(" "))
+            .await?;
+
+        let seq_id = seq_ids.clone().fetch_add(1, Ordering::SeqCst);
+        let req_id = json.get("seq").expect("seq should be set");
+
+        let response = serde_json::json!({
+            "seq_id": seq_id,
+            "type": "response",
+            "request_seq": req_id,
+            "command": "runInTerminal",
+            "body": {
+            },
+            "success": true
+        });
+
+        tracing::debug!("--> {}", response);
+
+        // One counterexample where we send a response, otherwise this should
+        // always use do_send_request to do a send on `write_tx`.
+        write_tx.clone().send(response).await?;
+
+        config_done_tx.take().unwrap().send(()).unwrap();
+
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(json, response_senders))]
+    async fn handle_codelldb_response(
+        json: serde_json::Value,
+        response_senders: Arc<Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>>,
+    ) -> Result<()> {
+        let seq_id = json
+            .get("request_seq")
+            .expect("request_seq should be set")
+            .as_u64()
+            .expect("request_seq should be u64");
+        let mut response_senders_lock = response_senders.lock().await;
+        match response_senders_lock.remove(&seq_id) {
+            Some(sender) => {
+                sender.send(json).unwrap();
+                tracing::trace!("Sent JSON response to request");
+            }
+            None => {}
+        };
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(
+        json,
+        seq_ids,
+        neovim_vadre_window,
+        write_tx,
+        response_senders,
+        codelldb_data,
+    ))]
+    async fn handle_codelldb_event(
+        json: serde_json::Value,
+        seq_ids: Arc<AtomicU64>,
+        neovim_vadre_window: &NeovimVadreWindow,
+        write_tx: mpsc::Sender<serde_json::Value>,
+        response_senders: Arc<Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>>,
+        codelldb_data: Arc<Mutex<CodeLLDBDebuggerData>>,
+    ) -> Result<()> {
+        tracing::trace!("Processing event: {}", json);
+        let event = json
+            .get("event")
+            .expect("event should be set")
+            .as_str()
+            .expect("event should be a str");
+        match event {
+            "output" => {
+                neovim_vadre_window
+                    .log_msg(
+                        VadreLogLevel::INFO,
+                        &format!(
+                            "CodeLLDB: {}",
+                            json.get("body")
+                                .expect("body should be set")
+                                .get("output")
+                                .expect("output should be set")
+                        ),
+                    )
+                    .await
+            }
+            "stopped" => {
+                CodeLLDBDebugger::handle_codelldb_event_stopped(
+                    json,
+                    seq_ids,
+                    neovim_vadre_window,
+                    write_tx,
+                    response_senders,
+                    codelldb_data,
+                )
+                .await
+            }
+            "continued" => {
+                CodeLLDBDebugger::handle_codelldb_event_continued(
+                    json,
+                    seq_ids,
+                    neovim_vadre_window,
+                    write_tx,
+                    response_senders,
+                    codelldb_data,
+                )
+                .await
+            }
+            _ => Ok(()),
+        }
+    }
+
+    #[tracing::instrument(skip(
+        json,
+        seq_ids,
+        neovim_vadre_window,
+        write_tx,
+        response_senders,
+        codelldb_data,
+    ))]
+    async fn handle_codelldb_event_stopped(
+        json: serde_json::Value,
+        seq_ids: Arc<AtomicU64>,
+        neovim_vadre_window: &NeovimVadreWindow,
+        write_tx: mpsc::Sender<serde_json::Value>,
+        response_senders: Arc<Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>>,
+        codelldb_data: Arc<Mutex<CodeLLDBDebuggerData>>,
+    ) -> Result<()> {
+        let neovim_vadre_window = neovim_vadre_window.clone();
+
+        let thread_id = match json
+            .get("body")
+            .expect("body should be set")
+            .get("threadId")
+        {
+            Some(thread_id) => thread_id.as_u64(),
+            None => None,
+        };
+
+        codelldb_data.lock().await.current_thread_id = thread_id;
+
+        tokio::spawn(async move {
+            log_err!(
+                CodeLLDBDebugger::process_output_info(
+                    seq_ids.clone(),
+                    write_tx.clone(),
+                    response_senders.clone(),
+                    &neovim_vadre_window,
+                    codelldb_data,
+                )
+                .await,
+                neovim_vadre_window,
+                "can get threads"
+            );
+
+            if let Some(thread_id) = thread_id {
+                if let Err(e) = CodeLLDBDebugger::process_stopped(
+                    thread_id,
+                    seq_ids,
+                    write_tx,
+                    response_senders,
+                    &neovim_vadre_window,
+                )
+                .await
+                {
+                    neovim_vadre_window
+                        .log_msg(
+                            VadreLogLevel::WARN,
+                            &format!("An error occurred while displaying code pointer: {}", e),
+                        )
+                        .await
+                        .expect("Can log to Vadre");
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(_json, seq_ids, neovim_vadre_window, write_tx, response_senders,))]
+    async fn handle_codelldb_event_continued(
+        _json: serde_json::Value,
+        seq_ids: Arc<AtomicU64>,
+        neovim_vadre_window: &NeovimVadreWindow,
+        write_tx: mpsc::Sender<serde_json::Value>,
+        response_senders: Arc<Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>>,
+        codelldb_data: Arc<Mutex<CodeLLDBDebuggerData>>,
+    ) -> Result<()> {
+        let neovim_vadre_window = neovim_vadre_window.clone();
+
+        tokio::spawn(async move {
+            log_err!(
+                CodeLLDBDebugger::process_output_info(
+                    seq_ids.clone(),
+                    write_tx.clone(),
+                    response_senders.clone(),
+                    &neovim_vadre_window,
+                    codelldb_data,
+                )
+                .await,
+                neovim_vadre_window,
+                "can get process info"
+            );
+        });
+
+        Ok(())
+    }
+
+    /// Actually send the request, should be the only function that does this, even the function
+    /// with the `&self` parameter still uses this in turn.
+    #[tracing::instrument(skip(seq_id, command, args, write_tx))]
+    async fn do_send_request(
         seq_id: u64,
         command: &str,
         args: serde_json::Value,
         write_tx: mpsc::Sender<serde_json::Value>,
-        response_senders: Arc<Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>>,
-    ) -> Result<serde_json::Value> {
-        let (sender, receiver) = oneshot::channel();
-
+    ) -> Result<()> {
         let request = serde_json::json!({
             "command": command,
             "arguments": args,
@@ -659,22 +860,47 @@ impl CodeLLDBDebugger {
             "type": "request",
         });
 
+        tracing::debug!("--> {}", request);
+        write_tx.send(request).await?;
+
+        Ok(())
+    }
+
+    /// Actually send the request and await the response. Used in turn by the equivalent function
+    /// with the `&self` parameter.
+    #[tracing::instrument(skip(seq_ids, command, args, write_tx, response_senders))]
+    async fn do_send_request_and_await_response(
+        seq_ids: Arc<AtomicU64>,
+        command: &str,
+        args: serde_json::Value,
+        write_tx: mpsc::Sender<serde_json::Value>,
+        response_senders: Arc<Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>>,
+    ) -> Result<serde_json::Value> {
+        let (sender, receiver) = oneshot::channel();
+
+        let seq_id = seq_ids.clone().fetch_add(1, Ordering::SeqCst);
+
         response_senders.lock().await.insert(seq_id, sender);
 
-        tracing::debug!("Request: {}", request);
-
-        write_tx.send(request).await?;
+        CodeLLDBDebugger::do_send_request(seq_id, command, args, write_tx).await?;
 
         // TODO: configurable timeout
         let response = match timeout(Duration::new(10, 0), receiver).await {
             Ok(resp) => resp?,
             Err(e) => bail!("Timed out waiting for a response: {}", e),
         };
-        tracing::debug!("Response: {}", response.to_string());
+        tracing::trace!("Response: {}", response.to_string());
 
         Ok(response)
     }
 
+    #[tracing::instrument(skip(
+        thread_id,
+        seq_ids,
+        write_tx,
+        response_senders,
+        neovim_vadre_window
+    ))]
     async fn process_stopped(
         thread_id: u64,
         seq_ids: Arc<AtomicU64>,
@@ -684,12 +910,10 @@ impl CodeLLDBDebugger {
     ) -> Result<()> {
         tracing::debug!("Thread id {} stopped", thread_id);
 
-        let seq_id = seq_ids.clone().fetch_add(1, Ordering::SeqCst);
-
         let stack_response = CodeLLDBDebugger::do_send_request_and_await_response(
-            seq_id,
+            seq_ids.clone(),
             "stackTrace",
-            serde_json::json!({ "threadId": thread_id }),
+            serde_json::json!({ "threadId": thread_id, "levels": 1 }),
             write_tx.clone(),
             response_senders.clone(),
         )
@@ -725,10 +949,8 @@ impl CodeLLDBDebugger {
             .expect("should have a source")
             .get("sourceReference")
         {
-            let seq_id = seq_ids.clone().fetch_add(1, Ordering::SeqCst);
-
             let source_reference_response = CodeLLDBDebugger::do_send_request_and_await_response(
-                seq_id,
+                seq_ids,
                 "source",
                 serde_json::json!({
                     "source": { "sourceReference": source_reference_id },
@@ -766,9 +988,263 @@ impl CodeLLDBDebugger {
         Ok(())
     }
 
+    #[tracing::instrument(skip(
+        seq_ids,
+        write_tx,
+        response_senders,
+        neovim_vadre_window,
+        codelldb_data
+    ))]
+    async fn process_output_info(
+        seq_ids: Arc<AtomicU64>,
+        write_tx: mpsc::Sender<serde_json::Value>,
+        response_senders: Arc<Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>>,
+        neovim_vadre_window: &NeovimVadreWindow,
+        codelldb_data: Arc<Mutex<CodeLLDBDebuggerData>>,
+    ) -> Result<()> {
+        tracing::debug!("Getting thread information");
+
+        let mut call_stack_buffer_content = Vec::new();
+        let current_thread_id = codelldb_data.lock().await.current_thread_id;
+
+        let threads_response = CodeLLDBDebugger::do_send_request_and_await_response(
+            seq_ids.clone(),
+            "threads",
+            serde_json::json!({}),
+            write_tx.clone(),
+            response_senders.clone(),
+        )
+        .await?;
+
+        for thread in threads_response
+            .get("body")
+            .expect("body is set")
+            .get("threads")
+            .expect("threads is set")
+            .as_array()
+            .expect("threads is array")
+        {
+            let thread_id = thread
+                .get("id")
+                .expect("thread should have id")
+                .as_u64()
+                .expect("thread is should be u64");
+            let thread_name = thread
+                .get("name")
+                .expect("thread should have name")
+                .as_str()
+                .expect("thread is should be str");
+
+            if current_thread_id == Some(thread_id) {
+                call_stack_buffer_content.push(format!("{} (*)", thread_name));
+
+                let stack_trace_response = CodeLLDBDebugger::do_send_request_and_await_response(
+                    seq_ids.clone(),
+                    "stackTrace",
+                    serde_json::json!({
+                        "threadId": current_thread_id,
+                    }),
+                    write_tx.clone(),
+                    response_senders.clone(),
+                )
+                .await?;
+
+                // Sometimes we don't get a body here as we get a message saying invalid thread,
+                // normally when the thread is doing something in blocking.
+                if let Some(body) = stack_trace_response.get("body") {
+                    let frames = body
+                        .get("stackFrames")
+                        .expect("stackFrames should be set")
+                        .as_array()
+                        .expect("stackFrames should be an array");
+
+                    let top_frame = frames.get(0).expect("has a frame on the stack trace");
+                    let frame_id = top_frame
+                        .get("id")
+                        .expect("frame has id")
+                        .as_u64()
+                        .expect("frame_id is u64");
+                    codelldb_data.lock().await.current_frame_id = Some(frame_id);
+
+                    CodeLLDBDebugger::process_variables(
+                        frame_id,
+                        seq_ids.clone(),
+                        write_tx.clone(),
+                        response_senders.clone(),
+                        &neovim_vadre_window,
+                    )
+                    .await?;
+
+                    for frame in frames {
+                        let frame_name = frame
+                            .get("name")
+                            .expect("should have a name")
+                            .as_str()
+                            .expect("frame name should be a string");
+                        call_stack_buffer_content.push(format!("+ {}", frame_name));
+
+                        let line_number = frame
+                            .get("line")
+                            .expect("line number should be set")
+                            .as_u64()
+                            .expect("line number should be u64");
+                        let source = frame.get("source").expect("should have a source");
+                        let source_name = source
+                            .get("name")
+                            .expect("source name should be set")
+                            .as_str()
+                            .expect("source name should be a string");
+                        if let Some(_) = source.get("path") {
+                            call_stack_buffer_content
+                                .push(format!("  - {}:{}", source_name, line_number));
+                        } else {
+                            call_stack_buffer_content.push(format!(
+                                "  - {}:{} (dissassembled)",
+                                source_name, line_number
+                            ));
+                        }
+                    }
+                }
+            } else {
+                let stack_trace_response = CodeLLDBDebugger::do_send_request_and_await_response(
+                    seq_ids.clone(),
+                    "stackTrace",
+                    serde_json::json!({
+                        "levels": 1,
+                        "threadId": thread_id,
+                    }),
+                    write_tx.clone(),
+                    response_senders.clone(),
+                )
+                .await?;
+
+                // Sometimes we don't get a body here as we get a message saying invalid thread,
+                // normally when the thread is doing something in blocking.
+                if let Some(body) = stack_trace_response.get("body") {
+                    let frame_name = body
+                        .get("stackFrames")
+                        .expect("stackFrames should be set")
+                        .get(0)
+                        .expect("should have a frame")
+                        .get("name")
+                        .expect("should have a name")
+                        .as_str()
+                        .expect("frame name should be a string");
+
+                    call_stack_buffer_content.push(format!("{} - {}", thread_name, frame_name));
+                }
+            }
+        }
+
+        // HACK: Sometimes we get two things at once write to this so we take a mutex here, really
+        // we should put the neovim_vadre_window behind an Arc<Mutex<>>.
+        let _lock = codelldb_data.lock().await;
+
+        neovim_vadre_window
+            .set_call_stack_buffer(call_stack_buffer_content)
+            .await?;
+
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(seq_ids, write_tx, response_senders, neovim_vadre_window,))]
+    async fn process_variables(
+        frame_id: u64,
+        seq_ids: Arc<AtomicU64>,
+        write_tx: mpsc::Sender<serde_json::Value>,
+        response_senders: Arc<Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>>,
+        neovim_vadre_window: &NeovimVadreWindow,
+    ) -> Result<()> {
+        tracing::debug!("Getting variable information");
+
+        let mut variable_content = Vec::new();
+
+        let scopes_response = CodeLLDBDebugger::do_send_request_and_await_response(
+            seq_ids.clone(),
+            "scopes",
+            serde_json::json!({
+                "frameId": frame_id,
+            }),
+            write_tx.clone(),
+            response_senders.clone(),
+        )
+        .await?;
+
+        let scopes = scopes_response
+            .get("body")
+            .expect("body should be set")
+            .get("scopes")
+            .expect("scopes should be set")
+            .as_array()
+            .expect("scopes should be an array");
+
+        for scope in scopes {
+            let scope_name = scope
+                .get("name")
+                .expect("scope name should be set")
+                .as_str()
+                .expect("scope name should be a string");
+
+            variable_content.push(format!("{}:", scope_name));
+
+            let variable_reference = scope
+                .get("variablesReference")
+                .expect("variablesReference should be set")
+                .as_u64()
+                .expect("variablesReference should be u64");
+
+            let variables_response = CodeLLDBDebugger::do_send_request_and_await_response(
+                seq_ids.clone(),
+                "variables",
+                serde_json::json!({
+                    "variablesReference": variable_reference,
+                }),
+                write_tx.clone(),
+                response_senders.clone(),
+            )
+            .await?;
+
+            let variables = variables_response
+                .get("body")
+                .expect("body is set")
+                .get("variables")
+                .expect("variables is set")
+                .as_array()
+                .expect("variables is an array");
+
+            for variable in variables {
+                let name = variable
+                    .get("name")
+                    .expect("variable name should be set")
+                    .as_str()
+                    .expect("variable name should be a string");
+
+                let value = variable
+                    .get("value")
+                    .expect("variable value should be set")
+                    .as_str()
+                    .expect("variable value should be a string");
+
+                if let Some(r#type) = variable.get("type") {
+                    let r#type = r#type.as_str().expect("variable type should be a string");
+                    variable_content.push(format!("+ ({}) {} = {}", r#type, name, value));
+                } else {
+                    variable_content.push(format!("+ {} = {}", name, value));
+                }
+            }
+        }
+
+        neovim_vadre_window
+            .set_variables_buffer(variable_content)
+            .await?;
+
+        Ok(())
+    }
+
     // We just make this synchronous because although it slows things down, it makes it much
     // easier to do. If anyone wants to make this async and cool be my guest but it seems not
     // easy.
+    #[tracing::instrument(skip(url))]
     async fn download_extract_zip(full_path: &Path, url: Url) -> Result<()> {
         tracing::trace!("Downloading {} and unzipping to {:?}", url, full_path);
         let zip_contents = reqwest::get(url).await?.bytes().await?;

@@ -29,19 +29,43 @@ macro_rules! log_err {
     ($e:expr, $logger:expr) => {
         if let Err(e) = $e {
             let msg = format!("Generic error: {}", e);
+            tracing::error!("{}", msg);
+            $logger
+                .log_msg(VadreLogLevel::ERROR, &msg)
+                .await
+                .expect("logs should be logged");
+        }
+    };
+    ($e:expr, $logger:expr, $msg:expr) => {
+        if let Err(e) = $e {
+            let msg = format!("{}: {}", $msg, e);
+            tracing::error!("{}", msg);
+            $logger
+                .log_msg(VadreLogLevel::ERROR, &msg)
+                .await
+                .expect("logs should be logged");
+        }
+    };
+}
+pub(crate) use log_err;
+
+// A helper macro to check if a result errored and return early if so and logs the error to Vadre
+// Log window.
+macro_rules! log_ret_err {
+    ($e:expr, $logger:expr) => {
+        if let Err(e) = $e {
+            let msg = format!("Generic error: {}", e);
             ret_err!($logger.log_msg(VadreLogLevel::ERROR, &msg).await);
-            bail!("{}", msg);
         }
     };
     ($e:expr, $logger:expr, $msg:expr) => {
         if let Err(e) = $e {
             let msg = format!("{}: {}", $msg, e);
             ret_err!($logger.log_msg(VadreLogLevel::ERROR, &msg).await);
-            bail!("{}", msg);
         }
     };
 }
-pub(crate) use log_err;
+pub(crate) use log_ret_err;
 
 fn get_root_dir() -> Result<PathBuf> {
     let mut path = env::current_exe()?;
@@ -62,4 +86,21 @@ pub fn get_debuggers_dir() -> Result<PathBuf> {
 pub fn get_unused_localhost_port() -> u16 {
     let listener = TcpListener::bind(format!("127.0.0.1:0")).unwrap();
     listener.local_addr().unwrap().port()
+}
+
+/// Translate the current machines os and arch to that required for downloading debugger adapters
+pub fn get_os_and_cpu_architecture<'a>() -> (&'a str, &'a str) {
+    #[cfg(target_os = "linux")]
+    let os = "linux";
+    #[cfg(target_os = "macos")]
+    let os = "darwin";
+    #[cfg(target_os = "windows")]
+    let os = "windows";
+
+    #[cfg(target_arch = "x86_64")]
+    let arch = "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+
+    (os, arch)
 }

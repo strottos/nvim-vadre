@@ -29,6 +29,11 @@ use debuggers::DebuggerStepType;
 use nvim_rs::{compat::tokio::Compat, create::tokio as create, Handler, Neovim, Value};
 use tokio::{io::Stdout, sync::Mutex};
 
+#[cfg(windows)]
+use dunce::canonicalize;
+#[cfg(not(windows))]
+use std::fs::canonicalize;
+
 static VADRE_NEXT_INSTANCE_NUM: AtomicUsize = AtomicUsize::new(1);
 
 type VadreResult = Result<Value, Value>;
@@ -159,7 +164,7 @@ impl NeovimHandler {
             .expect("could get current cursor position");
 
         let line_number = cursor_position.0;
-        let file_path = match dunce::canonicalize(Path::new(&file_path)) {
+        let file_path = match canonicalize(Path::new(&file_path)) {
             Ok(x) => x,
             Err(_) => return Err("Path not found for setting breakpoint".into()),
         };
@@ -240,6 +245,36 @@ impl NeovimHandler {
 
         Ok("".into())
     }
+
+    async fn print_variable(&self, instance_id: usize, variable_name: &str) -> VadreResult {
+        let debuggers = self.debuggers.lock().await;
+
+        let debugger = debuggers.get(&instance_id).expect("debugger should exist");
+
+        debugger
+            .lock()
+            .await
+            .print_variable(variable_name)
+            .await
+            .expect("Could print variable");
+
+        Ok("".into())
+    }
+
+    async fn change_output_window(&self, instance_id: usize, ascending: bool) -> VadreResult {
+        let debuggers = self.debuggers.lock().await;
+
+        let debugger = debuggers.get(&instance_id).expect("debugger should exist");
+
+        debugger
+            .lock()
+            .await
+            .change_output_window(ascending)
+            .await
+            .expect("Could print variable");
+
+        Ok("".into())
+    }
 }
 
 #[async_trait]
@@ -306,6 +341,49 @@ impl Handler for NeovimHandler {
                     .expect("instance_id is usize");
 
                 self.do_step(DebuggerStepType::Continue, instance_id).await
+            }
+            "print_variable" => {
+                let args = args.get(0).unwrap().as_array().unwrap();
+
+                tracing::trace!("ARGS: {:?}", args);
+
+                let instance_id: usize = args
+                    .get(0)
+                    .expect("instance_id should be supplied")
+                    .as_str()
+                    .expect("instance_id is string")
+                    .parse::<usize>()
+                    .expect("instance_id is usize");
+
+                let variable_name = args
+                    .get(1)
+                    .expect("variable name should be supplied")
+                    .as_str()
+                    .expect("variable name is a string");
+
+                self.print_variable(instance_id, variable_name).await
+            }
+            "next_output_window" => {
+                let instance_id: usize = args
+                    .get(0)
+                    .expect("instance_id should be supplied")
+                    .as_str()
+                    .expect("instance_id is string")
+                    .parse::<usize>()
+                    .expect("instance_id is usize");
+
+                self.change_output_window(instance_id, true).await
+            }
+            "prev_output_window" => {
+                let instance_id: usize = args
+                    .get(0)
+                    .expect("instance_id should be supplied")
+                    .as_str()
+                    .expect("instance_id is string")
+                    .parse::<usize>()
+                    .expect("instance_id is usize");
+
+                self.change_output_window(instance_id, false).await
             }
             _ => unimplemented!(),
         }
