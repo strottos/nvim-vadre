@@ -31,6 +31,8 @@ macro_rules! log_err {
             let msg = format!("Generic error: {}", e);
             tracing::error!("{}", msg);
             $logger
+                .lock()
+                .await
                 .log_msg(VadreLogLevel::ERROR, &msg)
                 .await
                 .expect("logs should be logged");
@@ -41,6 +43,8 @@ macro_rules! log_err {
             let msg = format!("{}: {}", $msg, e);
             tracing::error!("{}", msg);
             $logger
+                .lock()
+                .await
                 .log_msg(VadreLogLevel::ERROR, &msg)
                 .await
                 .expect("logs should be logged");
@@ -55,13 +59,25 @@ macro_rules! log_ret_err {
     ($e:expr, $logger:expr) => {
         if let Err(e) = $e {
             let msg = format!("Generic error: {}", e);
-            ret_err!($logger.log_msg(VadreLogLevel::ERROR, &msg).await);
+            ret_err!(
+                $logger
+                    .lock()
+                    .await
+                    .log_msg(VadreLogLevel::ERROR, &msg)
+                    .await
+            );
         }
     };
     ($e:expr, $logger:expr, $msg:expr) => {
         if let Err(e) = $e {
             let msg = format!("{}: {}", $msg, e);
-            ret_err!($logger.log_msg(VadreLogLevel::ERROR, &msg).await);
+            ret_err!(
+                $logger
+                    .lock()
+                    .await
+                    .log_msg(VadreLogLevel::ERROR, &msg)
+                    .await
+            );
         }
     };
 }

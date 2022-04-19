@@ -135,6 +135,8 @@ impl NeovimHandler {
                 let log_msg = format!("Can't setup debugger: {}", e);
                 debugger_lock
                     .neovim_vadre_window()
+                    .lock()
+                    .await
                     .log_msg(VadreLogLevel::CRITICAL, &log_msg)
                     .await
                     .unwrap();

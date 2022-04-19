@@ -51,9 +51,9 @@ impl Debugger {
     }
 
     #[tracing::instrument(skip(self))]
-    pub fn neovim_vadre_window(&self) -> &NeovimVadreWindow {
+    pub fn neovim_vadre_window(&self) -> Arc<Mutex<NeovimVadreWindow>> {
         match self {
-            Debugger::CodeLLDB(debugger) => &debugger.neovim_vadre_window,
+            Debugger::CodeLLDB(debugger) => debugger.neovim_vadre_window.clone(),
         }
     }
 
@@ -102,7 +102,7 @@ pub struct CodeLLDBDebugger {
     command: String,
     command_args: Vec<String>,
     seq_ids: Arc<AtomicU64>,
-    pub neovim_vadre_window: NeovimVadreWindow,
+    pub neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
     process: Option<Arc<Child>>,
 
     write_tx: mpsc::Sender<serde_json::Value>,
@@ -127,8 +127,6 @@ impl CodeLLDBDebugger {
         command_args: Vec<String>,
         neovim: Neovim<Compat<Stdout>>,
     ) -> Self {
-        let neovim_vadre_window = NeovimVadreWindow::new(neovim, id);
-
         let (write_tx, write_rx) = mpsc::channel(1);
 
         CodeLLDBDebugger {
@@ -136,7 +134,7 @@ impl CodeLLDBDebugger {
             command,
             command_args,
             seq_ids: Arc::new(AtomicU64::new(1)),
-            neovim_vadre_window,
+            neovim_vadre_window: Arc::new(Mutex::new(NeovimVadreWindow::new(neovim, id))),
             process: None,
 
             write_tx,
@@ -154,7 +152,7 @@ impl CodeLLDBDebugger {
         pending_breakpoints: &HashMap<String, HashSet<i64>>,
     ) -> Result<()> {
         log_ret_err!(
-            self.neovim_vadre_window.create_ui().await,
+            self.neovim_vadre_window.lock().await.create_ui().await,
             self.neovim_vadre_window,
             "Error setting up Vadre UI"
         );
@@ -180,6 +178,8 @@ impl CodeLLDBDebugger {
         );
         ret_err!(
             self.neovim_vadre_window
+                .lock()
+                .await
                 .log_msg(VadreLogLevel::INFO, "CodeLLDB launched and setup")
                 .await
         );
@@ -241,6 +241,8 @@ impl CodeLLDBDebugger {
     #[tracing::instrument(skip(self))]
     pub async fn change_output_window(&self, ascending: bool) -> Result<()> {
         self.neovim_vadre_window
+            .lock()
+            .await
             .change_output_window(ascending)
             .await
     }
@@ -252,6 +254,8 @@ impl CodeLLDBDebugger {
             self.command, self.command_args,
         );
         self.neovim_vadre_window
+            .lock()
+            .await
             .log_msg(VadreLogLevel::DEBUG, &msg)
             .await?;
 
@@ -278,6 +282,8 @@ impl CodeLLDBDebugger {
                 .expect("Failed to spawn debugger"),
         ));
         self.neovim_vadre_window
+            .lock()
+            .await
             .log_msg(VadreLogLevel::DEBUG, "Process spawned".into())
             .await?;
 
@@ -344,7 +350,7 @@ impl CodeLLDBDebugger {
                     if let Err(e) = CodeLLDBDebugger::handle_codelldb_request(
                         incoming_json,
                         seq_ids.clone(),
-                        &neovim_vadre_window,
+                        neovim_vadre_window.clone(),
                         write_tx.clone(),
                         Some(config_done_tx),
                     )
@@ -353,6 +359,8 @@ impl CodeLLDBDebugger {
                         let msg = format!("CodeLLDB Request Error: {}", e);
                         tracing::error!("{}", msg);
                         neovim_vadre_window
+                            .lock()
+                            .await
                             .log_msg(VadreLogLevel::WARN, &msg)
                             .await
                             .expect("Logging failed");
@@ -367,6 +375,8 @@ impl CodeLLDBDebugger {
                         let msg = format!("CodeLLDB Response Error: {}", e);
                         tracing::error!("{}", msg);
                         neovim_vadre_window
+                            .lock()
+                            .await
                             .log_msg(VadreLogLevel::WARN, &msg)
                             .await
                             .expect("Logging failed");
@@ -375,7 +385,7 @@ impl CodeLLDBDebugger {
                     if let Err(e) = CodeLLDBDebugger::handle_codelldb_event(
                         incoming_json,
                         seq_ids.clone(),
-                        &neovim_vadre_window,
+                        neovim_vadre_window.clone(),
                         write_tx.clone(),
                         response_senders.clone(),
                         codelldb_data.clone(),
@@ -385,6 +395,8 @@ impl CodeLLDBDebugger {
                         let msg = format!("CodeLLDB Event Error: {}", e);
                         tracing::error!("{}", msg);
                         neovim_vadre_window
+                            .lock()
+                            .await
                             .log_msg(VadreLogLevel::WARN, &msg)
                             .await
                             .expect("Logging failed");
@@ -415,6 +427,8 @@ impl CodeLLDBDebugger {
         });
 
         self.neovim_vadre_window
+            .lock()
+            .await
             .log_msg(
                 VadreLogLevel::DEBUG,
                 "Process connection established".into(),
@@ -582,6 +596,8 @@ impl CodeLLDBDebugger {
             let version = "v1.7.0";
 
             self.neovim_vadre_window
+                .lock()
+                .await
                 .log_msg(
                     VadreLogLevel::INFO,
                     &format!("Downloading and extracting {} plugin for {}", os, arch),
@@ -608,7 +624,7 @@ impl CodeLLDBDebugger {
     async fn handle_codelldb_request(
         json: serde_json::Value,
         seq_ids: Arc<AtomicU64>,
-        neovim_vadre_window: &NeovimVadreWindow,
+        neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
         write_tx: mpsc::Sender<serde_json::Value>,
         mut config_done_tx: Option<oneshot::Sender<()>>,
     ) -> Result<()> {
@@ -619,6 +635,8 @@ impl CodeLLDBDebugger {
         }
 
         neovim_vadre_window
+            .lock()
+            .await
             .log_msg(
                 VadreLogLevel::INFO,
                 "Spawning terminal to communicate with program",
@@ -637,6 +655,8 @@ impl CodeLLDBDebugger {
             .collect::<Vec<String>>();
 
         neovim_vadre_window
+            .lock()
+            .await
             .spawn_terminal_command(args.join(" "))
             .await?;
 
@@ -696,7 +716,7 @@ impl CodeLLDBDebugger {
     async fn handle_codelldb_event(
         json: serde_json::Value,
         seq_ids: Arc<AtomicU64>,
-        neovim_vadre_window: &NeovimVadreWindow,
+        neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
         write_tx: mpsc::Sender<serde_json::Value>,
         response_senders: Arc<Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>>,
         codelldb_data: Arc<Mutex<CodeLLDBDebuggerData>>,
@@ -710,6 +730,8 @@ impl CodeLLDBDebugger {
         match event {
             "output" => {
                 neovim_vadre_window
+                    .lock()
+                    .await
                     .log_msg(
                         VadreLogLevel::INFO,
                         &format!(
@@ -759,7 +781,7 @@ impl CodeLLDBDebugger {
     async fn handle_codelldb_event_stopped(
         json: serde_json::Value,
         seq_ids: Arc<AtomicU64>,
-        neovim_vadre_window: &NeovimVadreWindow,
+        neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
         write_tx: mpsc::Sender<serde_json::Value>,
         response_senders: Arc<Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>>,
         codelldb_data: Arc<Mutex<CodeLLDBDebuggerData>>,
@@ -783,7 +805,7 @@ impl CodeLLDBDebugger {
                     seq_ids.clone(),
                     write_tx.clone(),
                     response_senders.clone(),
-                    &neovim_vadre_window,
+                    neovim_vadre_window.clone(),
                     codelldb_data,
                 )
                 .await,
@@ -797,11 +819,13 @@ impl CodeLLDBDebugger {
                     seq_ids,
                     write_tx,
                     response_senders,
-                    &neovim_vadre_window,
+                    neovim_vadre_window.clone(),
                 )
                 .await
                 {
                     neovim_vadre_window
+                        .lock()
+                        .await
                         .log_msg(
                             VadreLogLevel::WARN,
                             &format!("An error occurred while displaying code pointer: {}", e),
@@ -819,7 +843,7 @@ impl CodeLLDBDebugger {
     async fn handle_codelldb_event_continued(
         _json: serde_json::Value,
         seq_ids: Arc<AtomicU64>,
-        neovim_vadre_window: &NeovimVadreWindow,
+        neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
         write_tx: mpsc::Sender<serde_json::Value>,
         response_senders: Arc<Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>>,
         codelldb_data: Arc<Mutex<CodeLLDBDebuggerData>>,
@@ -832,7 +856,7 @@ impl CodeLLDBDebugger {
                     seq_ids.clone(),
                     write_tx.clone(),
                     response_senders.clone(),
-                    &neovim_vadre_window,
+                    neovim_vadre_window.clone(),
                     codelldb_data,
                 )
                 .await,
@@ -906,7 +930,7 @@ impl CodeLLDBDebugger {
         seq_ids: Arc<AtomicU64>,
         write_tx: mpsc::Sender<serde_json::Value>,
         response_senders: Arc<Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>>,
-        neovim_vadre_window: &NeovimVadreWindow,
+        neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
     ) -> Result<()> {
         tracing::debug!("Thread id {} stopped", thread_id);
 
@@ -937,6 +961,8 @@ impl CodeLLDBDebugger {
         if let Some(source_file) = source.get("path") {
             let source_file = source_file.as_str().expect("path is a string").to_string();
             neovim_vadre_window
+                .lock()
+                .await
                 .set_code_buffer(
                     CodeBufferContent::File(&source_file),
                     line_number,
@@ -973,6 +999,8 @@ impl CodeLLDBDebugger {
                 .to_string();
 
             neovim_vadre_window
+                .lock()
+                .await
                 .set_code_buffer(
                     CodeBufferContent::Content(content),
                     line_number,
@@ -999,7 +1027,7 @@ impl CodeLLDBDebugger {
         seq_ids: Arc<AtomicU64>,
         write_tx: mpsc::Sender<serde_json::Value>,
         response_senders: Arc<Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>>,
-        neovim_vadre_window: &NeovimVadreWindow,
+        neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
         codelldb_data: Arc<Mutex<CodeLLDBDebuggerData>>,
     ) -> Result<()> {
         tracing::debug!("Getting thread information");
@@ -1071,7 +1099,7 @@ impl CodeLLDBDebugger {
                         seq_ids.clone(),
                         write_tx.clone(),
                         response_senders.clone(),
-                        &neovim_vadre_window,
+                        neovim_vadre_window.clone(),
                     )
                     .await?;
 
@@ -1136,11 +1164,9 @@ impl CodeLLDBDebugger {
             }
         }
 
-        // HACK: Sometimes we get two things at once write to this so we take a mutex here, really
-        // we should put the neovim_vadre_window behind an Arc<Mutex<>>.
-        let _lock = codelldb_data.lock().await;
-
         neovim_vadre_window
+            .lock()
+            .await
             .set_call_stack_buffer(call_stack_buffer_content)
             .await?;
 
@@ -1153,7 +1179,7 @@ impl CodeLLDBDebugger {
         seq_ids: Arc<AtomicU64>,
         write_tx: mpsc::Sender<serde_json::Value>,
         response_senders: Arc<Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>>,
-        neovim_vadre_window: &NeovimVadreWindow,
+        neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
     ) -> Result<()> {
         tracing::debug!("Getting variable information");
 
@@ -1235,6 +1261,8 @@ impl CodeLLDBDebugger {
         }
 
         neovim_vadre_window
+            .lock()
+            .await
             .set_variables_buffer(variable_content)
             .await?;
 
