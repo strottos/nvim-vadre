@@ -318,11 +318,11 @@ impl NeovimVadreWindow {
             .get(&VadreWindowType::Output)
             .expect("Logs window not found, have you setup the UI?");
 
-        let datetime = chrono::offset::Local::now();
+        let now = chrono::offset::Local::now();
 
         let msgs = msg
             .split("\n")
-            .map(move |msg| format!("{} [{}] {}", datetime.format("%a %H:%M:%S%.6f"), level, msg))
+            .map(move |msg| format!("{} [{}] {}", now.format("%a %H:%M:%S%.6f"), level, msg))
             .collect();
 
         // Annoying little hack for first log line

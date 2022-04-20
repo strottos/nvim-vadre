@@ -396,10 +396,7 @@ impl Handler for NeovimHandler {
 #[tracing::instrument]
 async fn main() -> Result<()> {
     logger::setup_logging(
-        env::var("VADRE_LOG_FILE")
-            .ok()
-            .as_ref()
-            .map(|x| Path::new(x)),
+        env::var("VADRE_LOG_FILE").ok().as_deref(),
         env::var("VADRE_LOG").ok().as_deref(),
     )?;
 

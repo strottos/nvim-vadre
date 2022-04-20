@@ -1160,6 +1160,8 @@ impl CodeLLDBDebugger {
                         .expect("frame name should be a string");
 
                     call_stack_buffer_content.push(format!("{} - {}", thread_name, frame_name));
+                } else {
+                    call_stack_buffer_content.push(format!("{}", thread_name));
                 }
             }
         }
@@ -1253,9 +1255,9 @@ impl CodeLLDBDebugger {
 
                 if let Some(r#type) = variable.get("type") {
                     let r#type = r#type.as_str().expect("variable type should be a string");
-                    variable_content.push(format!("+ ({}) {} = {}", r#type, name, value));
+                    variable_content.push(format!("+ ({}) {} = {:?}", r#type, name, value));
                 } else {
-                    variable_content.push(format!("+ {} = {}", name, value));
+                    variable_content.push(format!("+ {} = {:?}", name, value));
                 }
             }
         }
