@@ -20,7 +20,7 @@ use anyhow::{bail, Result};
 use nvim_rs::{compat::tokio::Compat, Neovim};
 use reqwest::Url;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, Stdout},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Stdout},
     net::TcpStream,
     process::{Child, Command},
     sync::{mpsc, oneshot, Mutex},
@@ -272,15 +272,34 @@ impl CodeLLDBDebugger {
         }
 
         tracing::trace!("Spawning processs {:?}", path);
-        self.process = Some(Arc::new(
-            Command::new(path)
-                .args(["--port", &port.to_string()])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("Failed to spawn debugger"),
-        ));
+
+        let mut child = Command::new(path)
+            .args(["--port", &port.to_string()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn debugger");
+
+        let stdout = child.stdout.take().expect("should have stdout");
+        let stderr = child.stderr.take().expect("should have stderr");
+
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stdout).lines();
+            while let Some(line) = reader.next_line().await.expect("can read stdout") {
+                tracing::trace!("CodeLLDB stdout: {}", line);
+            }
+        });
+
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr).lines();
+            while let Some(line) = reader.next_line().await.expect("can read stderr") {
+                tracing::trace!("CodeLLDB stderr: {}", line);
+            }
+        });
+
+        self.process = Some(Arc::new(child));
+
         self.neovim_vadre_window
             .lock()
             .await
