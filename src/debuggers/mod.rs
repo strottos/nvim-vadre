@@ -44,9 +44,12 @@ impl Debugger {
     pub async fn setup(
         &mut self,
         pending_breakpoints: &HashMap<String, HashSet<i64>>,
+        codelldb_port: Option<u16>,
     ) -> Result<()> {
         match self {
-            Debugger::CodeLLDB(debugger) => debugger.setup(pending_breakpoints).await,
+            Debugger::CodeLLDB(debugger) => {
+                debugger.setup(pending_breakpoints, codelldb_port).await
+            }
         }
     }
 
@@ -150,6 +153,7 @@ impl CodeLLDBDebugger {
     pub async fn setup(
         &mut self,
         pending_breakpoints: &HashMap<String, HashSet<i64>>,
+        codelldb_port: Option<u16>,
     ) -> Result<()> {
         log_ret_err!(
             self.neovim_vadre_window.lock().await.create_ui().await,
@@ -157,13 +161,15 @@ impl CodeLLDBDebugger {
             "Error setting up Vadre UI"
         );
 
-        let port = util::get_unused_localhost_port();
+        let port = codelldb_port.unwrap_or(util::get_unused_localhost_port());
 
-        log_ret_err!(
-            self.launch(port).await,
-            self.neovim_vadre_window,
-            "Error launching process"
-        );
+        if codelldb_port.is_none() {
+            log_ret_err!(
+                self.launch(port).await,
+                self.neovim_vadre_window,
+                "Error launching process"
+            );
+        }
 
         let (config_done_tx, config_done_rx) = oneshot::channel();
         log_ret_err!(

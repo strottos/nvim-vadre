@@ -68,6 +68,7 @@ impl NeovimHandler {
         tracing::debug!("Launching instance {} with args: {:?}", instance_id, args);
 
         let mut debugger_type = None;
+        let mut codelldb_port = None;
         let mut process_vadre_args = true;
 
         let mut command_args = vec![];
@@ -82,6 +83,15 @@ impl NeovimHandler {
             let arg_string = arg.as_str().unwrap().to_string();
             if process_vadre_args && arg_string.starts_with("-t=") && arg_string.len() > 3 {
                 debugger_type = Some(arg_string[3..].to_string());
+            } else if process_vadre_args
+                && arg_string.starts_with("--codelldb-port=")
+                && arg_string.len() > 16
+            {
+                codelldb_port = Some(
+                    arg_string[16..]
+                        .parse::<u16>()
+                        .expect("codelldb port is u16"),
+                );
             } else {
                 if command == "" {
                     command = arg_string.clone();
@@ -131,7 +141,10 @@ impl NeovimHandler {
             tracing::trace!("Trying to lock 1");
             let mut debugger_lock = debugger.lock().await;
             tracing::trace!("Locked 1");
-            if let Err(e) = debugger_lock.setup(&pending_breakpoints).await {
+            if let Err(e) = debugger_lock
+                .setup(&pending_breakpoints, codelldb_port)
+                .await
+            {
                 let log_msg = format!("Can't setup debugger: {}", e);
                 debugger_lock
                     .neovim_vadre_window()
