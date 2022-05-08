@@ -437,7 +437,7 @@ async fn main() -> Result<()> {
                         // maybe retry, but at this point it's probably best
                         // to assume the worst and print a friendly and
                         // supportive message to our users
-                        tracing::error!("Well, dang... '{}'", e);
+                        tracing::error!("Nvim quit... '{}'", e);
                     });
             }
 

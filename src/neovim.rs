@@ -10,6 +10,8 @@ use anyhow::{bail, Result};
 use nvim_rs::{compat::tokio::Compat, Buffer, Neovim, Value, Window};
 use tokio::io::Stdout;
 
+use crate::debuggers::Breakpoint;
+
 // Arbitrary number so no clashes with other plugins (hopefully)
 // TODO: Find a better solution
 static VADRE_NEXT_SIGN_ID: AtomicUsize = AtomicUsize::new(1157831);
@@ -87,9 +89,10 @@ impl VadreWindowType {
 enum VadreBufferType {
     Code,
     Logs,
+    Terminal,
     CallStack,
     Variables,
-    Terminal,
+    Breakpoints,
 }
 
 impl VadreBufferType {
@@ -100,6 +103,7 @@ impl VadreBufferType {
             VadreBufferType::Terminal => VadreWindowType::Program,
             VadreBufferType::CallStack => VadreWindowType::Output,
             VadreBufferType::Variables => VadreWindowType::Output,
+            VadreBufferType::Breakpoints => VadreWindowType::Output,
         }
     }
 
@@ -114,6 +118,7 @@ impl VadreBufferType {
             VadreBufferType::Terminal => Some("Terminal"),
             VadreBufferType::CallStack => Some("CallStack"),
             VadreBufferType::Variables => Some("Variables"),
+            VadreBufferType::Breakpoints => Some("Breakpoints"),
         }
     }
 
@@ -124,6 +129,7 @@ impl VadreBufferType {
             VadreBufferType::Terminal => "Terminal",
             VadreBufferType::CallStack => "CallStack",
             VadreBufferType::Variables => "Variables",
+            VadreBufferType::Breakpoints => "Breakpoints",
         }
     }
 
@@ -135,6 +141,7 @@ impl VadreBufferType {
             VadreBufferType::Terminal => true,
             VadreBufferType::CallStack => false,
             VadreBufferType::Variables => false,
+            VadreBufferType::Breakpoints => true,
         }
     }
 
@@ -149,6 +156,7 @@ impl VadreBufferType {
             VadreBufferType::Logs,
             VadreBufferType::CallStack,
             VadreBufferType::Variables,
+            VadreBufferType::Breakpoints,
         ];
 
         let mut index = buffer_order
@@ -176,6 +184,7 @@ impl VadreBufferType {
             "Terminal" => VadreBufferType::Terminal,
             "CallStack" => VadreBufferType::CallStack,
             "Variables" => VadreBufferType::Variables,
+            "Breakpoints" => VadreBufferType::Breakpoints,
             _ => panic!("Can't understand string {}", s),
         }
     }
@@ -274,7 +283,11 @@ impl NeovimVadreWindow {
             .insert(VadreBufferType::Terminal, terminal_buffer);
 
         // Extra output buffers
-        for buffer_type in vec![VadreBufferType::CallStack, VadreBufferType::Variables] {
+        for buffer_type in vec![
+            VadreBufferType::CallStack,
+            VadreBufferType::Variables,
+            VadreBufferType::Breakpoints,
+        ] {
             let buffer = self.neovim.create_buf(false, false).await?;
             self.set_vadre_buffer_options(&buffer, &buffer_type).await?;
             self.buffers.insert(buffer_type, buffer);
@@ -325,28 +338,27 @@ impl NeovimVadreWindow {
             .map(move |msg| format!("{} [{}] {}", now.format("%a %H:%M:%S%.6f"), level, msg))
             .collect();
 
-        // Annoying little hack for first log line
-        if buffer.get_lines(0, 1, true).await?.get(0).unwrap() == "" {
-            self.write_to_window(&buffer, 0, 1, msgs).await?;
-        } else {
-            let mut cursor_at_end = true;
-            let current_cursor = window.get_cursor().await?;
-            let line_count = buffer.line_count().await?;
+        let mut cursor_at_end = true;
+        let current_cursor = window.get_cursor().await?;
+        let line_count = buffer.line_count().await?;
 
-            if current_cursor.0 < line_count {
-                cursor_at_end = false;
-            }
-            self.write_to_window(&buffer, -1, -1, msgs).await?;
+        if current_cursor.0 < line_count {
+            cursor_at_end = false;
+        }
+        self.write_to_buffer(&buffer, -1, -1, msgs).await?;
 
-            if cursor_at_end {
-                window.set_cursor((line_count + 1, 0)).await?;
-            }
+        if cursor_at_end && line_count > 1 {
+            window.set_cursor((line_count + 1, 0)).await?;
         }
 
         Ok(())
     }
 
-    pub async fn spawn_terminal_command(&self, command: String) -> Result<()> {
+    pub async fn spawn_terminal_command(
+        &self,
+        command: String,
+        debug_program_str: Option<&str>,
+    ) -> Result<()> {
         let original_window = self.neovim.get_current_win().await?;
 
         let terminal_window = self.windows.get(&VadreWindowType::Program).unwrap();
@@ -355,6 +367,19 @@ impl NeovimVadreWindow {
         self.neovim
             .command(&format!("terminal! {}", command))
             .await?;
+
+        match debug_program_str {
+            Some(debug_program_str) => {
+                self.neovim
+                    .get_current_win()
+                    .await?
+                    .get_buf()
+                    .await?
+                    .set_name(debug_program_str)
+                    .await?;
+            }
+            None => {}
+        };
 
         self.neovim.set_current_win(&original_window).await?;
 
@@ -411,7 +436,7 @@ impl NeovimVadreWindow {
                 }
             };
 
-            self.write_to_window(&code_buffer, 0, 0, content).await?;
+            self.write_to_buffer(&code_buffer, 0, 0, content).await?;
 
             code_buffer.set_name(&buffer_name).await?;
         };
@@ -444,7 +469,7 @@ impl NeovimVadreWindow {
             .buffers
             .get(&VadreBufferType::CallStack)
             .expect("call stack output buffer exists");
-        self.write_to_window(buffer, 0, 0, content).await?;
+        self.write_to_buffer(buffer, 0, 0, content).await?;
 
         Ok(())
     }
@@ -454,7 +479,61 @@ impl NeovimVadreWindow {
             .buffers
             .get(&VadreBufferType::Variables)
             .expect("variables output buffer exists");
-        self.write_to_window(buffer, 0, 0, content).await?;
+        self.write_to_buffer(buffer, 0, 0, content).await?;
+
+        Ok(())
+    }
+
+    pub async fn toggle_breakpoint_in_buffer(
+        &self,
+        file_path: &str,
+        breakpoints: Vec<&Breakpoint>,
+    ) -> Result<()> {
+        let buffer = self
+            .buffers
+            .get(&VadreBufferType::Breakpoints)
+            .expect("breakpoints output buffer exists");
+
+        let mut line_count = buffer.line_count().await?;
+        let mut current_contents = buffer.get_lines(0, line_count, false).await?;
+
+        for breakpoint in breakpoints {
+            if breakpoint.file_path != file_path {
+                panic!(
+                    "Breakpoints with wrong file_path: {:?} != {:?}",
+                    breakpoint.file_path, file_path
+                );
+            }
+            let breakpoint_info = format!("{}:{}", file_path, breakpoint.line_number);
+            let resolved_to_info = if breakpoint.actual_line_number.is_some()
+                && breakpoint.line_number != breakpoint.actual_line_number.unwrap()
+            {
+                format!(
+                    " (resolved to line {})",
+                    breakpoint.actual_line_number.unwrap()
+                )
+            } else {
+                "".to_string()
+            };
+            let line = format!(
+                "({}) {}{}",
+                if breakpoint.enabled { "*" } else { " " },
+                breakpoint_info,
+                resolved_to_info,
+            );
+            if let Some(pos) = current_contents
+                .iter()
+                .position(|x| x.contains(&breakpoint_info))
+            {
+                self.write_to_buffer(buffer, pos.try_into()?, pos.try_into()?, vec![line])
+                    .await?;
+                current_contents = buffer.get_lines(0, line_count, false).await?;
+            } else {
+                self.write_to_buffer(buffer, line_count, line_count, vec![line])
+                    .await?;
+                line_count = buffer.line_count().await?;
+            }
+        }
 
         Ok(())
     }
@@ -480,19 +559,23 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
-    async fn write_to_window(
+    async fn write_to_buffer(
         &self,
         buffer: &Buffer<Compat<Stdout>>,
         start_line: i64,
         mut end_line: i64,
         msgs: Vec<String>,
     ) -> Result<()> {
+        let line_count = buffer.line_count().await?;
         if start_line == 0 && end_line == 0 {
-            let line_count = buffer.line_count().await?;
             end_line = line_count;
         }
         buffer.set_option("modifiable", true.into()).await?;
-        buffer.set_lines(start_line, end_line, false, msgs).await?;
+        if line_count == 1 && buffer.get_lines(0, 1, true).await?.get(0).unwrap() == "" {
+            buffer.set_lines(0, 1, false, msgs).await?;
+        } else {
+            buffer.set_lines(start_line, end_line, false, msgs).await?;
+        }
         buffer.set_option("modifiable", false.into()).await?;
 
         Ok(())
