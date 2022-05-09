@@ -35,7 +35,7 @@ pub enum Either<T1, T2> {
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct NoArguments {}
+pub struct Empty {}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProtocolMessage {
@@ -63,13 +63,13 @@ pub enum RequestArguments {
     setBreakpoints(SetBreakpointsArguments),
     setFunctionBreakpoints(SetFunctionBreakpointsArguments),
     setExceptionBreakpoints(SetExceptionBreakpointsArguments),
-    configurationDone(Option<NoArguments>),
+    configurationDone(Option<Empty>),
     pause(PauseArguments),
     #[serde(rename = "continue")]
     continue_(ContinueArguments),
     next(NextArguments),
     stepIn(StepInArguments),
-    threads(Option<NoArguments>),
+    threads(Option<Empty>),
     stackTrace(StackTraceArguments),
     scopes(ScopesArguments),
     source(SourceArguments),
@@ -110,7 +110,7 @@ pub enum ResponseBody {
     launch,
     setBreakpoints(SetBreakpointsResponseBody),
     setFunctionBreakpoints(SetBreakpointsResponseBody),
-    setExceptionBreakpoints,
+    setExceptionBreakpoints(Option<Empty>),
     configurationDone,
     pause,
     #[serde(rename = "continue")]

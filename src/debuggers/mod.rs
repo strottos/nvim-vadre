@@ -133,7 +133,9 @@ struct DebuggerData {
 #[derive(Clone, Debug)]
 pub enum DebuggerType {
     CodeLLDB,
-    Python,
+    DebugPy,
+    Go,
+    Delve,
 }
 
 // TODO: Checksum
@@ -141,14 +143,18 @@ impl DebuggerType {
     fn init_debugger_name(&self) -> String {
         String::from(match self {
             DebuggerType::CodeLLDB => "CodeLLDB",
-            DebuggerType::Python => "debugpy",
+            DebuggerType::DebugPy => "debugpy",
+            DebuggerType::Go => "vscode-go",
+            DebuggerType::Delve => "delve",
         })
     }
 
     fn get_debugger_name(&self) -> &str {
         match self {
             DebuggerType::CodeLLDB => "codelldb",
-            DebuggerType::Python => "debugpy",
+            DebuggerType::DebugPy => "debugpy",
+            DebuggerType::Go => "vscode-go",
+            DebuggerType::Delve => "delve",
         }
     }
 
@@ -158,13 +164,12 @@ impl DebuggerType {
     ) -> Result<PathBuf> {
         match self {
             DebuggerType::CodeLLDB => {
-                let binary_name = self.get_debugger_extension_binary_name();
+                let binary_name = format!("codelldb{}", EXE_SUFFIX);
                 let mut path = self.get_debugger_extension_dir()?;
                 path.push(&binary_name);
                 Ok(path)
             }
-            DebuggerType::Python => {
-                tracing::trace!("Searching for `python3` program");
+            DebuggerType::DebugPy => {
                 let python_path = neovim_vadre_window
                     .lock()
                     .await
@@ -173,11 +178,28 @@ impl DebuggerType {
                     .map(|x| PathBuf::from(x))
                     .unwrap_or(which("python3").unwrap());
 
-                tracing::trace!("Found `{:?}`", python_path);
                 let python_path = dunce::canonicalize(&python_path)?;
-                tracing::trace!("Canonical path `{:?}`", python_path);
 
                 Ok(PathBuf::from(python_path))
+            }
+            DebuggerType::Go => {
+                let node_path = neovim_vadre_window
+                    .lock()
+                    .await
+                    .get_var("vadre_node_path")
+                    .await
+                    .map(|x| PathBuf::from(x))
+                    .unwrap_or(which("node").unwrap());
+
+                let node_path = dunce::canonicalize(&node_path)?;
+
+                Ok(PathBuf::from(node_path))
+            }
+            DebuggerType::Delve => {
+                let binary_name = format!("dlv{}", EXE_SUFFIX);
+                let mut path = self.get_debugger_extension_dir()?;
+                path.push(&binary_name);
+                Ok(path)
             }
         }
     }
@@ -185,7 +207,9 @@ impl DebuggerType {
     fn get_debugger_extension_root_dir(&self) -> &str {
         match self {
             DebuggerType::CodeLLDB => "codelldb",
-            DebuggerType::Python => "debugpy",
+            DebuggerType::DebugPy => "debugpy",
+            DebuggerType::Go => "vscode-go",
+            DebuggerType::Delve => "delve",
         }
     }
 
@@ -197,26 +221,27 @@ impl DebuggerType {
                 path.push("extension");
                 path.push("adapter");
             }
-            DebuggerType::Python => {
+            DebuggerType::DebugPy => {
                 path.push(&format!("debugpy-{}", self.get_debugger_version()));
+            }
+            DebuggerType::Go => {
+                path.push("extension");
+                path.push("dist");
+            }
+            DebuggerType::Delve => {
+                path.push(&format!("delve-{}", self.get_debugger_version()));
+                path.push("cmd");
+                path.push("dlv");
             }
         }
         let path = dunce::canonicalize(path)?;
         Ok(path)
     }
 
-    fn get_debugger_extension_binary_name(&self) -> String {
-        let binary = match self {
-            DebuggerType::CodeLLDB => "codelldb".to_string(),
-            DebuggerType::Python => unreachable!(),
-        };
-        format!("{}{}", binary, EXE_SUFFIX)
-    }
-
     fn get_debugger_run_command_args(&self, port: u16, log: bool) -> Result<Vec<String>> {
         let ret = match self {
             DebuggerType::CodeLLDB => vec!["--port".to_string(), port.to_string()],
-            DebuggerType::Python => {
+            DebuggerType::DebugPy => {
                 let mut debugger_dir = self.get_debugger_extension_dir()?;
                 debugger_dir.push("build");
                 debugger_dir.push("lib");
@@ -238,6 +263,16 @@ impl DebuggerType {
                 }
                 ret
             }
+            DebuggerType::Go => {
+                let mut debugger_dir = self.get_debugger_extension_dir()?;
+                debugger_dir.push("debugAdapter.js");
+                vec![debugger_dir.to_str().unwrap().to_string()]
+            }
+            DebuggerType::Delve => vec![
+                "dap".to_string(),
+                "--listen".to_string(),
+                format!("127.0.0.1:{}", port),
+            ],
         };
         Ok(ret)
     }
@@ -245,7 +280,9 @@ impl DebuggerType {
     fn get_debugger_version(&self) -> &str {
         match self {
             DebuggerType::CodeLLDB => "1.7.0",
-            DebuggerType::Python => "1.6.0",
+            DebuggerType::DebugPy => "1.6.0",
+            DebuggerType::Go => "0.33.0",
+            DebuggerType::Delve => "1.8.3",
         }
     }
 
@@ -262,7 +299,7 @@ impl DebuggerType {
                 "request": "launch",
                 "program": program,
             }),
-            DebuggerType::Python => serde_json::json!({
+            DebuggerType::DebugPy => serde_json::json!({
                 "args": args,
                 "cwd": env::current_dir()?,
                 "env": {},
@@ -272,6 +309,16 @@ impl DebuggerType {
                 "request": "launch",
                 "program": program,
                 "stopOnEntry": true,
+            }),
+            DebuggerType::Go => todo!(),
+            DebuggerType::Delve => serde_json::json!({
+                "args": args,
+                "cwd": env::current_dir()?,
+                "env": {},
+                "name": "delve",
+                "type": "delve",
+                "request": "launch",
+                "program": program,
             }),
         };
         Ok(ret)
@@ -283,7 +330,7 @@ impl DebuggerType {
     ) -> Result<()> {
         match self {
             DebuggerType::CodeLLDB => {}
-            DebuggerType::Python => {
+            DebuggerType::DebugPy => {
                 let python_path = self
                     .get_debugger_binary_path(neovim_vadre_window.clone())
                     .await?;
@@ -322,6 +369,53 @@ impl DebuggerType {
                     .log_msg(VadreLogLevel::INFO, &format!("debugpy stderr: {}", stderr))
                     .await?;
             }
+            DebuggerType::Go => {}
+            DebuggerType::Delve => {
+                let go_path = neovim_vadre_window
+                    .lock()
+                    .await
+                    .get_var("vadre_go_path")
+                    .await
+                    .map(|x| PathBuf::from(x))
+                    .unwrap_or(which("go").unwrap());
+
+                let go_path = dunce::canonicalize(&go_path)?;
+
+                let working_dir = self.get_debugger_extension_dir()?;
+
+                tracing::debug!(
+                    "Running delve installation: {:?} {:?}",
+                    go_path,
+                    working_dir
+                );
+
+                let child = Command::new(go_path.to_str().unwrap())
+                    .args(vec!["build", "."])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .current_dir(working_dir)
+                    .output()
+                    .await
+                    .expect("Failed to spawn go setup");
+
+                let stdout = String::from_utf8_lossy(&child.stdout);
+                let stderr = String::from_utf8_lossy(&child.stdout);
+
+                tracing::debug!("go build output: {:?}", stdout);
+                tracing::debug!("go build stderr: {:?}", stderr);
+
+                neovim_vadre_window
+                    .lock()
+                    .await
+                    .log_msg(VadreLogLevel::INFO, &format!("go stdout: {}", stdout))
+                    .await?;
+                neovim_vadre_window
+                    .lock()
+                    .await
+                    .log_msg(VadreLogLevel::INFO, &format!("go stderr: {}", stderr))
+                    .await?;
+            }
         };
         Ok(())
     }
@@ -337,12 +431,21 @@ impl DebuggerType {
                     os
                 )
             }
-            DebuggerType::Python => {
+            DebuggerType::DebugPy => {
                 format!(
                     "https://github.com/microsoft/debugpy/archive/v{}.zip",
                     self.get_debugger_version()
                 )
             }
+            DebuggerType::Go => format!(
+                "https://github.com/golang/vscode-go/releases/download/v{}/go-{}.vsix",
+                self.get_debugger_version(),
+                self.get_debugger_version(),
+            ),
+            DebuggerType::Delve => format!(
+                "https://github.com/go-delve/delve/archive/refs/tags/v{}.zip",
+                self.get_debugger_version(),
+            ),
         };
         Ok(Url::parse(&url)?)
     }
@@ -717,7 +820,7 @@ impl Debugger {
 
         tokio::spawn(async move {
             let mut framed_stream = framed_stream;
-            let mut config_done_tx = Some(config_done_tx);
+            let config_done_tx = Arc::new(Mutex::new(Some(config_done_tx)));
             let mut debugger_sender_rx = debugger_sender_rx;
             let debugger_type = debugger_type;
 
@@ -741,7 +844,7 @@ impl Debugger {
                                 match decoder_result {
                                     Ok(message) => match message.type_ {
                                         dap_protocol::ProtocolMessageType::Request(request) => {
-                                            let config_done_tx = config_done_tx.take().unwrap();
+                                            let config_done_tx = config_done_tx.clone();
                                             if let Err(e) = timeout(
                                                 Duration::new(10, 0),
                                                 Debugger::handle_request(
@@ -750,7 +853,7 @@ impl Debugger {
                                                     neovim_vadre_window.clone(),
                                                     debugger_sender_tx.clone(),
                                                     Some(&debug_program_str),
-                                                    Some(config_done_tx),
+                                                    config_done_tx,
                                                 ),
                                             )
                                             .await
@@ -790,6 +893,7 @@ impl Debugger {
 
                                         dap_protocol::ProtocolMessageType::Event(event) => {
                                             // TODO: configurable timeout?
+                                            let config_done_tx = config_done_tx.clone();
                                             if let Err(e) = timeout(
                                                 Duration::new(10, 0),
                                                 Debugger::handle_event(
@@ -798,6 +902,7 @@ impl Debugger {
                                                     debugger_sender_tx.clone(),
                                                     data.clone(),
                                                     &debugger_type,
+                                                    config_done_tx,
                                                 ),
                                             )
                                             .await
@@ -989,7 +1094,7 @@ impl Debugger {
             Option<oneshot::Sender<ResponseResult>>,
         )>,
         debug_program_str: Option<&str>,
-        mut config_done_tx: Option<oneshot::Sender<()>>,
+        config_done_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     ) -> Result<()> {
         // Debugger is requesting something from us, currently only runTerminal should be received
         match args {
@@ -1031,7 +1136,10 @@ impl Debugger {
                 // always use do_send_request to do a send on `debugger_sender_tx`.
                 debugger_sender_tx.clone().send((response, None)).await?;
 
-                config_done_tx.take().unwrap().send(()).unwrap();
+                match config_done_tx.lock().await.take() {
+                    Some(x) => x.send(()).unwrap(),
+                    None => {}
+                };
 
                 Ok(())
             }
@@ -1063,7 +1171,13 @@ impl Debugger {
         Ok(())
     }
 
-    #[tracing::instrument(skip(event, neovim_vadre_window, debugger_sender_tx, data,))]
+    #[tracing::instrument(skip(
+        event,
+        neovim_vadre_window,
+        debugger_sender_tx,
+        data,
+        config_done_tx
+    ))]
     async fn handle_event(
         event: EventBody,
         neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
@@ -1073,9 +1187,23 @@ impl Debugger {
         )>,
         data: Arc<Mutex<DebuggerData>>,
         debugger_type: &DebuggerType,
+        config_done_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     ) -> Result<()> {
         tracing::trace!("Processing event: {:?}", event);
         match event {
+            EventBody::initialized => {
+                match debugger_type {
+                    DebuggerType::Delve => config_done_tx
+                        .lock()
+                        .await
+                        .take()
+                        .unwrap()
+                        .send(())
+                        .unwrap(),
+                    _ => {}
+                }
+                Ok(())
+            }
             EventBody::output(output) => {
                 neovim_vadre_window
                     .lock()
@@ -1268,7 +1396,9 @@ impl Debugger {
                 assert!(message.starts_with("Resolved locations: "));
                 message.rsplit_once(": ").unwrap().1.parse::<i64>().unwrap() > 0
             }
-            DebuggerType::Python => true, // TODO
+            DebuggerType::DebugPy => true,
+            DebuggerType::Go => todo!(),
+            DebuggerType::Delve => todo!(),
         }
     }
 
