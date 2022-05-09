@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     env::{self, consts::EXE_SUFFIX},
     fmt::Debug,
-    path::Path,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::{
         atomic::{AtomicU32, Ordering},
@@ -38,6 +38,8 @@ use tokio::{
     time::{sleep, timeout},
 };
 use tokio_util::codec::Decoder;
+use which::which;
+
 use tracing::{debug, error};
 
 use self::dap_protocol::{ContinueArguments, NextArguments, StepInArguments};
@@ -121,79 +123,241 @@ impl Breakpoints {
     }
 }
 
-#[derive(Clone, Debug)]
-pub enum Debugger {
-    CodeLLDB(CodeLLDBDebugger),
-}
-
-impl Debugger {
-    #[tracing::instrument(skip(self))]
-    pub async fn setup(
-        &mut self,
-        pending_breakpoints: &HashMap<String, HashSet<i64>>,
-        codelldb_port: Option<u16>,
-    ) -> Result<()> {
-        match self {
-            Debugger::CodeLLDB(debugger) => {
-                debugger.setup(pending_breakpoints, codelldb_port).await
-            }
-        }
-    }
-
-    #[tracing::instrument(skip(self))]
-    pub fn neovim_vadre_window(&self) -> Arc<Mutex<NeovimVadreWindow>> {
-        match self {
-            Debugger::CodeLLDB(debugger) => debugger.neovim_vadre_window.clone(),
-        }
-    }
-
-    #[tracing::instrument(skip(self))]
-    pub async fn set_source_breakpoints(
-        &self,
-        file_path: String,
-        line_numbers: &HashSet<i64>,
-    ) -> Result<()> {
-        match self {
-            Debugger::CodeLLDB(debugger) => debugger.set_breakpoints(file_path, line_numbers).await,
-        }
-    }
-
-    #[tracing::instrument(skip(self))]
-    pub async fn do_step(&self, step_type: DebuggerStepType) -> Result<()> {
-        match self {
-            Debugger::CodeLLDB(debugger) => debugger.do_step(step_type).await,
-        }
-    }
-
-    #[tracing::instrument(skip(self))]
-    pub async fn print_variable(&self, variable_name: &str) -> Result<()> {
-        match self {
-            Debugger::CodeLLDB(debugger) => debugger.print_variable(variable_name).await,
-        }
-    }
-
-    #[tracing::instrument(skip(self))]
-    pub async fn change_output_window(&self, ascending: bool) -> Result<()> {
-        match self {
-            Debugger::CodeLLDB(debugger) => debugger.change_output_window(ascending).await,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Default)]
-struct CodeLLDBDebuggerData {
+struct DebuggerData {
     current_thread_id: Option<i64>,
     current_frame_id: Option<i64>,
     breakpoints: Breakpoints,
 }
 
+#[derive(Clone, Debug)]
+pub enum DebuggerType {
+    CodeLLDB,
+    Python,
+}
+
+// TODO: Checksum
+impl DebuggerType {
+    fn init_debugger_name(&self) -> String {
+        String::from(match self {
+            DebuggerType::CodeLLDB => "CodeLLDB",
+            DebuggerType::Python => "debugpy",
+        })
+    }
+
+    fn get_debugger_name(&self) -> &str {
+        match self {
+            DebuggerType::CodeLLDB => "codelldb",
+            DebuggerType::Python => "debugpy",
+        }
+    }
+
+    async fn get_debugger_binary_path(
+        &self,
+        neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
+    ) -> Result<PathBuf> {
+        match self {
+            DebuggerType::CodeLLDB => {
+                let binary_name = self.get_debugger_extension_binary_name();
+                let mut path = self.get_debugger_extension_dir()?;
+                path.push(&binary_name);
+                Ok(path)
+            }
+            DebuggerType::Python => {
+                tracing::trace!("Searching for `python3` program");
+                let python_path = neovim_vadre_window
+                    .lock()
+                    .await
+                    .get_var("vadre_python_path")
+                    .await
+                    .map(|x| PathBuf::from(x))
+                    .unwrap_or(which("python3").unwrap());
+
+                tracing::trace!("Found `{:?}`", python_path);
+                let python_path = dunce::canonicalize(&python_path)?;
+                tracing::trace!("Canonical path `{:?}`", python_path);
+
+                Ok(PathBuf::from(python_path))
+            }
+        }
+    }
+
+    fn get_debugger_extension_root_dir(&self) -> &str {
+        match self {
+            DebuggerType::CodeLLDB => "codelldb",
+            DebuggerType::Python => "debugpy",
+        }
+    }
+
+    fn get_debugger_extension_dir(&self) -> Result<PathBuf> {
+        let mut path = get_debuggers_dir()?;
+        path.push(self.get_debugger_extension_root_dir());
+        match self {
+            DebuggerType::CodeLLDB => {
+                path.push("extension");
+                path.push("adapter");
+            }
+            DebuggerType::Python => {
+                path.push(&format!("debugpy-{}", self.get_debugger_version()));
+            }
+        }
+        let path = dunce::canonicalize(path)?;
+        Ok(path)
+    }
+
+    fn get_debugger_extension_binary_name(&self) -> String {
+        let binary = match self {
+            DebuggerType::CodeLLDB => "codelldb".to_string(),
+            DebuggerType::Python => unreachable!(),
+        };
+        format!("{}{}", binary, EXE_SUFFIX)
+    }
+
+    fn get_debugger_run_command_args(&self, port: u16, log: bool) -> Result<Vec<String>> {
+        let ret = match self {
+            DebuggerType::CodeLLDB => vec!["--port".to_string(), port.to_string()],
+            DebuggerType::Python => {
+                let mut debugger_dir = self.get_debugger_extension_dir()?;
+                debugger_dir.push("build");
+                debugger_dir.push("lib");
+                debugger_dir.push("debugpy");
+                debugger_dir.push("adapter");
+                let mut ret = vec![
+                    debugger_dir.to_str().unwrap().to_string(),
+                    "--port".to_string(),
+                    port.to_string(),
+                ];
+                if log {
+                    if let Ok(vadre_log_file) = env::var("VADRE_LOG_FILE") {
+                        let mut vadre_log = PathBuf::from(vadre_log_file);
+                        vadre_log.pop();
+                        ret.push(format!("--log-dir={}", vadre_log.to_str().unwrap()));
+                    } else {
+                        ret.push("--log-stderr".to_string());
+                    }
+                }
+                ret
+            }
+        };
+        Ok(ret)
+    }
+
+    fn get_debugger_version(&self) -> &str {
+        match self {
+            DebuggerType::CodeLLDB => "1.7.0",
+            DebuggerType::Python => "1.6.0",
+        }
+    }
+
+    fn get_launcher_args(&self, program: String, args: &Vec<String>) -> Result<serde_json::Value> {
+        let ret = match self {
+            DebuggerType::CodeLLDB => serde_json::json!({
+                "args": args,
+                "cargo": {},
+                "cwd": env::current_dir()?,
+                "env": {},
+                "name": "lldb",
+                "terminal": "integrated",
+                "type": "lldb",
+                "request": "launch",
+                "program": program,
+            }),
+            DebuggerType::Python => serde_json::json!({
+                "args": args,
+                "cwd": env::current_dir()?,
+                "env": {},
+                "name": "debugpy",
+                "console": "integratedTerminal",
+                "type": "debugpy",
+                "request": "launch",
+                "program": program,
+                "stopOnEntry": true,
+            }),
+        };
+        Ok(ret)
+    }
+
+    async fn install_plugin(
+        &self,
+        neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
+    ) -> Result<()> {
+        match self {
+            DebuggerType::CodeLLDB => {}
+            DebuggerType::Python => {
+                let python_path = self
+                    .get_debugger_binary_path(neovim_vadre_window.clone())
+                    .await?;
+                let working_dir = self.get_debugger_extension_dir()?;
+
+                tracing::debug!(
+                    "Running debugpy installation: {:?} {:?}",
+                    python_path,
+                    working_dir
+                );
+
+                let child = Command::new(python_path.to_str().unwrap())
+                    .args(vec!["setup.py", "build", "--build-platlib", "build/lib"])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .current_dir(working_dir)
+                    .output()
+                    .await
+                    .expect("Failed to spawn debugpy setup");
+
+                let stdout = String::from_utf8_lossy(&child.stdout);
+                let stderr = String::from_utf8_lossy(&child.stdout);
+
+                tracing::debug!("debugpy output: {:?}", stdout);
+                tracing::debug!("debugpy stderr: {:?}", stderr);
+
+                neovim_vadre_window
+                    .lock()
+                    .await
+                    .log_msg(VadreLogLevel::INFO, &format!("debugpy stdout: {}", stdout))
+                    .await?;
+                neovim_vadre_window
+                    .lock()
+                    .await
+                    .log_msg(VadreLogLevel::INFO, &format!("debugpy stderr: {}", stderr))
+                    .await?;
+            }
+        };
+        Ok(())
+    }
+
+    fn get_debugger_extension_url(&self, os: &str, arch: &str) -> Result<Url> {
+        let url = match self {
+            DebuggerType::CodeLLDB => {
+                format!(
+                    "https://github.com/vadimcn/vscode-lldb/releases/download/v{}\
+                                 /codelldb-{}-{}.vsix",
+                    self.get_debugger_version(),
+                    arch,
+                    os
+                )
+            }
+            DebuggerType::Python => {
+                format!(
+                    "https://github.com/microsoft/debugpy/archive/v{}.zip",
+                    self.get_debugger_version()
+                )
+            }
+        };
+        Ok(Url::parse(&url)?)
+    }
+}
+
 #[derive(Clone)]
-pub struct CodeLLDBDebugger {
+pub struct Debugger {
     id: usize,
     command: String,
     command_args: Vec<String>,
     pub neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
     process: Option<Arc<Child>>,
+
+    debugger_type: DebuggerType,
+    log_debugger: bool,
 
     debugger_sender_tx:
         mpsc::Sender<(ProtocolMessageType, Option<oneshot::Sender<ResponseResult>>)>,
@@ -210,40 +374,45 @@ pub struct CodeLLDBDebugger {
 
     pending_outgoing_requests: Arc<Mutex<HashMap<u32, oneshot::Sender<ResponseResult>>>>,
 
-    codelldb_data: Arc<Mutex<CodeLLDBDebuggerData>>,
+    data: Arc<Mutex<DebuggerData>>,
 }
 
-impl CodeLLDBDebugger {
+impl Debugger {
     #[tracing::instrument(skip(neovim))]
     pub fn new(
         id: usize,
         command: String,
         command_args: Vec<String>,
         neovim: Neovim<Compat<Stdout>>,
+        debugger_type: DebuggerType,
+        log_debugger: bool,
     ) -> Self {
         let (debugger_sender_tx, debugger_sender_rx) = mpsc::channel(1);
 
-        CodeLLDBDebugger {
+        Debugger {
             id,
             command,
             command_args,
             neovim_vadre_window: Arc::new(Mutex::new(NeovimVadreWindow::new(neovim, id))),
             process: None,
 
+            debugger_type,
+            log_debugger,
+
             debugger_sender_tx,
             debugger_sender_rx: Arc::new(Mutex::new(Some(debugger_sender_rx))),
 
             pending_outgoing_requests: Arc::new(Mutex::new(HashMap::new())),
 
-            codelldb_data: Arc::new(Mutex::new(CodeLLDBDebuggerData::default())),
+            data: Arc::new(Mutex::new(DebuggerData::default())),
         }
     }
 
-    #[tracing::instrument(skip(self, pending_breakpoints))]
+    #[tracing::instrument(skip(self))]
     pub async fn setup(
         &mut self,
         pending_breakpoints: &HashMap<String, HashSet<i64>>,
-        codelldb_port: Option<u16>,
+        existing_debugger_port: Option<u16>,
     ) -> Result<()> {
         log_ret_err!(
             self.neovim_vadre_window.lock().await.create_ui().await,
@@ -251,15 +420,20 @@ impl CodeLLDBDebugger {
             "Error setting up Vadre UI"
         );
 
-        let port = codelldb_port.unwrap_or(util::get_unused_localhost_port());
+        let port = match existing_debugger_port {
+            Some(port) => port,
+            None => {
+                let port = util::get_unused_localhost_port();
 
-        if codelldb_port.is_none() {
-            log_ret_err!(
-                self.launch(port).await,
-                self.neovim_vadre_window,
-                "Error launching process"
-            );
-        }
+                log_ret_err!(
+                    self.launch(port).await,
+                    self.neovim_vadre_window,
+                    "Error launching process"
+                );
+
+                port
+            }
+        };
 
         let (config_done_tx, config_done_rx) = oneshot::channel();
         log_ret_err!(
@@ -276,7 +450,7 @@ impl CodeLLDBDebugger {
             self.neovim_vadre_window
                 .lock()
                 .await
-                .log_msg(VadreLogLevel::INFO, "CodeLLDB launched and setup")
+                .log_msg(VadreLogLevel::INFO, "Debugger launched and setup")
                 .await
         );
 
@@ -290,7 +464,7 @@ impl CodeLLDBDebugger {
         line_numbers: &HashSet<i64>,
     ) -> Result<()> {
         tracing::trace!(
-            "CodeLLDB setting breakpoints in file {:?} on lines {:?}",
+            "Debugger setting breakpoints in file {:?} on lines {:?}",
             file_path,
             line_numbers,
         );
@@ -331,17 +505,13 @@ impl CodeLLDBDebugger {
                     .map(|x| x.id.unwrap())
                     .collect::<Vec<i64>>();
 
-                tracing::trace!("1 - {:?}", self.codelldb_data.lock().await.breakpoints);
-
-                self.codelldb_data
+                self.data
                     .lock()
                     .await
                     .breakpoints
                     .remove_file_ids(file_path.clone(), ids_left)?;
 
-                tracing::trace!("2 - {:?}", self.codelldb_data.lock().await.breakpoints);
-
-                let mut codelldb_data_lock = self.codelldb_data.lock().await;
+                let mut data_lock = self.data.lock().await;
 
                 for (i, breakpoint_response) in breakpoints_body.breakpoints.into_iter().enumerate()
                 {
@@ -349,22 +519,22 @@ impl CodeLLDBDebugger {
 
                     let breakpoint_id = breakpoint_response.id.unwrap();
 
-                    let message = breakpoint_response.message.unwrap();
-                    let breakpoint_is_resolved = CodeLLDBDebugger::breakpoint_is_resolved(&message);
+                    let breakpoint_is_resolved =
+                        Debugger::breakpoint_is_resolved(&breakpoint_response, &self.debugger_type);
 
-                    tracing::trace!("3 - {:?}", codelldb_data_lock.breakpoints);
+                    tracing::trace!("3 - {:?}", data_lock.breakpoints);
 
-                    codelldb_data_lock.breakpoints.add_breakpoint(
+                    data_lock.breakpoints.add_breakpoint(
                         breakpoint_id,
                         file_path.clone(),
                         original_line_number,
                         breakpoint_response.line,
                         breakpoint_is_resolved,
                     )?;
-                    tracing::trace!("4 - {:?}", codelldb_data_lock.breakpoints);
+                    tracing::trace!("4 - {:?}", data_lock.breakpoints);
                 }
 
-                let breakpoints = codelldb_data_lock
+                let breakpoints = data_lock
                     .breakpoints
                     .get_all_breakpoints_for_file(&file_path);
 
@@ -381,24 +551,52 @@ impl CodeLLDBDebugger {
     }
 
     #[tracing::instrument(skip(self))]
+    pub async fn set_source_breakpoints(
+        &self,
+        file_path: String,
+        line_numbers: &HashSet<i64>,
+    ) -> Result<()> {
+        self.set_breakpoints(file_path, line_numbers).await
+    }
+
+    #[tracing::instrument(skip(self))]
     pub async fn do_step(&self, step_type: DebuggerStepType) -> Result<()> {
-        let codelldb_data = self.codelldb_data.lock().await;
+        let thread_id = {
+            let data = self.data.lock().await;
+
+            data.current_thread_id.clone()
+        };
+
+        let thread_id = match thread_id {
+            Some(thread_id) => thread_id,
+            None => {
+                self.neovim_vadre_window
+                    .lock()
+                    .await
+                    .log_msg(
+                        VadreLogLevel::ERROR,
+                        "Can't do stepping as no current thread",
+                    )
+                    .await?;
+                return Ok(());
+            }
+        };
 
         let request = match step_type {
             DebuggerStepType::Over => RequestArguments::next(NextArguments {
                 granularity: None,
                 single_thread: Some(false),
-                thread_id: codelldb_data.current_thread_id.unwrap(),
+                thread_id,
             }),
             DebuggerStepType::In => RequestArguments::stepIn(StepInArguments {
                 granularity: None,
                 single_thread: Some(false),
                 target_id: None,
-                thread_id: codelldb_data.current_thread_id.unwrap(),
+                thread_id,
             }),
             DebuggerStepType::Continue => RequestArguments::continue_(ContinueArguments {
                 single_thread: Some(false),
-                thread_id: codelldb_data.current_thread_id.unwrap(),
+                thread_id,
             }),
         };
 
@@ -430,8 +628,10 @@ impl CodeLLDBDebugger {
     #[tracing::instrument(skip(self, port))]
     async fn launch(&mut self, port: u16) -> Result<()> {
         let msg = format!(
-            "Launching process {:?} with lldb and args: {:?}",
-            self.command, self.command_args,
+            "Launching process {:?} with {:?} and args: {:?}",
+            self.command,
+            self.debugger_type.get_debugger_name(),
+            self.command_args,
         );
         self.neovim_vadre_window
             .lock()
@@ -441,20 +641,23 @@ impl CodeLLDBDebugger {
 
         self.download_plugin().await?;
 
-        let mut path = get_debuggers_dir()?;
-        path.push("codelldb");
-        path.push("extension");
-        path.push("adapter");
-        path.push(format!("codelldb{}", EXE_SUFFIX));
+        let path = self
+            .debugger_type
+            .get_debugger_binary_path(self.neovim_vadre_window.clone())
+            .await?;
 
         if !path.exists() {
-            bail!("The binary for codelldb.exe doesn't exist, though it should by this point");
+            bail!("The binary doesn't exist: {}", path.to_str().unwrap());
         }
 
-        tracing::trace!("Spawning processs {:?}", path);
+        let args = self
+            .debugger_type
+            .get_debugger_run_command_args(port, self.log_debugger)?;
 
-        let mut child = Command::new(path)
-            .args(["--port", &port.to_string()])
+        tracing::trace!("Spawning process: {:?} {:?}", path, args);
+
+        let mut child = Command::new(path.to_str().unwrap())
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -467,14 +670,14 @@ impl CodeLLDBDebugger {
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
             while let Some(line) = reader.next_line().await.expect("can read stdout") {
-                tracing::trace!("CodeLLDB stdout: {}", line);
+                tracing::trace!("Debugger stdout: {}", line);
             }
         });
 
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr).lines();
             while let Some(line) = reader.next_line().await.expect("can read stderr") {
-                tracing::trace!("CodeLLDB stderr: {}", line);
+                tracing::trace!("Debugger stderr: {}", line);
             }
         });
 
@@ -507,7 +710,8 @@ impl CodeLLDBDebugger {
             .expect("Should have a debugger_sender_rx to take");
 
         let pending_outgoing_requests = self.pending_outgoing_requests.clone();
-        let codelldb_data = self.codelldb_data.clone();
+        let data = self.data.clone();
+        let debugger_type = self.debugger_type.clone();
 
         let debug_program_str = self.command.clone() + &self.command_args.join(" ");
 
@@ -515,6 +719,7 @@ impl CodeLLDBDebugger {
             let mut framed_stream = framed_stream;
             let mut config_done_tx = Some(config_done_tx);
             let mut debugger_sender_rx = debugger_sender_rx;
+            let debugger_type = debugger_type;
 
             let seq_ids = AtomicU32::new(1);
             let pending_outgoing_requests = pending_outgoing_requests.clone();
@@ -529,7 +734,7 @@ impl CodeLLDBDebugger {
                 tokio::select! {
                     msg = framed_stream.next() => {
                         tracing::trace!("Got message {:?}", msg);
-                        // Message from CodeLLDB
+                        // Message from Debugger
                         match msg {
                             Some(Ok(decoder_result)) => {
                                 tracing::trace!("Message: {:?}", decoder_result);
@@ -539,7 +744,7 @@ impl CodeLLDBDebugger {
                                             let config_done_tx = config_done_tx.take().unwrap();
                                             if let Err(e) = timeout(
                                                 Duration::new(10, 0),
-                                                CodeLLDBDebugger::handle_codelldb_request(
+                                                Debugger::handle_request(
                                                     message.seq,
                                                     request,
                                                     neovim_vadre_window.clone(),
@@ -550,7 +755,7 @@ impl CodeLLDBDebugger {
                                             )
                                             .await
                                             {
-                                                let msg = format!("CodeLLDB Request Error: {}", e);
+                                                let msg = format!("Debugger Request Error: {}", e);
                                                 tracing::error!("{}", msg);
                                                 neovim_vadre_window
                                                     .lock()
@@ -565,14 +770,14 @@ impl CodeLLDBDebugger {
                                             // TODO: configurable timeout?
                                             if let Err(e) = timeout(
                                                 Duration::new(10, 0),
-                                                CodeLLDBDebugger::handle_codelldb_response(
+                                                Debugger::handle_response(
                                                     response,
                                                     pending_outgoing_requests.clone(),
                                                 ),
                                             )
                                             .await
                                             {
-                                                let msg = format!("CodeLLDB Response Error: {}", e);
+                                                let msg = format!("Debugger Response Error: {}", e);
                                                 tracing::error!("{}", msg);
                                                 neovim_vadre_window
                                                     .lock()
@@ -587,16 +792,17 @@ impl CodeLLDBDebugger {
                                             // TODO: configurable timeout?
                                             if let Err(e) = timeout(
                                                 Duration::new(10, 0),
-                                                CodeLLDBDebugger::handle_codelldb_event(
+                                                Debugger::handle_event(
                                                     event,
                                                     neovim_vadre_window.clone(),
                                                     debugger_sender_tx.clone(),
-                                                    codelldb_data.clone(),
+                                                    data.clone(),
+                                                    &debugger_type,
                                                 ),
                                             )
                                             .await
                                             {
-                                                let msg = format!("CodeLLDB Event Error: {}", e);
+                                                let msg = format!("Debugger Event Error: {}", e);
                                                 tracing::error!("{}", msg);
                                                 neovim_vadre_window
                                                     .lock()
@@ -609,14 +815,14 @@ impl CodeLLDBDebugger {
                                     },
 
                                     Err(err) => {
-                                        error!("TODO: {:?}", err);
-                                        todo!();
+                                        error!("An error occurred, panic: {:?}", err);
+                                        panic!("An error occurred, panic: {:?}", err);
                                     }
                                 };
                             }
                             Some(Err(err)) => {
-                                error!("Frame decoder error: {}", err);
-                                break;
+                                error!("Frame decoder error: {:?}", err);
+                                panic!("Frame decoder error: {}", err);
                             }
                             None => {
                                 debug!("Client has disconnected");
@@ -684,33 +890,19 @@ impl CodeLLDBDebugger {
         pending_breakpoints: &HashMap<String, HashSet<i64>>,
         config_done_rx: oneshot::Receiver<()>,
     ) -> Result<()> {
-        let res = self
-            .send_request_and_await_response(RequestArguments::initialize(
-                InitializeRequestArguments::new("CodeLLDB".to_string()),
-            ))
-            .await?;
-
-        tracing::trace!("RES: {:?}", res);
-
-        #[cfg(windows)]
-        let program = dunce::canonicalize(&self.command)?;
-        #[cfg(not(windows))]
-        let program = std::fs::canonicalize(&self.command)?;
-
-        self.send_request(RequestArguments::launch(dap_protocol::Either::Second(
-            serde_json::json!({
-                "args": self.command_args,
-                "cargo": {},
-                "cwd": env::current_dir()?,
-                "env": {},
-                "name": "lldb",
-                "terminal": "integrated",
-                "type": "lldb",
-                "request": "launch",
-                "program": program,
-            }),
-        )))
+        self.send_request_and_await_response(RequestArguments::initialize(
+            InitializeRequestArguments::new(self.debugger_type.init_debugger_name()),
+        ))
         .await?;
+
+        let program = dunce::canonicalize(&self.command)?;
+
+        let args = self
+            .debugger_type
+            .get_launcher_args(program.to_str().unwrap().to_string(), &self.command_args)?;
+
+        self.send_request(RequestArguments::launch(dap_protocol::Either::Second(args)))
+            .await?;
 
         self.send_request(RequestArguments::setFunctionBreakpoints(
             SetFunctionBreakpointsArguments {
@@ -743,7 +935,7 @@ impl CodeLLDBDebugger {
 
     #[tracing::instrument(skip(self, request))]
     async fn send_request(&self, request: RequestArguments) -> Result<()> {
-        CodeLLDBDebugger::do_send_request(request, self.debugger_sender_tx.clone(), None).await
+        Debugger::do_send_request(request, self.debugger_sender_tx.clone(), None).await
     }
 
     #[tracing::instrument(skip(self, request))]
@@ -751,21 +943,16 @@ impl CodeLLDBDebugger {
         &self,
         request: RequestArguments,
     ) -> Result<ResponseResult> {
-        CodeLLDBDebugger::do_send_request_and_await_response(
-            request,
-            self.debugger_sender_tx.clone(),
-        )
-        .await
+        Debugger::do_send_request_and_await_response(request, self.debugger_sender_tx.clone()).await
     }
 
     #[tracing::instrument(skip(self))]
     async fn download_plugin(&self) -> Result<()> {
         let mut path = get_debuggers_dir()?;
-        path.push("codelldb");
+        path.push(self.debugger_type.get_debugger_extension_root_dir());
 
         if !path.exists() {
             let (os, arch) = util::get_os_and_cpu_architecture();
-            let version = "v1.7.0";
 
             self.neovim_vadre_window
                 .lock()
@@ -776,13 +963,13 @@ impl CodeLLDBDebugger {
                 )
                 .await?;
 
-            let url = Url::parse(&format!(
-                "https://github.com/vadimcn/vscode-lldb/releases/download/{}\
-                         /codelldb-{}-{}.vsix",
-                version, arch, os
-            ))?;
+            let url = self.debugger_type.get_debugger_extension_url(os, arch)?;
 
-            CodeLLDBDebugger::download_extract_zip(path.as_path(), url).await?;
+            Debugger::download_extract_zip(path.as_path(), url).await?;
+
+            self.debugger_type
+                .install_plugin(self.neovim_vadre_window.clone())
+                .await?;
         }
 
         Ok(())
@@ -791,9 +978,9 @@ impl CodeLLDBDebugger {
     // These functions going forward are useful as they don't have a `self` parameter and thus can
     // be used by tokio spawned async functions, though more parameters need passing in to be
     // useful of course.
-    /// Handle a request from CodeLLDB
+    /// Handle a request from Debugger
     #[tracing::instrument(skip(args, neovim_vadre_window, debugger_sender_tx, config_done_tx))]
-    async fn handle_codelldb_request(
+    async fn handle_request(
         request_id: u32,
         args: RequestArguments,
         neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
@@ -804,7 +991,7 @@ impl CodeLLDBDebugger {
         debug_program_str: Option<&str>,
         mut config_done_tx: Option<oneshot::Sender<()>>,
     ) -> Result<()> {
-        // CodeLLDB is requesting something from us, currently only runTerminal should be received
+        // Debugger is requesting something from us, currently only runTerminal should be received
         match args {
             RequestArguments::runInTerminal(args) => {
                 neovim_vadre_window
@@ -819,7 +1006,14 @@ impl CodeLLDBDebugger {
                 neovim_vadre_window
                     .lock()
                     .await
-                    .spawn_terminal_command(args.args.join(" "), debug_program_str)
+                    .spawn_terminal_command(
+                        args.args
+                            .into_iter()
+                            .map(|x| format!(r#""{}""#, x))
+                            .collect::<Vec<String>>()
+                            .join(" "),
+                        debug_program_str,
+                    )
                     .await?;
 
                 let response = ProtocolMessageType::Response(Response {
@@ -846,7 +1040,7 @@ impl CodeLLDBDebugger {
     }
 
     #[tracing::instrument(skip(response, pending_outgoing_requests))]
-    async fn handle_codelldb_response(
+    async fn handle_response(
         response: Response,
         pending_outgoing_requests: Arc<Mutex<HashMap<u32, oneshot::Sender<ResponseResult>>>>,
     ) -> Result<()> {
@@ -869,15 +1063,16 @@ impl CodeLLDBDebugger {
         Ok(())
     }
 
-    #[tracing::instrument(skip(event, neovim_vadre_window, debugger_sender_tx, codelldb_data,))]
-    async fn handle_codelldb_event(
+    #[tracing::instrument(skip(event, neovim_vadre_window, debugger_sender_tx, data,))]
+    async fn handle_event(
         event: EventBody,
         neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
         debugger_sender_tx: mpsc::Sender<(
             ProtocolMessageType,
             Option<oneshot::Sender<ResponseResult>>,
         )>,
-        codelldb_data: Arc<Mutex<CodeLLDBDebuggerData>>,
+        data: Arc<Mutex<DebuggerData>>,
+        debugger_type: &DebuggerType,
     ) -> Result<()> {
         tracing::trace!("Processing event: {:?}", event);
         match event {
@@ -887,33 +1082,34 @@ impl CodeLLDBDebugger {
                     .await
                     .log_msg(
                         VadreLogLevel::INFO,
-                        &format!("CodeLLDB: {}", output.output.trim_end()),
+                        &format!("Debugger: {}", output.output.trim_end()),
                     )
                     .await
             }
             EventBody::stopped(stopped_event) => {
-                CodeLLDBDebugger::handle_codelldb_event_stopped(
+                Debugger::handle_event_stopped(
                     stopped_event,
                     neovim_vadre_window,
                     debugger_sender_tx,
-                    codelldb_data,
+                    data,
                 )
                 .await
             }
             EventBody::continued(continued_event) => {
-                CodeLLDBDebugger::handle_codelldb_event_continued(
+                Debugger::handle_event_continued(
                     continued_event,
                     neovim_vadre_window,
                     debugger_sender_tx,
-                    codelldb_data,
+                    data,
                 )
                 .await
             }
             EventBody::breakpoint(breakpoint_event) => {
-                CodeLLDBDebugger::handle_codelldb_event_breakpoint(
+                Debugger::handle_event_breakpoint(
                     breakpoint_event,
                     neovim_vadre_window,
-                    codelldb_data,
+                    data,
+                    debugger_type,
                 )
                 .await
             }
@@ -924,31 +1120,26 @@ impl CodeLLDBDebugger {
         }
     }
 
-    #[tracing::instrument(skip(
-        stopped_event,
-        neovim_vadre_window,
-        debugger_sender_tx,
-        codelldb_data,
-    ))]
-    async fn handle_codelldb_event_stopped(
+    #[tracing::instrument(skip(stopped_event, neovim_vadre_window, debugger_sender_tx, data,))]
+    async fn handle_event_stopped(
         stopped_event: StoppedEventBody,
         neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
         debugger_sender_tx: mpsc::Sender<(
             ProtocolMessageType,
             Option<oneshot::Sender<ResponseResult>>,
         )>,
-        codelldb_data: Arc<Mutex<CodeLLDBDebuggerData>>,
+        data: Arc<Mutex<DebuggerData>>,
     ) -> Result<()> {
         let neovim_vadre_window = neovim_vadre_window.clone();
 
-        codelldb_data.lock().await.current_thread_id = stopped_event.thread_id;
+        data.lock().await.current_thread_id = stopped_event.thread_id;
 
         tokio::spawn(async move {
             log_err!(
-                CodeLLDBDebugger::process_output_info(
+                Debugger::process_output_info(
                     debugger_sender_tx.clone(),
                     neovim_vadre_window.clone(),
-                    codelldb_data,
+                    data,
                 )
                 .await,
                 neovim_vadre_window,
@@ -956,7 +1147,7 @@ impl CodeLLDBDebugger {
             );
 
             if let Some(thread_id) = stopped_event.thread_id {
-                if let Err(e) = CodeLLDBDebugger::process_stopped(
+                if let Err(e) = Debugger::process_stopped(
                     thread_id,
                     debugger_sender_tx,
                     neovim_vadre_window.clone(),
@@ -979,27 +1170,22 @@ impl CodeLLDBDebugger {
         Ok(())
     }
 
-    #[tracing::instrument(skip(
-        _continued_event,
-        neovim_vadre_window,
-        debugger_sender_tx,
-        codelldb_data,
-    ))]
-    async fn handle_codelldb_event_continued(
+    #[tracing::instrument(skip(_continued_event, neovim_vadre_window, debugger_sender_tx, data))]
+    async fn handle_event_continued(
         _continued_event: ContinuedEventBody,
         neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
         debugger_sender_tx: mpsc::Sender<(
             ProtocolMessageType,
             Option<oneshot::Sender<ResponseResult>>,
         )>,
-        codelldb_data: Arc<Mutex<CodeLLDBDebuggerData>>,
+        data: Arc<Mutex<DebuggerData>>,
     ) -> Result<()> {
         tokio::spawn(async move {
             log_err!(
-                CodeLLDBDebugger::process_output_info(
+                Debugger::process_output_info(
                     debugger_sender_tx.clone(),
                     neovim_vadre_window.clone(),
-                    codelldb_data,
+                    data,
                 )
                 .await,
                 neovim_vadre_window,
@@ -1010,19 +1196,20 @@ impl CodeLLDBDebugger {
         Ok(())
     }
 
-    #[tracing::instrument(skip(breakpoint_event, neovim_vadre_window, codelldb_data,))]
-    async fn handle_codelldb_event_breakpoint(
+    #[tracing::instrument(skip(breakpoint_event, neovim_vadre_window, data,))]
+    async fn handle_event_breakpoint(
         breakpoint_event: BreakpointEventBody,
         neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
-        codelldb_data: Arc<Mutex<CodeLLDBDebuggerData>>,
+        data: Arc<Mutex<DebuggerData>>,
+        debugger_type: &DebuggerType,
     ) -> Result<()> {
         let breakpoint_id = breakpoint_event.breakpoint.id.unwrap();
 
-        let message = breakpoint_event.breakpoint.message.unwrap();
-        let is_resolved = CodeLLDBDebugger::breakpoint_is_resolved(&message);
+        let is_resolved =
+            Debugger::breakpoint_is_resolved(&breakpoint_event.breakpoint, debugger_type);
 
         for _ in 1..100 {
-            if codelldb_data
+            if data
                 .lock()
                 .await
                 .breakpoints
@@ -1034,7 +1221,7 @@ impl CodeLLDBDebugger {
             sleep(Duration::from_millis(100)).await;
         }
 
-        let existing_breakpoint = codelldb_data
+        let existing_breakpoint = data
             .lock()
             .await
             .breakpoints
@@ -1044,9 +1231,9 @@ impl CodeLLDBDebugger {
 
         let file_path = existing_breakpoint.file_path.clone();
 
-        let mut codelldb_data_lock = codelldb_data.lock().await;
+        let mut data_lock = data.lock().await;
 
-        codelldb_data_lock.breakpoints.add_breakpoint(
+        data_lock.breakpoints.add_breakpoint(
             breakpoint_id,
             file_path.clone(),
             existing_breakpoint.line_number,
@@ -1054,7 +1241,7 @@ impl CodeLLDBDebugger {
             is_resolved,
         )?;
 
-        let breakpoints = codelldb_data_lock
+        let breakpoints = data_lock
             .breakpoints
             .get_all_breakpoints_for_file(&file_path);
 
@@ -1067,12 +1254,22 @@ impl CodeLLDBDebugger {
         Ok(())
     }
 
-    fn breakpoint_is_resolved(message: &str) -> bool {
-        // This is awful but I can't see any other way of knowing if a breakpoint
-        // was resolved other than checking the message for "Resolved locations: "
-        // and ending in either 0 or greater.
-        assert!(message.starts_with("Resolved locations: "));
-        message.rsplit_once(": ").unwrap().1.parse::<i64>().unwrap() > 0
+    fn breakpoint_is_resolved(
+        breakpoint: &dap_protocol::Breakpoint,
+        debugger_type: &DebuggerType,
+    ) -> bool {
+        match debugger_type {
+            DebuggerType::CodeLLDB => {
+                let message = breakpoint.message.as_ref().unwrap();
+
+                // This is awful but I can't see any other way of knowing if a breakpoint
+                // was resolved other than checking the message for "Resolved locations: "
+                // and ending in either 0 or greater.
+                assert!(message.starts_with("Resolved locations: "));
+                message.rsplit_once(": ").unwrap().1.parse::<i64>().unwrap() > 0
+            }
+            DebuggerType::Python => true, // TODO
+        }
     }
 
     /// Actually send the request, should be the only function that does this, even the function
@@ -1106,7 +1303,7 @@ impl CodeLLDBDebugger {
     ) -> Result<ResponseResult> {
         let (sender, receiver) = oneshot::channel();
 
-        CodeLLDBDebugger::do_send_request(request, debugger_sender_tx, Some(sender)).await?;
+        Debugger::do_send_request(request, debugger_sender_tx, Some(sender)).await?;
 
         // TODO: configurable timeout
         let response = match timeout(Duration::new(10, 0), receiver).await {
@@ -1129,12 +1326,12 @@ impl CodeLLDBDebugger {
     ) -> Result<()> {
         tracing::debug!("Thread id {} stopped", thread_id);
 
-        let stack_trace_response = CodeLLDBDebugger::do_send_request_and_await_response(
+        let stack_trace_response = Debugger::do_send_request_and_await_response(
             RequestArguments::stackTrace(StackTraceArguments {
                 thread_id,
                 format: None,
                 levels: Some(1),
-                start_frame: None,
+                start_frame: Some(0), // Should be optional but debugpy breaks without this
             }),
             debugger_sender_tx.clone(),
         )
@@ -1161,15 +1358,14 @@ impl CodeLLDBDebugger {
                         )
                         .await?;
                 } else if let Some(source_reference_id) = source.source_reference {
-                    let source_reference_response =
-                        CodeLLDBDebugger::do_send_request_and_await_response(
-                            RequestArguments::source(SourceArguments {
-                                source: Some(source.clone()),
-                                source_reference: source_reference_id,
-                            }),
-                            debugger_sender_tx.clone(),
-                        )
-                        .await?;
+                    let source_reference_response = Debugger::do_send_request_and_await_response(
+                        RequestArguments::source(SourceArguments {
+                            source: Some(source.clone()),
+                            source_reference: source_reference_id,
+                        }),
+                        debugger_sender_tx.clone(),
+                    )
+                    .await?;
                     if let ResponseResult::Success { body } = source_reference_response {
                         if let ResponseBody::source(source_reference_body) = body {
                             tracing::trace!("source reference {:?}", source_reference_body);
@@ -1196,21 +1392,21 @@ impl CodeLLDBDebugger {
         Ok(())
     }
 
-    #[tracing::instrument(skip(debugger_sender_tx, neovim_vadre_window, codelldb_data))]
+    #[tracing::instrument(skip(debugger_sender_tx, neovim_vadre_window, data))]
     async fn process_output_info(
         debugger_sender_tx: mpsc::Sender<(
             ProtocolMessageType,
             Option<oneshot::Sender<ResponseResult>>,
         )>,
         neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
-        codelldb_data: Arc<Mutex<CodeLLDBDebuggerData>>,
+        data: Arc<Mutex<DebuggerData>>,
     ) -> Result<()> {
         tracing::debug!("Getting thread information");
 
         let mut call_stack_buffer_content = Vec::new();
-        let current_thread_id = codelldb_data.lock().await.current_thread_id;
+        let current_thread_id = data.lock().await.current_thread_id;
 
-        let response_result = CodeLLDBDebugger::do_send_request_and_await_response(
+        let response_result = Debugger::do_send_request_and_await_response(
             RequestArguments::threads(None),
             debugger_sender_tx.clone(),
         )
@@ -1225,17 +1421,16 @@ impl CodeLLDBDebugger {
                     if current_thread_id == Some(thread_id) {
                         call_stack_buffer_content.push(format!("{} (*)", thread_name));
 
-                        let stack_trace_response =
-                            CodeLLDBDebugger::do_send_request_and_await_response(
-                                RequestArguments::stackTrace(StackTraceArguments {
-                                    thread_id,
-                                    format: None,
-                                    levels: None,
-                                    start_frame: None,
-                                }),
-                                debugger_sender_tx.clone(),
-                            )
-                            .await?;
+                        let stack_trace_response = Debugger::do_send_request_and_await_response(
+                            RequestArguments::stackTrace(StackTraceArguments {
+                                thread_id,
+                                format: None,
+                                levels: None,
+                                start_frame: None,
+                            }),
+                            debugger_sender_tx.clone(),
+                        )
+                        .await?;
 
                         // Sometimes we don't get a body here as we get a message saying invalid thread,
                         // normally when the thread is doing something in blocking.
@@ -1246,9 +1441,9 @@ impl CodeLLDBDebugger {
                                 let top_frame =
                                     frames.get(0).expect("has a frame on the stack trace");
                                 let frame_id = top_frame.id;
-                                codelldb_data.lock().await.current_frame_id = Some(frame_id);
+                                data.lock().await.current_frame_id = Some(frame_id);
 
-                                CodeLLDBDebugger::process_variables(
+                                Debugger::process_variables(
                                     frame_id,
                                     debugger_sender_tx.clone(),
                                     neovim_vadre_window.clone(),
@@ -1260,31 +1455,39 @@ impl CodeLLDBDebugger {
 
                                     let line_number = frame.line;
                                     let source = frame.source.unwrap();
-                                    let source_name = source.name.unwrap();
-                                    if let Some(_) = source.path {
+                                    if let Some(source_name) = source.name {
+                                        if let Some(_) = source.path {
+                                            call_stack_buffer_content.push(format!(
+                                                "  - {}:{}",
+                                                source_name, line_number
+                                            ));
+                                        } else {
+                                            call_stack_buffer_content.push(format!(
+                                                "  - {}:{} (dissassembled)",
+                                                source_name, line_number
+                                            ));
+                                        }
+                                    } else if let Some(source_path) = source.path {
                                         call_stack_buffer_content
-                                            .push(format!("  - {}:{}", source_name, line_number));
+                                            .push(format!("  - {}:{}", source_path, line_number));
                                     } else {
-                                        call_stack_buffer_content.push(format!(
-                                            "  - {}:{} (dissassembled)",
-                                            source_name, line_number
-                                        ));
+                                        call_stack_buffer_content
+                                            .push(format!(" - source not understood {:?}", source));
                                     }
                                 }
                             }
                         }
                     } else {
-                        let stack_trace_response =
-                            CodeLLDBDebugger::do_send_request_and_await_response(
-                                RequestArguments::stackTrace(StackTraceArguments {
-                                    thread_id,
-                                    format: None,
-                                    levels: None,
-                                    start_frame: None,
-                                }),
-                                debugger_sender_tx.clone(),
-                            )
-                            .await?;
+                        let stack_trace_response = Debugger::do_send_request_and_await_response(
+                            RequestArguments::stackTrace(StackTraceArguments {
+                                thread_id,
+                                format: None,
+                                levels: None,
+                                start_frame: None,
+                            }),
+                            debugger_sender_tx.clone(),
+                        )
+                        .await?;
 
                         if let ResponseResult::Success { body } = stack_trace_response {
                             if let ResponseBody::stackTrace(stack_trace_body) = body {
@@ -1324,7 +1527,7 @@ impl CodeLLDBDebugger {
 
         let mut variable_content = Vec::new();
 
-        let scopes_response_result = CodeLLDBDebugger::do_send_request_and_await_response(
+        let scopes_response_result = Debugger::do_send_request_and_await_response(
             RequestArguments::scopes(ScopesArguments { frame_id }),
             debugger_sender_tx.clone(),
         )
@@ -1335,18 +1538,17 @@ impl CodeLLDBDebugger {
                 for scope in scopes_body.scopes {
                     variable_content.push(format!("{}:", scope.name));
 
-                    let variables_response_result =
-                        CodeLLDBDebugger::do_send_request_and_await_response(
-                            RequestArguments::variables(VariablesArguments {
-                                count: None,
-                                filter: None,
-                                format: None,
-                                start: None,
-                                variables_reference: scope.variables_reference,
-                            }),
-                            debugger_sender_tx.clone(),
-                        )
-                        .await?;
+                    let variables_response_result = Debugger::do_send_request_and_await_response(
+                        RequestArguments::variables(VariablesArguments {
+                            count: None,
+                            filter: None,
+                            format: None,
+                            start: None,
+                            variables_reference: scope.variables_reference,
+                        }),
+                        debugger_sender_tx.clone(),
+                    )
+                    .await?;
 
                     if let ResponseResult::Success { body } = variables_response_result {
                         if let ResponseBody::variables(variables_body) = body {
@@ -1393,12 +1595,13 @@ impl CodeLLDBDebugger {
     }
 }
 
-impl Debug for CodeLLDBDebugger {
+impl Debug for Debugger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CodeLLDBDebugger")
+        f.debug_struct("Debugger")
             .field("id", &self.id)
             .field("command", &self.command)
             .field("command_args", &self.command_args)
+            .field("process", &self.process)
             .finish()
     }
 }

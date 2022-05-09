@@ -364,6 +364,8 @@ impl NeovimVadreWindow {
         let terminal_window = self.windows.get(&VadreWindowType::Program).unwrap();
         self.neovim.set_current_win(&terminal_window).await?;
 
+        tracing::debug!("Running terminal command {}", command);
+
         self.neovim
             .command(&format!("terminal! {}", command))
             .await?;
@@ -428,12 +430,13 @@ impl NeovimVadreWindow {
                     tokio::fs::read_to_string(path)
                         .await?
                         .split("\n")
-                        .map(|x| x.to_string())
+                        .map(|x| x.trim_end().to_string())
                         .collect()
                 }
-                CodeBufferContent::Content(content) => {
-                    content.split("\n").map(|x| x.to_string()).collect()
-                }
+                CodeBufferContent::Content(content) => content
+                    .split("\n")
+                    .map(|x| x.trim_end().to_string())
+                    .collect(),
             };
 
             self.write_to_buffer(&code_buffer, 0, 0, content).await?;
@@ -666,6 +669,14 @@ impl NeovimVadreWindow {
         }
 
         Ok(())
+    }
+
+    pub async fn get_var(&self, var_name: &str) -> Option<String> {
+        self.neovim
+            .get_var(var_name)
+            .await
+            .ok()
+            .map(|x| x.to_string())
     }
 }
 

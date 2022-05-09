@@ -24,6 +24,8 @@ use serde_derive::{Deserialize, Serialize};
 use tokio_util::codec;
 use tracing::debug;
 
+use self::dap_schema::ProcessEventBody;
+
 #[derive(Serialize, Deserialize, Debug, Copy, Clone)]
 #[serde(untagged)]
 pub enum Either<T1, T2> {
@@ -138,6 +140,7 @@ pub enum EventBody {
     thread(ThreadEventBody),
     invalidated(InvalidatedEventBody),
     stopped(StoppedEventBody),
+    process(ProcessEventBody),
 }
 
 #[derive(Debug)]

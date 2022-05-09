@@ -7,7 +7,7 @@ mod neovim;
 mod util;
 
 use crate::{
-    debuggers::{CodeLLDBDebugger, Debugger},
+    debuggers::{Debugger, DebuggerType},
     neovim::VadreLogLevel,
 };
 
@@ -28,11 +28,6 @@ use async_trait::async_trait;
 use debuggers::DebuggerStepType;
 use nvim_rs::{compat::tokio::Compat, create::tokio as create, Handler, Neovim, Value};
 use tokio::{io::Stdout, sync::Mutex};
-
-#[cfg(windows)]
-use dunce::canonicalize;
-#[cfg(not(windows))]
-use std::fs::canonicalize;
 
 static VADRE_NEXT_INSTANCE_NUM: AtomicUsize = AtomicUsize::new(1);
 
@@ -68,8 +63,9 @@ impl NeovimHandler {
         tracing::debug!("Launching instance {} with args: {:?}", instance_id, args);
 
         let mut debugger_type = None;
-        let mut codelldb_port = None;
+        let mut debugger_port = None;
         let mut process_vadre_args = true;
+        let mut log_debugger = false;
 
         let mut command_args = vec![];
         let mut command = "".to_string();
@@ -84,14 +80,16 @@ impl NeovimHandler {
             if process_vadre_args && arg_string.starts_with("-t=") && arg_string.len() > 3 {
                 debugger_type = Some(arg_string[3..].to_string());
             } else if process_vadre_args
-                && arg_string.starts_with("--codelldb-port=")
+                && arg_string.starts_with("--debugger-port=")
                 && arg_string.len() > 16
             {
-                codelldb_port = Some(
+                debugger_port = Some(
                     arg_string[16..]
                         .parse::<u16>()
-                        .expect("codelldb port is u16"),
+                        .expect("debugger port is u16"),
                 );
+            } else if process_vadre_args && arg_string.starts_with("--log-debugger") {
+                log_debugger = true;
             } else {
                 if command == "" {
                     command = arg_string.clone();
@@ -111,23 +109,25 @@ impl NeovimHandler {
         }
 
         let debugger_type = match debugger_type.as_ref() {
-            "lldb" | "codelldb" => "codelldb",
+            "lldb" | "codelldb" => DebuggerType::CodeLLDB,
+            "python" => DebuggerType::Python,
             _ => return Err(format!("ERROR: Debugger unknown {}", debugger_type).into()),
         };
 
         tracing::trace!(
-            "Setting up instance {} of type {}",
+            "Setting up instance {} of type {:?}",
             instance_id,
             debugger_type
         );
 
-        let debugger =
-            match debugger_type {
-                "lldb" | "codelldb" => Arc::new(Mutex::new(Debugger::CodeLLDB(
-                    CodeLLDBDebugger::new(instance_id, command, command_args, neovim),
-                ))),
-                _ => return Err(format!("ERROR: Debugger unknown {}", debugger_type).into()),
-            };
+        let debugger = Arc::new(Mutex::new(Debugger::new(
+            instance_id,
+            command,
+            command_args,
+            neovim,
+            debugger_type,
+            log_debugger,
+        )));
 
         self.debuggers
             .lock()
@@ -142,12 +142,12 @@ impl NeovimHandler {
             let mut debugger_lock = debugger.lock().await;
             tracing::trace!("Locked 1");
             if let Err(e) = debugger_lock
-                .setup(&pending_breakpoints, codelldb_port)
+                .setup(&pending_breakpoints, debugger_port)
                 .await
             {
                 let log_msg = format!("Can't setup debugger: {}", e);
                 debugger_lock
-                    .neovim_vadre_window()
+                    .neovim_vadre_window
                     .lock()
                     .await
                     .log_msg(VadreLogLevel::CRITICAL, &log_msg)
@@ -179,7 +179,7 @@ impl NeovimHandler {
             .expect("could get current cursor position");
 
         let line_number = cursor_position.0;
-        let file_path = match canonicalize(Path::new(&file_path)) {
+        let file_path = match dunce::canonicalize(Path::new(&file_path)) {
             Ok(x) => x,
             Err(_) => return Err("Path not found for setting breakpoint".into()),
         };
