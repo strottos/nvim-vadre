@@ -5,9 +5,14 @@ use tracing_subscriber::{
     fmt::writer::BoxMakeWriter, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Registry,
 };
 
-pub(crate) fn setup_logging(log_file: Option<&Path>, filter: Option<&str>) -> Result<()> {
+pub(crate) fn setup_logging(log_file: Option<&str>, filter: Option<&str>) -> Result<()> {
     let log_file = match log_file {
         Some(path) => {
+            let now = chrono::offset::Local::now();
+            let path = path
+                .replace("${timestamp}", &now.timestamp().to_string())
+                .replace("${datetime}", &now.format("%Y%m%d%H%M%S").to_string());
+            let path = Path::new(&path);
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
