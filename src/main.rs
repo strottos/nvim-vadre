@@ -4,12 +4,10 @@ extern crate lazy_static;
 mod debuggers;
 mod logger;
 mod neovim;
+mod tokio_join;
 mod util;
 
-use crate::{
-    debuggers::{CodeLLDBDebugger, Debugger},
-    neovim::VadreLogLevel,
-};
+use crate::{debuggers::DebuggerAPI, neovim::VadreLogLevel};
 
 use std::{
     collections::{HashMap, HashSet},
@@ -29,11 +27,6 @@ use debuggers::DebuggerStepType;
 use nvim_rs::{compat::tokio::Compat, create::tokio as create, Handler, Neovim, Value};
 use tokio::{io::Stdout, sync::Mutex};
 
-#[cfg(windows)]
-use dunce::canonicalize;
-#[cfg(not(windows))]
-use std::fs::canonicalize;
-
 static VADRE_NEXT_INSTANCE_NUM: AtomicUsize = AtomicUsize::new(1);
 
 type VadreResult = Result<Value, Value>;
@@ -45,7 +38,7 @@ struct NeovimHandler {
     // really be using more than one debugger at a time and we try and take the second mutex
     // sparingly hopefully this won't be too big a performance hit. I'd prefer to take them out
     // though ideally.
-    debuggers: Arc<Mutex<HashMap<usize, Arc<Mutex<Debugger>>>>>,
+    debuggers: Arc<Mutex<HashMap<usize, Arc<Mutex<Box<(dyn DebuggerAPI + Send + Sync)>>>>>>,
 
     breakpoints: Arc<Mutex<HashMap<String, HashSet<i64>>>>,
 }
@@ -68,8 +61,9 @@ impl NeovimHandler {
         tracing::debug!("Launching instance {} with args: {:?}", instance_id, args);
 
         let mut debugger_type = None;
-        let mut codelldb_port = None;
+        let mut debugger_port = None;
         let mut process_vadre_args = true;
+        let mut log_debugger = false;
 
         let mut command_args = vec![];
         let mut command = "".to_string();
@@ -84,14 +78,12 @@ impl NeovimHandler {
             if process_vadre_args && arg_string.starts_with("-t=") && arg_string.len() > 3 {
                 debugger_type = Some(arg_string[3..].to_string());
             } else if process_vadre_args
-                && arg_string.starts_with("--codelldb-port=")
+                && arg_string.starts_with("--debugger-port=")
                 && arg_string.len() > 16
             {
-                codelldb_port = Some(
-                    arg_string[16..]
-                        .parse::<u16>()
-                        .expect("codelldb port is u16"),
-                );
+                debugger_port = Some(arg_string[16..].to_string());
+            } else if process_vadre_args && arg_string.starts_with("--log-debugger") {
+                log_debugger = true;
             } else {
                 if command == "" {
                     command = arg_string.clone();
@@ -110,51 +102,43 @@ impl NeovimHandler {
             return Err(format!("ERROR: {}", log_msg).into());
         }
 
-        let debugger_type = match debugger_type.as_ref() {
-            "lldb" | "codelldb" => "codelldb",
-            _ => return Err(format!("ERROR: Debugger unknown {}", debugger_type).into()),
-        };
-
         tracing::trace!(
-            "Setting up instance {} of type {}",
+            "Setting up instance {} of type {:?}",
             instance_id,
             debugger_type
         );
 
-        let debugger =
-            match debugger_type {
-                "lldb" | "codelldb" => Arc::new(Mutex::new(Debugger::CodeLLDB(
-                    CodeLLDBDebugger::new(instance_id, command, command_args, neovim),
-                ))),
-                _ => return Err(format!("ERROR: Debugger unknown {}", debugger_type).into()),
-            };
+        let debugger = match debuggers::new_debugger(
+            instance_id,
+            command,
+            command_args,
+            neovim,
+            debugger_type,
+            log_debugger,
+        ) {
+            Ok(x) => Arc::new(Mutex::new(x)),
+            Err(e) => return Err(format!("Can't setup debugger: {}", e).into()),
+        };
 
-        self.debuggers
-            .lock()
-            .await
-            .insert(instance_id, debugger.clone());
+        let debugger_clone = debugger.clone();
+
+        self.debuggers.lock().await.insert(instance_id, debugger);
 
         let pending_breakpoints = self.breakpoints.lock().await.clone();
 
         tokio::spawn(async move {
-            let debugger = debugger.clone();
-            tracing::trace!("Trying to lock 1");
+            let debugger = debugger_clone.clone();
             let mut debugger_lock = debugger.lock().await;
-            tracing::trace!("Locked 1");
             if let Err(e) = debugger_lock
-                .setup(&pending_breakpoints, codelldb_port)
+                .setup(&pending_breakpoints, debugger_port)
                 .await
             {
                 let log_msg = format!("Can't setup debugger: {}", e);
                 debugger_lock
-                    .neovim_vadre_window()
-                    .lock()
-                    .await
                     .log_msg(VadreLogLevel::CRITICAL, &log_msg)
                     .await
                     .unwrap();
             }
-            tracing::trace!("Unlocked 1");
         });
 
         Ok("process launched".into())
@@ -179,7 +163,7 @@ impl NeovimHandler {
             .expect("could get current cursor position");
 
         let line_number = cursor_position.0;
-        let file_path = match canonicalize(Path::new(&file_path)) {
+        let file_path = match dunce::canonicalize(Path::new(&file_path)) {
             Ok(x) => x,
             Err(_) => return Err("Path not found for setting breakpoint".into()),
         };
@@ -246,7 +230,12 @@ impl NeovimHandler {
         .into())
     }
 
-    async fn do_step(&self, step_type: DebuggerStepType, instance_id: usize) -> VadreResult {
+    async fn do_step(
+        &self,
+        step_type: DebuggerStepType,
+        instance_id: usize,
+        count: u64,
+    ) -> VadreResult {
         let debuggers = self.debuggers.lock().await;
 
         let debugger = debuggers.get(&instance_id).expect("debugger should exist");
@@ -254,14 +243,14 @@ impl NeovimHandler {
         debugger
             .lock()
             .await
-            .do_step(step_type)
+            .do_step(step_type, count)
             .await
             .expect("Could do code step");
 
         Ok("".into())
     }
 
-    async fn print_variable(&self, instance_id: usize, variable_name: &str) -> VadreResult {
+    async fn change_output_window(&self, instance_id: usize, type_: &str) -> VadreResult {
         let debuggers = self.debuggers.lock().await;
 
         let debugger = debuggers.get(&instance_id).expect("debugger should exist");
@@ -269,22 +258,7 @@ impl NeovimHandler {
         debugger
             .lock()
             .await
-            .print_variable(variable_name)
-            .await
-            .expect("Could print variable");
-
-        Ok("".into())
-    }
-
-    async fn change_output_window(&self, instance_id: usize, ascending: bool) -> VadreResult {
-        let debuggers = self.debuggers.lock().await;
-
-        let debugger = debuggers.get(&instance_id).expect("debugger should exist");
-
-        debugger
-            .lock()
-            .await
-            .change_output_window(ascending)
+            .change_output_window(type_)
             .await
             .expect("Could print variable");
 
@@ -325,26 +299,54 @@ impl Handler for NeovimHandler {
             "breakpoint" => self.breakpoint(neovim).await,
             "step_in" => {
                 tracing::trace!("Args: {:?}", args);
+                let args = args
+                    .get(0)
+                    .expect("step args should be supplied")
+                    .as_array()
+                    .expect("step args should be an array")
+                    .to_vec();
+                tracing::trace!("Args: {:?}", args);
                 let instance_id: usize = args
                     .get(0)
                     .expect("instance_id should be supplied")
                     .as_str()
                     .expect("instance_id is string")
+                    .replace("\"", "")
                     .parse::<usize>()
                     .expect("instance_id is usize");
 
-                self.do_step(DebuggerStepType::In, instance_id).await
+                let count = match args.get(1) {
+                    Some(x) => x.as_u64().expect("count is u64"),
+                    None => 1,
+                };
+
+                self.do_step(DebuggerStepType::In, instance_id, count).await
             }
             "step_over" => {
+                tracing::trace!("Args: {:?}", args);
+                let args = args
+                    .get(0)
+                    .expect("step args should be supplied")
+                    .as_array()
+                    .expect("step args should be an array")
+                    .to_vec();
+                tracing::trace!("Args: {:?}", args);
                 let instance_id: usize = args
                     .get(0)
                     .expect("instance_id should be supplied")
                     .as_str()
                     .expect("instance_id is string")
+                    .replace("\"", "")
                     .parse::<usize>()
                     .expect("instance_id is usize");
 
-                self.do_step(DebuggerStepType::Over, instance_id).await
+                let count = match args.get(1) {
+                    Some(x) => x.as_u64().expect("count is u64"),
+                    None => 1,
+                };
+
+                self.do_step(DebuggerStepType::Over, instance_id, count)
+                    .await
             }
             "continue" => {
                 let instance_id: usize = args
@@ -355,12 +357,16 @@ impl Handler for NeovimHandler {
                     .parse::<usize>()
                     .expect("instance_id is usize");
 
-                self.do_step(DebuggerStepType::Continue, instance_id).await
+                self.do_step(DebuggerStepType::Continue, instance_id, 1)
+                    .await
             }
-            "print_variable" => {
-                let args = args.get(0).unwrap().as_array().unwrap();
-
-                tracing::trace!("ARGS: {:?}", args);
+            "output_window" => {
+                let args = args
+                    .get(0)
+                    .expect("launch args should be supplied")
+                    .as_array()
+                    .expect("launch args should be an array")
+                    .to_vec();
 
                 let instance_id: usize = args
                     .get(0)
@@ -370,35 +376,13 @@ impl Handler for NeovimHandler {
                     .parse::<usize>()
                     .expect("instance_id is usize");
 
-                let variable_name = args
+                let type_: &str = args
                     .get(1)
-                    .expect("variable name should be supplied")
+                    .expect("type should be supplied")
                     .as_str()
-                    .expect("variable name is a string");
+                    .expect("type is string");
 
-                self.print_variable(instance_id, variable_name).await
-            }
-            "next_output_window" => {
-                let instance_id: usize = args
-                    .get(0)
-                    .expect("instance_id should be supplied")
-                    .as_str()
-                    .expect("instance_id is string")
-                    .parse::<usize>()
-                    .expect("instance_id is usize");
-
-                self.change_output_window(instance_id, true).await
-            }
-            "prev_output_window" => {
-                let instance_id: usize = args
-                    .get(0)
-                    .expect("instance_id should be supplied")
-                    .as_str()
-                    .expect("instance_id is string")
-                    .parse::<usize>()
-                    .expect("instance_id is usize");
-
-                self.change_output_window(instance_id, false).await
+                self.change_output_window(instance_id, type_).await
             }
             _ => unimplemented!(),
         }

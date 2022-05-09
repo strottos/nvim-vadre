@@ -55,12 +55,10 @@ function! s:configureCommands()
     command! VadrePing :call s:ping()
     command! -nargs=* -complete=file VadreDebug call s:launch(<f-args>)
     command! -nargs=0 VadreBreakpoint call s:breakpoint()
-    command! -nargs=1 VadreStepIn call s:step_in(<f-args>)
-    command! -nargs=1 VadreStepOver call s:step_over(<f-args>)
+    command! -nargs=1 -count=1 VadreStepIn call s:step_in(<f-args>, <count>)
+    command! -nargs=1 -count=1 VadreStepOver call s:step_over(<f-args>, <count>)
     command! -nargs=1 VadreContinue call s:continue(<f-args>)
-    command! -nargs=* VadrePrintVariable call s:print_variable(<f-args>)
-    command! -nargs=1 VadreNextOutputWindow call s:next_output_window(<f-args>)
-    command! -nargs=1 VadrePrevOutputWindow call s:prev_output_window(<f-args>)
+    command! -nargs=* VadreOutputWindow call s:output_window(<f-args>)
 endfunction
 
 function! s:ping()
@@ -75,28 +73,20 @@ function! s:breakpoint()
     echom rpcrequest(s:vadreJobId, "breakpoint")
 endfunction
 
-function! s:step_in(instance_id)
-    call rpcrequest(s:vadreJobId, "step_in", a:instance_id)
+function! s:step_in(...)
+    call rpcrequest(s:vadreJobId, "step_in", a:000)
 endfunction
 
-function! s:step_over(instance_id)
-    call rpcrequest(s:vadreJobId, "step_over", a:instance_id)
+function! s:step_over(...)
+    call rpcrequest(s:vadreJobId, "step_over", a:000)
 endfunction
 
 function! s:continue(instance_id)
     call rpcrequest(s:vadreJobId, "continue", a:instance_id)
 endfunction
 
-function! s:print_variable(...)
-    call rpcrequest(s:vadreJobId, "print_variable", a:000)
-endfunction
-
-function! s:next_output_window(instance_id)
-    call rpcrequest(s:vadreJobId, "next_output_window", a:instance_id)
-endfunction
-
-function! s:prev_output_window(instance_id)
-    call rpcrequest(s:vadreJobId, "prev_output_window", a:instance_id)
+function! s:output_window(...)
+    call rpcrequest(s:vadreJobId, "output_window", a:000)
 endfunction
 
 " TODO: Make these log to logs if available??
