@@ -3483,7 +3483,7 @@
 					"description": "Optional end column of the range covered by this scope."
 				}
 			},
-			"required": [ "name", "variablesReference", "expensive" ]
+			"required": [ "name", "variablesReference" ]
 		},
 
 		"Variable": {

@@ -2,19 +2,17 @@
 // https://github.com/vadimcn/vscode-lldb/tree/master/adapter/crates/adapter-protocol
 #![allow(non_camel_case_types)]
 
-mod dap_schema;
-
-pub use dap_schema::{
+pub use super::schema::{
     Breakpoint, BreakpointEventBody, CancelArguments, Capabilities, CapabilitiesEventBody,
     ContinueArguments, ContinueResponseBody, ContinuedEventBody, ExitedEventBody,
     InitializeRequest, InitializeRequestArguments, InitializeResponse, InvalidatedEventBody,
     LaunchRequestArguments, ModuleEventBody, NextArguments, OutputEventBody, PauseArguments,
-    RunInTerminalRequestArguments, RunInTerminalResponseBody, ScopesArguments, ScopesResponseBody,
-    SetBreakpointsArguments, SetBreakpointsResponseBody, SetExceptionBreakpointsArguments,
-    SetFunctionBreakpointsArguments, Source, SourceArguments, SourceBreakpoint, SourceResponseBody,
-    StackTraceArguments, StackTraceResponseBody, StepInArguments, StoppedEventBody,
-    TerminatedEventBody, ThreadEventBody, ThreadsResponseBody, VariablesArguments,
-    VariablesResponseBody,
+    ProcessEventBody, RunInTerminalRequestArguments, RunInTerminalResponseBody, ScopesArguments,
+    ScopesResponseBody, SetBreakpointsArguments, SetBreakpointsResponseBody,
+    SetExceptionBreakpointsArguments, SetFunctionBreakpointsArguments, Source, SourceArguments,
+    SourceBreakpoint, SourceResponseBody, StackTraceArguments, StackTraceResponseBody,
+    StepInArguments, StoppedEventBody, TerminatedEventBody, ThreadEventBody, ThreadsResponseBody,
+    VariablesArguments, VariablesResponseBody,
 };
 
 use std::{fmt::Write, io, str};
@@ -31,13 +29,29 @@ pub enum Either<T1, T2> {
     Second(T2),
 }
 
+impl<T1, T2> Either<T1, T2> {
+    pub fn first(&self) -> &T1 {
+        match &self {
+            Either::First(x) => &x,
+            Either::Second(_) => panic!("Called second when should have been first in Either"),
+        }
+    }
+
+    pub fn second(&self) -> &T2 {
+        match &self {
+            Either::First(_) => panic!("Called first when should have been second in Either"),
+            Either::Second(x) => &x,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Copy, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct NoArguments {}
+pub struct Empty {}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProtocolMessage {
-    pub seq: u32,
+    pub seq: Either<u32, String>,
     #[serde(flatten)]
     pub type_: ProtocolMessageType,
 }
@@ -61,13 +75,13 @@ pub enum RequestArguments {
     setBreakpoints(SetBreakpointsArguments),
     setFunctionBreakpoints(SetFunctionBreakpointsArguments),
     setExceptionBreakpoints(SetExceptionBreakpointsArguments),
-    configurationDone(Option<NoArguments>),
+    configurationDone(Option<Empty>),
     pause(PauseArguments),
     #[serde(rename = "continue")]
     continue_(ContinueArguments),
     next(NextArguments),
     stepIn(StepInArguments),
-    threads(Option<NoArguments>),
+    threads(Option<Empty>),
     stackTrace(StackTraceArguments),
     scopes(ScopesArguments),
     source(SourceArguments),
@@ -80,7 +94,7 @@ pub enum RequestArguments {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Response {
-    pub request_seq: u32,
+    pub request_seq: Either<u32, String>,
     pub success: bool,
     #[serde(flatten)]
     pub result: ResponseResult,
@@ -105,16 +119,16 @@ pub enum ResponseResult {
 #[serde(tag = "command", content = "body")]
 pub enum ResponseBody {
     initialize(Capabilities),
-    launch,
+    launch(Option<Empty>),
     setBreakpoints(SetBreakpointsResponseBody),
     setFunctionBreakpoints(SetBreakpointsResponseBody),
-    setExceptionBreakpoints,
-    configurationDone,
-    pause,
+    setExceptionBreakpoints(Option<Empty>),
+    configurationDone(Option<Empty>),
+    pause(Option<Empty>),
     #[serde(rename = "continue")]
     continue_(ContinueResponseBody),
-    next,
-    stepIn,
+    next(Option<Empty>),
+    stepIn(Option<Empty>),
     threads(ThreadsResponseBody),
     stackTrace(StackTraceResponseBody),
     scopes(ScopesResponseBody),
@@ -127,7 +141,7 @@ pub enum ResponseBody {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "event", content = "body")]
 pub enum EventBody {
-    initialized,
+    initialized(Option<Empty>),
     output(OutputEventBody),
     breakpoint(BreakpointEventBody),
     capabilities(CapabilitiesEventBody),
@@ -138,6 +152,7 @@ pub enum EventBody {
     thread(ThreadEventBody),
     invalidated(InvalidatedEventBody),
     stopped(StoppedEventBody),
+    process(ProcessEventBody),
 }
 
 #[derive(Debug)]

@@ -21,6 +21,9 @@ lazy_static! {
         let mut m = HashMap::new();
         m.insert("rs", "rust");
         m.insert("c", "c");
+        m.insert("js", "javascript");
+        m.insert("ts", "typescript");
+        m.insert("go", "go");
         m.insert("cpp", "cpp");
         m.insert("py", "python");
         m
@@ -86,7 +89,7 @@ impl VadreWindowType {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-enum VadreBufferType {
+pub enum VadreBufferType {
     Code,
     Logs,
     Terminal,
@@ -145,7 +148,10 @@ impl VadreBufferType {
         }
     }
 
-    fn get_next_output_buffer(current_buf_name: &str, ascending: bool) -> VadreBufferType {
+    fn get_output_buffer(
+        current_buf_name: &str,
+        type_: VadreOutputBufferSelector,
+    ) -> VadreBufferType {
         let mut split = current_buf_name.rsplit(" - ");
         let output_buffer_type = split
             .next()
@@ -164,14 +170,19 @@ impl VadreBufferType {
             .position(|r| *r == output_buffer_type)
             .unwrap();
 
-        if ascending {
-            index += 1;
-        } else {
-            if index == 0 {
-                index = buffer_order.len();
+        match type_ {
+            VadreOutputBufferSelector::Next => index += 1,
+            VadreOutputBufferSelector::Previous => {
+                if index == 0 {
+                    index = buffer_order.len();
+                }
+                index -= 1;
             }
-            index -= 1;
-        }
+            VadreOutputBufferSelector::Logs => index = 0,
+            VadreOutputBufferSelector::CallStack => index = 1,
+            VadreOutputBufferSelector::Variables => index = 2,
+            VadreOutputBufferSelector::Breakpoints => index = 3,
+        };
         let index: usize = index % buffer_order.len();
 
         buffer_order.get(index).unwrap().clone()
@@ -194,6 +205,44 @@ impl VadreBufferType {
 pub enum CodeBufferContent<'a> {
     File(&'a str),
     Content(String),
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum VadreOutputBufferSelector {
+    Next,
+    Previous,
+    Logs,
+    CallStack,
+    Variables,
+    Breakpoints,
+}
+
+impl VadreOutputBufferSelector {
+    fn get_type(type_: &str) -> Self {
+        tracing::trace!("Type: {}", type_);
+        match type_.to_lowercase().chars().nth(0).unwrap() {
+            'n' => Self::Next,
+            'p' => Self::Previous,
+            'l' => Self::Logs,
+            's' => Self::CallStack,
+            'v' => Self::Variables,
+            'b' => Self::Breakpoints,
+            _ => panic!("Can't understand type {}", type_),
+        }
+    }
+}
+
+impl Display for VadreOutputBufferSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VadreOutputBufferSelector::Next => write!(f, "Next"),
+            VadreOutputBufferSelector::Previous => write!(f, "Previous"),
+            VadreOutputBufferSelector::Logs => write!(f, "Logs"),
+            VadreOutputBufferSelector::CallStack => write!(f, "CallStack"),
+            VadreOutputBufferSelector::Variables => write!(f, "Variables"),
+            VadreOutputBufferSelector::Breakpoints => write!(f, "Breakpoints"),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -364,6 +413,8 @@ impl NeovimVadreWindow {
         let terminal_window = self.windows.get(&VadreWindowType::Program).unwrap();
         self.neovim.set_current_win(&terminal_window).await?;
 
+        tracing::debug!("Running terminal command {}", command);
+
         self.neovim
             .command(&format!("terminal! {}", command))
             .await?;
@@ -414,12 +465,7 @@ impl NeovimVadreWindow {
                     if let Some(file_type) = path.extension().map(|x| x.to_str().unwrap()) {
                         match VIM_FILE_TYPES.get(&file_type) {
                             Some(file_type) => {
-                                self.neovim
-                                    .command(&format!("set filetype={}", file_type))
-                                    .await?;
-                                self.neovim
-                                    .command(&format!("set filetype={}", file_type))
-                                    .await?;
+                                self.set_file_type(file_type).await?;
                             }
                             None => {}
                         };
@@ -428,11 +474,19 @@ impl NeovimVadreWindow {
                     tokio::fs::read_to_string(path)
                         .await?
                         .split("\n")
-                        .map(|x| x.to_string())
+                        .map(|x| x.trim_end().to_string())
                         .collect()
                 }
                 CodeBufferContent::Content(content) => {
-                    content.split("\n").map(|x| x.to_string()).collect()
+                    let split_char = if content.contains("\r\n") {
+                        "\r\n"
+                    } else {
+                        "\n"
+                    };
+                    content
+                        .split(split_char)
+                        .map(|x| x.trim_end().to_string())
+                        .collect()
                 }
             };
 
@@ -460,6 +514,14 @@ impl NeovimVadreWindow {
 
         let code_window = self.windows.get(&VadreWindowType::Code).unwrap();
         code_window.set_cursor((line_number, 0)).await?;
+
+        Ok(())
+    }
+
+    pub async fn set_file_type(&self, file_type: &str) -> Result<()> {
+        self.neovim
+            .command(&format!("set filetype={}", file_type))
+            .await?;
 
         Ok(())
     }
@@ -538,14 +600,31 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
-    pub async fn change_output_window(&self, ascending: bool) -> Result<()> {
+    pub async fn get_output_window_type(&self) -> Result<VadreBufferType> {
         let output_window = self
             .windows
             .get(&VadreWindowType::Output)
             .expect("can get output window");
-        let new_buffer_type = VadreBufferType::get_next_output_buffer(
+        let output_buffer_name = &output_window.get_buf().await?.get_name().await?;
+        let mut split = output_buffer_name.rsplit(" - ");
+        let output_buffer_type = split
+            .next()
+            .expect("should be able to retrieve output buffer type");
+        let output_buffer_type = VadreBufferType::get_buffer_type_from_str(output_buffer_type);
+
+        Ok(output_buffer_type)
+    }
+
+    pub async fn change_output_window(&self, type_: &str) -> Result<()> {
+        let type_ = VadreOutputBufferSelector::get_type(type_);
+
+        let output_window = self
+            .windows
+            .get(&VadreWindowType::Output)
+            .expect("can get output window");
+        let new_buffer_type = VadreBufferType::get_output_buffer(
             &output_window.get_buf().await?.get_name().await?,
-            ascending,
+            type_,
         );
         let new_buffer = self
             .buffers
@@ -648,24 +727,81 @@ impl NeovimVadreWindow {
     ) -> Result<()> {
         // TODO: Configurable?
         for (key, action) in vec![
-            ("S", &format!(":VadreStepIn {}<CR>", self.instance_id)),
-            ("s", &format!(":VadreStepOver {}<CR>", self.instance_id)),
-            ("n", &format!(":VadreStepOver {}<CR>", self.instance_id)),
+            (
+                "S",
+                // This is a bit of a hack to have to quote the argument after VadreStepIn,
+                // ideally we wouldn't do this but neovim seems to get upset if the argument
+                // after when you specify a count is an integer.
+                &format!(
+                    ":<C-U>execute v:count1 . \" VadreStepIn \\\"{}\\\"\"<CR>",
+                    self.instance_id
+                ),
+            ),
+            (
+                "s",
+                // See comment above for why multiple levels of quoting
+                &format!(
+                    ":<C-U>execute v:count1 . \" VadreStepOver \\\"{}\\\"\"<CR>",
+                    self.instance_id
+                ),
+            ),
             ("c", &format!(":VadreContinue {}<CR>", self.instance_id)),
             ("C", &format!(":VadreContinue {}<CR>", self.instance_id)),
             (
+                "<localleader>l",
+                &format!(":VadreOutputWindow {} Logs<CR>", self.instance_id),
+            ),
+            (
+                "<localleader>s",
+                &format!(":VadreOutputWindow {} CallStack<CR>", self.instance_id),
+            ),
+            (
+                "<localleader>v",
+                &format!(":VadreOutputWindow {} Variables<CR>", self.instance_id),
+            ),
+            (
+                "<localleader>b",
+                &format!(":VadreOutputWindow {} Breakpoints<CR>", self.instance_id),
+            ),
+            (
                 ">",
-                &format!(":VadreNextOutputWindow {}<CR>", self.instance_id),
+                &format!(
+                    ":VadreOutputWindow {} {}<CR>",
+                    self.instance_id,
+                    VadreOutputBufferSelector::Next
+                ),
             ),
             (
                 "<",
-                &format!(":VadrePrevOutputWindow {}<CR>", self.instance_id),
+                &format!(
+                    ":VadreOutputWindow {} {}<CR>",
+                    self.instance_id,
+                    VadreOutputBufferSelector::Previous
+                ),
             ),
         ] {
-            buffer.set_keymap("n", key, action, vec![]).await?; // nnoremap <silent> <buffer> r :PadreRun<cr>
+            buffer
+                .set_keymap(
+                    "n",
+                    key,
+                    action,
+                    vec![
+                        (Value::String("noremap".into()), Value::Boolean(true)),
+                        (Value::String("silent".into()), Value::Boolean(true)),
+                    ],
+                )
+                .await?; // nnoremap <silent> <buffer> r :PadreRun<cr>
         }
 
         Ok(())
+    }
+
+    pub async fn get_var(&self, var_name: &str) -> Option<String> {
+        self.neovim
+            .get_var(var_name)
+            .await
+            .ok()
+            .map(|x| x.to_string())
     }
 }
 
