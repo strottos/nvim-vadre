@@ -4,6 +4,7 @@ extern crate lazy_static;
 mod debuggers;
 mod logger;
 mod neovim;
+mod tokio_join;
 mod util;
 
 use crate::{

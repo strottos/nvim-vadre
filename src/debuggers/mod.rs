@@ -4,6 +4,8 @@ use std::{
     collections::{HashMap, HashSet},
     env::{self, consts::EXE_SUFFIX},
     fmt::Debug,
+    io,
+    marker::Unpin,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -27,7 +29,7 @@ use dap_protocol::{
 };
 
 use anyhow::{bail, Result};
-use futures::prelude::*;
+use futures::{prelude::*, StreamExt};
 use nvim_rs::{compat::tokio::Compat, Neovim};
 use reqwest::Url;
 use tokio::{
@@ -42,13 +44,19 @@ use which::which;
 
 use tracing::{debug, error};
 
-use self::dap_protocol::{ContinueArguments, NextArguments, StepInArguments};
+use self::dap_protocol::{ContinueArguments, DecoderResult, NextArguments, StepInArguments};
 
 #[derive(Clone, Debug)]
 pub enum DebuggerStepType {
     Over,
     In,
     Continue,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum DebuggerConnectionType {
+    Tcp,
+    Stdio,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Hash)]
@@ -286,6 +294,13 @@ impl DebuggerType {
         }
     }
 
+    fn get_connection_type(&self) -> DebuggerConnectionType {
+        match &self {
+            DebuggerType::Delve => DebuggerConnectionType::Stdio,
+            _ => DebuggerConnectionType::Tcp,
+        }
+    }
+
     fn get_launcher_args(&self, program: String, args: &Vec<String>) -> Result<serde_json::Value> {
         let ret = match self {
             DebuggerType::CodeLLDB => serde_json::json!({
@@ -457,7 +472,7 @@ pub struct Debugger {
     command: String,
     command_args: Vec<String>,
     pub neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
-    process: Option<Arc<Child>>,
+    process: Arc<Mutex<Option<Child>>>,
 
     debugger_type: DebuggerType,
     log_debugger: bool,
@@ -497,7 +512,7 @@ impl Debugger {
             command,
             command_args,
             neovim_vadre_window: Arc::new(Mutex::new(NeovimVadreWindow::new(neovim, id))),
-            process: None,
+            process: Arc::new(Mutex::new(None)),
 
             debugger_type,
             log_debugger,
@@ -539,11 +554,18 @@ impl Debugger {
         };
 
         let (config_done_tx, config_done_rx) = oneshot::channel();
-        log_ret_err!(
-            self.tcp_connect(port, config_done_tx).await,
-            self.neovim_vadre_window,
-            "Error creating TCP connection to process"
-        );
+        match self.debugger_type.get_connection_type() {
+            DebuggerConnectionType::Tcp => log_ret_err!(
+                self.tcp_connect(port, config_done_tx).await,
+                self.neovim_vadre_window,
+                "Error creating TCP connection to process"
+            ),
+            DebuggerConnectionType::Stdio => log_ret_err!(
+                self.stdio_connect(config_done_tx).await,
+                self.neovim_vadre_window,
+                "Error creating TCP connection to process"
+            ),
+        }
         log_ret_err!(
             self.init_process(pending_breakpoints, config_done_rx).await,
             self.neovim_vadre_window,
@@ -767,24 +789,44 @@ impl Debugger {
             .spawn()
             .expect("Failed to spawn debugger");
 
-        let stdout = child.stdout.take().expect("should have stdout");
+        if self.debugger_type.get_connection_type() != DebuggerConnectionType::Stdio {
+            let stdout = child.stdout.take().expect("should have stdout");
+
+            let neovim_vadre_window = self.neovim_vadre_window.clone();
+
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stdout).lines();
+                while let Some(line) = reader.next_line().await.expect("can read stdout") {
+                    tracing::info!("Debugger stdout: {}", line);
+                    neovim_vadre_window
+                        .lock()
+                        .await
+                        .log_msg(VadreLogLevel::INFO, &format!("Debugger stdout: {}", line))
+                        .await
+                        .expect("can log to vim");
+                }
+            });
+        }
+
         let stderr = child.stderr.take().expect("should have stderr");
 
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(stdout).lines();
-            while let Some(line) = reader.next_line().await.expect("can read stdout") {
-                tracing::trace!("Debugger stdout: {}", line);
-            }
-        });
+        let neovim_vadre_window = self.neovim_vadre_window.clone();
 
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr).lines();
+
             while let Some(line) = reader.next_line().await.expect("can read stderr") {
-                tracing::trace!("Debugger stderr: {}", line);
+                tracing::warn!("Debugger stderr: {}", line);
+                neovim_vadre_window
+                    .lock()
+                    .await
+                    .log_msg(VadreLogLevel::WARN, &format!("Debugger stderr: {}", line))
+                    .await
+                    .expect("can log to vim");
             }
         });
 
-        self.process = Some(Arc::new(child));
+        *self.process.lock().await = Some(child);
 
         self.neovim_vadre_window
             .lock()
@@ -795,15 +837,50 @@ impl Debugger {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self, port))]
+    #[tracing::instrument(skip(self, port, config_done_tx))]
     async fn tcp_connect(&mut self, port: u16, config_done_tx: oneshot::Sender<()>) -> Result<()> {
         tracing::trace!("Connecting to port {}", port);
-
-        let neovim_vadre_window = self.neovim_vadre_window.clone();
 
         let tcp_stream = self.do_tcp_connect(port).await?;
         let framed_stream = DAPCodec::new().framed(tcp_stream);
 
+        self.handle_framed_stream(framed_stream, config_done_tx)
+            .await
+    }
+
+    #[tracing::instrument(skip(self, config_done_tx))]
+    async fn stdio_connect(&mut self, config_done_tx: oneshot::Sender<()>) -> Result<()> {
+        tracing::trace!("Connecting over stdio");
+
+        let (stdin, stdout) = {
+            let process = &mut *self.process.lock().await;
+            (
+                process.as_mut().unwrap().stdin.take().unwrap(),
+                process.as_mut().unwrap().stdout.take().unwrap(),
+            )
+        };
+
+        let stdio = crate::tokio_join::join(stdout, stdin);
+        let framed_stream = DAPCodec::new().framed(stdio);
+
+        self.handle_framed_stream(framed_stream, config_done_tx)
+            .await
+    }
+
+    #[tracing::instrument(skip(self, framed_stream, config_done_tx))]
+    async fn handle_framed_stream<T>(
+        &mut self,
+        framed_stream: T,
+        config_done_tx: oneshot::Sender<()>,
+    ) -> Result<()>
+    where
+        T: std::fmt::Debug
+            + Stream<Item = Result<DecoderResult, io::Error>>
+            + Sink<ProtocolMessage, Error = io::Error>
+            + Send
+            + Unpin
+            + 'static,
+    {
         let debugger_sender_tx = self.debugger_sender_tx.clone();
         let debugger_sender_rx = self
             .debugger_sender_rx
@@ -812,10 +889,10 @@ impl Debugger {
             .take()
             .expect("Should have a debugger_sender_rx to take");
 
+        let neovim_vadre_window = self.neovim_vadre_window.clone();
         let pending_outgoing_requests = self.pending_outgoing_requests.clone();
         let data = self.data.clone();
         let debugger_type = self.debugger_type.clone();
-
         let debug_program_str = self.command.clone() + &self.command_args.join(" ");
 
         tokio::spawn(async move {
@@ -1716,7 +1793,7 @@ impl Debugger {
         tracing::trace!("Downloading {} and unzipping to {:?}", url, full_path);
         let zip_contents = reqwest::get(url).await?.bytes().await?;
 
-        let reader = std::io::Cursor::new(zip_contents);
+        let reader = io::Cursor::new(zip_contents);
         let mut zip = zip::ZipArchive::new(reader)?;
 
         zip.extract(full_path)?;
