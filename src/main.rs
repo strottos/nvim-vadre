@@ -112,8 +112,7 @@ impl NeovimHandler {
         let debugger_type = match debugger_type.as_ref() {
             "lldb" | "codelldb" => DebuggerType::CodeLLDB,
             "python" | "debugpy" => DebuggerType::DebugPy,
-            "go" => DebuggerType::Go,
-            "delve" => DebuggerType::Delve,
+            "go" | "delve" => DebuggerType::Go,
             _ => return Err(format!("ERROR: Debugger unknown {}", debugger_type).into()),
         };
 

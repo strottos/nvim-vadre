@@ -30,6 +30,7 @@ use dap_protocol::{
 
 use anyhow::{bail, Result};
 use futures::{prelude::*, StreamExt};
+use is_executable::IsExecutable;
 use nvim_rs::{compat::tokio::Compat, Neovim};
 use reqwest::Url;
 use tokio::{
@@ -143,7 +144,6 @@ pub enum DebuggerType {
     CodeLLDB,
     DebugPy,
     Go,
-    Delve,
 }
 
 // TODO: Checksum
@@ -152,8 +152,7 @@ impl DebuggerType {
         String::from(match self {
             DebuggerType::CodeLLDB => "CodeLLDB",
             DebuggerType::DebugPy => "debugpy",
-            DebuggerType::Go => "vscode-go",
-            DebuggerType::Delve => "delve",
+            DebuggerType::Go => "delve",
         })
     }
 
@@ -161,8 +160,7 @@ impl DebuggerType {
         match self {
             DebuggerType::CodeLLDB => "codelldb",
             DebuggerType::DebugPy => "debugpy",
-            DebuggerType::Go => "vscode-go",
-            DebuggerType::Delve => "delve",
+            DebuggerType::Go => "delve",
         }
     }
 
@@ -191,19 +189,6 @@ impl DebuggerType {
                 Ok(PathBuf::from(python_path))
             }
             DebuggerType::Go => {
-                let node_path = neovim_vadre_window
-                    .lock()
-                    .await
-                    .get_var("vadre_node_path")
-                    .await
-                    .map(|x| PathBuf::from(x))
-                    .unwrap_or(which("node").unwrap());
-
-                let node_path = dunce::canonicalize(&node_path)?;
-
-                Ok(PathBuf::from(node_path))
-            }
-            DebuggerType::Delve => {
                 let binary_name = format!("dlv{}", EXE_SUFFIX);
                 let mut path = self.get_debugger_extension_dir()?;
                 path.push(&binary_name);
@@ -216,8 +201,7 @@ impl DebuggerType {
         match self {
             DebuggerType::CodeLLDB => "codelldb",
             DebuggerType::DebugPy => "debugpy",
-            DebuggerType::Go => "vscode-go",
-            DebuggerType::Delve => "delve",
+            DebuggerType::Go => "delve",
         }
     }
 
@@ -233,10 +217,6 @@ impl DebuggerType {
                 path.push(&format!("debugpy-{}", self.get_debugger_version()));
             }
             DebuggerType::Go => {
-                path.push("extension");
-                path.push("dist");
-            }
-            DebuggerType::Delve => {
                 path.push(&format!("delve-{}", self.get_debugger_version()));
                 path.push("cmd");
                 path.push("dlv");
@@ -271,12 +251,7 @@ impl DebuggerType {
                 }
                 ret
             }
-            DebuggerType::Go => {
-                let mut debugger_dir = self.get_debugger_extension_dir()?;
-                debugger_dir.push("debugAdapter.js");
-                vec![debugger_dir.to_str().unwrap().to_string()]
-            }
-            DebuggerType::Delve => vec![
+            DebuggerType::Go => vec![
                 "dap".to_string(),
                 "--listen".to_string(),
                 format!("127.0.0.1:{}", port),
@@ -289,19 +264,20 @@ impl DebuggerType {
         match self {
             DebuggerType::CodeLLDB => "1.7.0",
             DebuggerType::DebugPy => "1.6.0",
-            DebuggerType::Go => "0.33.0",
-            DebuggerType::Delve => "1.8.3",
+            DebuggerType::Go => "1.8.3",
         }
     }
 
     fn get_connection_type(&self) -> DebuggerConnectionType {
-        match &self {
-            DebuggerType::Delve => DebuggerConnectionType::Stdio,
-            _ => DebuggerConnectionType::Tcp,
-        }
+        DebuggerConnectionType::Tcp
     }
 
-    fn get_launcher_args(&self, program: String, args: &Vec<String>) -> Result<serde_json::Value> {
+    async fn get_launcher_args(
+        &self,
+        program: String,
+        args: &Vec<String>,
+        neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
+    ) -> Result<serde_json::Value> {
         let ret = match self {
             DebuggerType::CodeLLDB => serde_json::json!({
                 "args": args,
@@ -325,16 +301,35 @@ impl DebuggerType {
                 "program": program,
                 "stopOnEntry": true,
             }),
-            DebuggerType::Go => todo!(),
-            DebuggerType::Delve => serde_json::json!({
-                "args": args,
-                "cwd": env::current_dir()?,
-                "env": {},
-                "name": "delve",
-                "type": "delve",
-                "request": "launch",
-                "program": program,
-            }),
+            DebuggerType::Go => {
+                let go_dir = env::var("GOPATH")
+                    .map(PathBuf::from)
+                    .unwrap_or(dirs::home_dir().unwrap().join("Go"));
+
+                let program_path = PathBuf::from(&program);
+                let mode = if program_path.exists() && program_path.is_executable() {
+                    "exec"
+                } else {
+                    "auto"
+                };
+
+                serde_json::json!({
+                    "args": args,
+                    "cwd": env::current_dir()?,
+                    "debugAdapter": "dlv-dap",
+                    "dlvFlags": [],
+                    "dlvToolPath": self.get_debugger_binary_path(neovim_vadre_window).await?,
+                    "env": {
+                        "GOPATH": go_dir,
+                    },
+                    "mode": mode,
+                    "name": "Launch Package",
+                    "program": program,
+                    "request": "launch",
+                    "stopOnEntry": true,
+                    "type": "go",
+                })
+            }
         };
         Ok(ret)
     }
@@ -384,8 +379,7 @@ impl DebuggerType {
                     .log_msg(VadreLogLevel::INFO, &format!("debugpy stderr: {}", stderr))
                     .await?;
             }
-            DebuggerType::Go => {}
-            DebuggerType::Delve => {
+            DebuggerType::Go => {
                 let go_path = neovim_vadre_window
                     .lock()
                     .await
@@ -453,11 +447,6 @@ impl DebuggerType {
                 )
             }
             DebuggerType::Go => format!(
-                "https://github.com/golang/vscode-go/releases/download/v{}/go-{}.vsix",
-                self.get_debugger_version(),
-                self.get_debugger_version(),
-            ),
-            DebuggerType::Delve => format!(
                 "https://github.com/go-delve/delve/archive/refs/tags/v{}.zip",
                 self.get_debugger_version(),
             ),
@@ -1013,7 +1002,6 @@ impl Debugger {
                         };
                     },
                     Some((message_type, sender)) = debugger_sender_rx.recv() => {
-                        tracing::trace!("Sending message 2 {:?}", message_type);
                         let seq = seq_ids.fetch_add(1, Ordering::SeqCst);
                         let message = ProtocolMessage {
                             seq,
@@ -1081,7 +1069,12 @@ impl Debugger {
 
         let args = self
             .debugger_type
-            .get_launcher_args(program.to_str().unwrap().to_string(), &self.command_args)?;
+            .get_launcher_args(
+                program.to_str().unwrap().to_string(),
+                &self.command_args,
+                self.neovim_vadre_window.clone(),
+            )
+            .await?;
 
         self.send_request(RequestArguments::launch(dap_protocol::Either::Second(args)))
             .await?;
@@ -1270,7 +1263,7 @@ impl Debugger {
         match event {
             EventBody::initialized => {
                 match debugger_type {
-                    DebuggerType::Delve => config_done_tx
+                    DebuggerType::Go => config_done_tx
                         .lock()
                         .await
                         .take()
@@ -1475,7 +1468,6 @@ impl Debugger {
             }
             DebuggerType::DebugPy => true,
             DebuggerType::Go => todo!(),
-            DebuggerType::Delve => todo!(),
         }
     }
 
@@ -1492,7 +1484,6 @@ impl Debugger {
     ) -> Result<()> {
         let message = ProtocolMessageType::Request(request);
 
-        tracing::trace!("Sending message 1 {:?}", message);
         debugger_sender_tx.send((message, sender)).await?;
 
         Ok(())
