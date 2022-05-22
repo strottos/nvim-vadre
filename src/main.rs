@@ -7,10 +7,7 @@ mod neovim;
 mod tokio_join;
 mod util;
 
-use crate::{
-    debuggers::{Debugger, DebuggerType},
-    neovim::VadreLogLevel,
-};
+use crate::{debuggers::Debugger, neovim::VadreLogLevel};
 
 use std::{
     collections::{HashMap, HashSet},
@@ -41,7 +38,7 @@ struct NeovimHandler {
     // really be using more than one debugger at a time and we try and take the second mutex
     // sparingly hopefully this won't be too big a performance hit. I'd prefer to take them out
     // though ideally.
-    debuggers: Arc<Mutex<HashMap<usize, Arc<Mutex<Debugger>>>>>,
+    debuggers: Arc<Mutex<HashMap<usize, Arc<Mutex<Box<(dyn Debugger + Send + Sync)>>>>>>,
 
     breakpoints: Arc<Mutex<HashMap<String, HashSet<i64>>>>,
 }
@@ -109,37 +106,32 @@ impl NeovimHandler {
             return Err(format!("ERROR: {}", log_msg).into());
         }
 
-        let debugger_type = match debugger_type.as_ref() {
-            "lldb" | "codelldb" => DebuggerType::CodeLLDB,
-            "python" | "debugpy" => DebuggerType::DebugPy,
-            "go" | "delve" => DebuggerType::Go,
-            _ => return Err(format!("ERROR: Debugger unknown {}", debugger_type).into()),
-        };
-
         tracing::trace!(
             "Setting up instance {} of type {:?}",
             instance_id,
             debugger_type
         );
 
-        let debugger = Arc::new(Mutex::new(Debugger::new(
+        let debugger = match debuggers::new_debugger(
             instance_id,
             command,
             command_args,
             neovim,
             debugger_type,
             log_debugger,
-        )));
+        ) {
+            Ok(x) => Arc::new(Mutex::new(x)),
+            Err(e) => return Err(format!("Can't setup debugger: {}", e).into()),
+        };
 
-        self.debuggers
-            .lock()
-            .await
-            .insert(instance_id, debugger.clone());
+        let debugger_clone = debugger.clone();
+
+        self.debuggers.lock().await.insert(instance_id, debugger);
 
         let pending_breakpoints = self.breakpoints.lock().await.clone();
 
         tokio::spawn(async move {
-            let debugger = debugger.clone();
+            let debugger = debugger_clone.clone();
             tracing::trace!("Trying to lock 1");
             let mut debugger_lock = debugger.lock().await;
             tracing::trace!("Locked 1");
@@ -149,9 +141,6 @@ impl NeovimHandler {
             {
                 let log_msg = format!("Can't setup debugger: {}", e);
                 debugger_lock
-                    .neovim_vadre_window
-                    .lock()
-                    .await
                     .log_msg(VadreLogLevel::CRITICAL, &log_msg)
                     .await
                     .unwrap();
@@ -263,21 +252,6 @@ impl NeovimHandler {
         Ok("".into())
     }
 
-    async fn print_variable(&self, instance_id: usize, variable_name: &str) -> VadreResult {
-        let debuggers = self.debuggers.lock().await;
-
-        let debugger = debuggers.get(&instance_id).expect("debugger should exist");
-
-        debugger
-            .lock()
-            .await
-            .print_variable(variable_name)
-            .await
-            .expect("Could print variable");
-
-        Ok("".into())
-    }
-
     async fn change_output_window(&self, instance_id: usize, ascending: bool) -> VadreResult {
         let debuggers = self.debuggers.lock().await;
 
@@ -358,27 +332,6 @@ impl Handler for NeovimHandler {
                     .expect("instance_id is usize");
 
                 self.do_step(DebuggerStepType::Continue, instance_id).await
-            }
-            "print_variable" => {
-                let args = args.get(0).unwrap().as_array().unwrap();
-
-                tracing::trace!("ARGS: {:?}", args);
-
-                let instance_id: usize = args
-                    .get(0)
-                    .expect("instance_id should be supplied")
-                    .as_str()
-                    .expect("instance_id is string")
-                    .parse::<usize>()
-                    .expect("instance_id is usize");
-
-                let variable_name = args
-                    .get(1)
-                    .expect("variable name should be supplied")
-                    .as_str()
-                    .expect("variable name is a string");
-
-                self.print_variable(instance_id, variable_name).await
             }
             "next_output_window" => {
                 let instance_id: usize = args

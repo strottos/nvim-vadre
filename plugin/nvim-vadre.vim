@@ -58,7 +58,6 @@ function! s:configureCommands()
     command! -nargs=1 VadreStepIn call s:step_in(<f-args>)
     command! -nargs=1 VadreStepOver call s:step_over(<f-args>)
     command! -nargs=1 VadreContinue call s:continue(<f-args>)
-    command! -nargs=* VadrePrintVariable call s:print_variable(<f-args>)
     command! -nargs=1 VadreNextOutputWindow call s:next_output_window(<f-args>)
     command! -nargs=1 VadrePrevOutputWindow call s:prev_output_window(<f-args>)
 endfunction
@@ -85,10 +84,6 @@ endfunction
 
 function! s:continue(instance_id)
     call rpcrequest(s:vadreJobId, "continue", a:instance_id)
-endfunction
-
-function! s:print_variable(...)
-    call rpcrequest(s:vadreJobId, "print_variable", a:000)
 endfunction
 
 function! s:next_output_window(instance_id)

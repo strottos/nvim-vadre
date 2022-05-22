@@ -20,6 +20,7 @@ use crate::{
     neovim::{CodeBufferContent, NeovimVadreWindow, VadreLogLevel},
     util::{self, get_debuggers_dir, log_err, log_ret_err, ret_err},
 };
+use async_trait::async_trait;
 use dap_protocol::{
     BreakpointEventBody, ContinuedEventBody, DAPCodec, EventBody, InitializeRequestArguments,
     ProtocolMessage, ProtocolMessageType, RequestArguments, Response, ResponseBody, ResponseResult,
@@ -29,6 +30,7 @@ use dap_protocol::{
 };
 
 use anyhow::{bail, Result};
+use dyn_clone::DynClone;
 use futures::{prelude::*, StreamExt};
 use is_executable::IsExecutable;
 use nvim_rs::{compat::tokio::Compat, Neovim};
@@ -46,6 +48,52 @@ use which::which;
 use tracing::{debug, error};
 
 use self::dap_protocol::{ContinueArguments, DecoderResult, NextArguments, StepInArguments};
+
+pub fn new_debugger(
+    id: usize,
+    command: String,
+    command_args: Vec<String>,
+    neovim: Neovim<Compat<Stdout>>,
+    debugger_type: String,
+    log_debugger: bool,
+) -> Result<Box<dyn Debugger + Send + Sync + 'static>> {
+    let debugger_type = match debugger_type.as_ref() {
+        "lldb" | "codelldb" => DebuggerType::CodeLLDB,
+        "python" | "debugpy" => DebuggerType::DebugPy,
+        "go" | "delve" => DebuggerType::Go,
+        _ => bail!("ERROR: Debugger unknown {}", debugger_type),
+    };
+
+    Ok(Box::new(DapDebugger::new(
+        id,
+        command,
+        command_args,
+        neovim,
+        debugger_type,
+        log_debugger,
+    )))
+}
+
+#[async_trait]
+pub trait Debugger: DynClone + Debug {
+    async fn setup(
+        &mut self,
+        pending_breakpoints: &HashMap<String, HashSet<i64>>,
+        existing_debugger_port: Option<u16>,
+    ) -> Result<()>;
+
+    async fn set_source_breakpoints(
+        &self,
+        file_path: String,
+        line_numbers: &HashSet<i64>,
+    ) -> Result<()>;
+
+    async fn do_step(&self, step_type: DebuggerStepType) -> Result<()>;
+
+    async fn change_output_window(&self, ascending: bool) -> Result<()>;
+
+    async fn log_msg(&self, level: VadreLogLevel, msg: &str) -> Result<()>;
+}
 
 #[derive(Clone, Debug)]
 pub enum DebuggerStepType {
@@ -456,7 +504,7 @@ impl DebuggerType {
 }
 
 #[derive(Clone)]
-pub struct Debugger {
+pub struct DapDebugger {
     id: usize,
     command: String,
     command_args: Vec<String>,
@@ -484,7 +532,7 @@ pub struct Debugger {
     data: Arc<Mutex<DebuggerData>>,
 }
 
-impl Debugger {
+impl DapDebugger {
     #[tracing::instrument(skip(neovim))]
     pub fn new(
         id: usize,
@@ -496,7 +544,7 @@ impl Debugger {
     ) -> Self {
         let (debugger_sender_tx, debugger_sender_rx) = mpsc::channel(1);
 
-        Debugger {
+        DapDebugger {
             id,
             command,
             command_args,
@@ -513,62 +561,6 @@ impl Debugger {
 
             data: Arc::new(Mutex::new(DebuggerData::default())),
         }
-    }
-
-    #[tracing::instrument(skip(self))]
-    pub async fn setup(
-        &mut self,
-        pending_breakpoints: &HashMap<String, HashSet<i64>>,
-        existing_debugger_port: Option<u16>,
-    ) -> Result<()> {
-        log_ret_err!(
-            self.neovim_vadre_window.lock().await.create_ui().await,
-            self.neovim_vadre_window,
-            "Error setting up Vadre UI"
-        );
-
-        let port = match existing_debugger_port {
-            Some(port) => port,
-            None => {
-                let port = util::get_unused_localhost_port();
-
-                log_ret_err!(
-                    self.launch(port).await,
-                    self.neovim_vadre_window,
-                    "Error launching process"
-                );
-
-                port
-            }
-        };
-
-        let (config_done_tx, config_done_rx) = oneshot::channel();
-        match self.debugger_type.get_connection_type() {
-            DebuggerConnectionType::Tcp => log_ret_err!(
-                self.tcp_connect(port, config_done_tx).await,
-                self.neovim_vadre_window,
-                "Error creating TCP connection to process"
-            ),
-            DebuggerConnectionType::Stdio => log_ret_err!(
-                self.stdio_connect(config_done_tx).await,
-                self.neovim_vadre_window,
-                "Error creating TCP connection to process"
-            ),
-        }
-        log_ret_err!(
-            self.init_process(pending_breakpoints, config_done_rx).await,
-            self.neovim_vadre_window,
-            "Error initialising process"
-        );
-        ret_err!(
-            self.neovim_vadre_window
-                .lock()
-                .await
-                .log_msg(VadreLogLevel::INFO, "Debugger launched and setup")
-                .await
-        );
-
-        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
@@ -633,8 +625,10 @@ impl Debugger {
 
                     let breakpoint_id = breakpoint_response.id.unwrap();
 
-                    let breakpoint_is_resolved =
-                        Debugger::breakpoint_is_resolved(&breakpoint_response, &self.debugger_type);
+                    let breakpoint_is_resolved = DapDebugger::breakpoint_is_resolved(
+                        &breakpoint_response,
+                        &self.debugger_type,
+                    );
 
                     tracing::trace!("3 - {:?}", data_lock.breakpoints);
 
@@ -664,81 +658,6 @@ impl Debugger {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self))]
-    pub async fn set_source_breakpoints(
-        &self,
-        file_path: String,
-        line_numbers: &HashSet<i64>,
-    ) -> Result<()> {
-        self.set_breakpoints(file_path, line_numbers).await
-    }
-
-    #[tracing::instrument(skip(self))]
-    pub async fn do_step(&self, step_type: DebuggerStepType) -> Result<()> {
-        let thread_id = {
-            let data = self.data.lock().await;
-
-            data.current_thread_id.clone()
-        };
-
-        let thread_id = match thread_id {
-            Some(thread_id) => thread_id,
-            None => {
-                self.neovim_vadre_window
-                    .lock()
-                    .await
-                    .log_msg(
-                        VadreLogLevel::ERROR,
-                        "Can't do stepping as no current thread",
-                    )
-                    .await?;
-                return Ok(());
-            }
-        };
-
-        let request = match step_type {
-            DebuggerStepType::Over => RequestArguments::next(NextArguments {
-                granularity: None,
-                single_thread: Some(false),
-                thread_id,
-            }),
-            DebuggerStepType::In => RequestArguments::stepIn(StepInArguments {
-                granularity: None,
-                single_thread: Some(false),
-                target_id: None,
-                thread_id,
-            }),
-            DebuggerStepType::Continue => RequestArguments::continue_(ContinueArguments {
-                single_thread: Some(false),
-                thread_id,
-            }),
-        };
-
-        self.send_request(request).await?;
-
-        Ok(())
-    }
-
-    #[tracing::instrument(skip(self))]
-    pub async fn print_variable(&self, variable_name: &str) -> Result<()> {
-        // self.send_request(
-        //     "evaluate",
-        //     serde_json::json!({ "expression": &format!("/se frame evaluate {}", variable_name) }),
-        // )
-        // .await?;
-
-        Ok(())
-    }
-
-    #[tracing::instrument(skip(self))]
-    pub async fn change_output_window(&self, ascending: bool) -> Result<()> {
-        self.neovim_vadre_window
-            .lock()
-            .await
-            .change_output_window(ascending)
-            .await
-    }
-
     #[tracing::instrument(skip(self, port))]
     async fn launch(&mut self, port: u16) -> Result<()> {
         let msg = format!(
@@ -747,11 +666,7 @@ impl Debugger {
             self.debugger_type.get_debugger_name(),
             self.command_args,
         );
-        self.neovim_vadre_window
-            .lock()
-            .await
-            .log_msg(VadreLogLevel::DEBUG, &msg)
-            .await?;
+        self.log_msg(VadreLogLevel::DEBUG, &msg).await?;
 
         self.download_plugin().await?;
 
@@ -817,10 +732,7 @@ impl Debugger {
 
         *self.process.lock().await = Some(child);
 
-        self.neovim_vadre_window
-            .lock()
-            .await
-            .log_msg(VadreLogLevel::DEBUG, "Process spawned".into())
+        self.log_msg(VadreLogLevel::DEBUG, "Process spawned".into())
             .await?;
 
         Ok(())
@@ -913,7 +825,7 @@ impl Debugger {
                                             let config_done_tx = config_done_tx.clone();
                                             if let Err(e) = timeout(
                                                 Duration::new(10, 0),
-                                                Debugger::handle_request(
+                                                DapDebugger::handle_request(
                                                     message.seq,
                                                     request,
                                                     neovim_vadre_window.clone(),
@@ -939,7 +851,7 @@ impl Debugger {
                                             // TODO: configurable timeout?
                                             if let Err(e) = timeout(
                                                 Duration::new(10, 0),
-                                                Debugger::handle_response(
+                                                DapDebugger::handle_response(
                                                     response,
                                                     pending_outgoing_requests.clone(),
                                                 ),
@@ -962,7 +874,7 @@ impl Debugger {
                                             let config_done_tx = config_done_tx.clone();
                                             if let Err(e) = timeout(
                                                 Duration::new(10, 0),
-                                                Debugger::handle_event(
+                                                DapDebugger::handle_event(
                                                     event,
                                                     neovim_vadre_window.clone(),
                                                     debugger_sender_tx.clone(),
@@ -1021,14 +933,11 @@ impl Debugger {
             unreachable!();
         });
 
-        self.neovim_vadre_window
-            .lock()
-            .await
-            .log_msg(
-                VadreLogLevel::DEBUG,
-                "Process connection established".into(),
-            )
-            .await?;
+        self.log_msg(
+            VadreLogLevel::DEBUG,
+            "Process connection established".into(),
+        )
+        .await?;
 
         Ok(())
     }
@@ -1110,7 +1019,7 @@ impl Debugger {
 
     #[tracing::instrument(skip(self, request))]
     async fn send_request(&self, request: RequestArguments) -> Result<()> {
-        Debugger::do_send_request(request, self.debugger_sender_tx.clone(), None).await
+        DapDebugger::do_send_request(request, self.debugger_sender_tx.clone(), None).await
     }
 
     #[tracing::instrument(skip(self, request))]
@@ -1118,7 +1027,8 @@ impl Debugger {
         &self,
         request: RequestArguments,
     ) -> Result<ResponseResult> {
-        Debugger::do_send_request_and_await_response(request, self.debugger_sender_tx.clone()).await
+        DapDebugger::do_send_request_and_await_response(request, self.debugger_sender_tx.clone())
+            .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -1129,18 +1039,15 @@ impl Debugger {
         if !path.exists() {
             let (os, arch) = util::get_os_and_cpu_architecture();
 
-            self.neovim_vadre_window
-                .lock()
-                .await
-                .log_msg(
-                    VadreLogLevel::INFO,
-                    &format!("Downloading and extracting {} plugin for {}", os, arch),
-                )
-                .await?;
+            self.log_msg(
+                VadreLogLevel::INFO,
+                &format!("Downloading and extracting {} plugin for {}", os, arch),
+            )
+            .await?;
 
             let url = self.debugger_type.get_debugger_extension_url(os, arch)?;
 
-            Debugger::download_extract_zip(path.as_path(), url).await?;
+            DapDebugger::download_extract_zip(path.as_path(), url).await?;
 
             self.debugger_type
                 .install_plugin(self.neovim_vadre_window.clone())
@@ -1285,7 +1192,7 @@ impl Debugger {
                     .await
             }
             EventBody::stopped(stopped_event) => {
-                Debugger::handle_event_stopped(
+                DapDebugger::handle_event_stopped(
                     stopped_event,
                     neovim_vadre_window,
                     debugger_sender_tx,
@@ -1294,7 +1201,7 @@ impl Debugger {
                 .await
             }
             EventBody::continued(continued_event) => {
-                Debugger::handle_event_continued(
+                DapDebugger::handle_event_continued(
                     continued_event,
                     neovim_vadre_window,
                     debugger_sender_tx,
@@ -1303,7 +1210,7 @@ impl Debugger {
                 .await
             }
             EventBody::breakpoint(breakpoint_event) => {
-                Debugger::handle_event_breakpoint(
+                DapDebugger::handle_event_breakpoint(
                     breakpoint_event,
                     neovim_vadre_window,
                     data,
@@ -1334,7 +1241,7 @@ impl Debugger {
 
         tokio::spawn(async move {
             log_err!(
-                Debugger::process_output_info(
+                DapDebugger::process_output_info(
                     debugger_sender_tx.clone(),
                     neovim_vadre_window.clone(),
                     data,
@@ -1345,7 +1252,7 @@ impl Debugger {
             );
 
             if let Some(thread_id) = stopped_event.thread_id {
-                if let Err(e) = Debugger::process_stopped(
+                if let Err(e) = DapDebugger::process_stopped(
                     thread_id,
                     debugger_sender_tx,
                     neovim_vadre_window.clone(),
@@ -1380,7 +1287,7 @@ impl Debugger {
     ) -> Result<()> {
         tokio::spawn(async move {
             log_err!(
-                Debugger::process_output_info(
+                DapDebugger::process_output_info(
                     debugger_sender_tx.clone(),
                     neovim_vadre_window.clone(),
                     data,
@@ -1404,7 +1311,7 @@ impl Debugger {
         let breakpoint_id = breakpoint_event.breakpoint.id.unwrap();
 
         let is_resolved =
-            Debugger::breakpoint_is_resolved(&breakpoint_event.breakpoint, debugger_type);
+            DapDebugger::breakpoint_is_resolved(&breakpoint_event.breakpoint, debugger_type);
 
         for _ in 1..100 {
             if data
@@ -1501,7 +1408,7 @@ impl Debugger {
     ) -> Result<ResponseResult> {
         let (sender, receiver) = oneshot::channel();
 
-        Debugger::do_send_request(request, debugger_sender_tx, Some(sender)).await?;
+        DapDebugger::do_send_request(request, debugger_sender_tx, Some(sender)).await?;
 
         // TODO: configurable timeout
         let response = match timeout(Duration::new(10, 0), receiver).await {
@@ -1524,7 +1431,7 @@ impl Debugger {
     ) -> Result<()> {
         tracing::debug!("Thread id {} stopped", thread_id);
 
-        let stack_trace_response = Debugger::do_send_request_and_await_response(
+        let stack_trace_response = DapDebugger::do_send_request_and_await_response(
             RequestArguments::stackTrace(StackTraceArguments {
                 thread_id,
                 format: None,
@@ -1556,14 +1463,15 @@ impl Debugger {
                         )
                         .await?;
                 } else if let Some(source_reference_id) = source.source_reference {
-                    let source_reference_response = Debugger::do_send_request_and_await_response(
-                        RequestArguments::source(SourceArguments {
-                            source: Some(source.clone()),
-                            source_reference: source_reference_id,
-                        }),
-                        debugger_sender_tx.clone(),
-                    )
-                    .await?;
+                    let source_reference_response =
+                        DapDebugger::do_send_request_and_await_response(
+                            RequestArguments::source(SourceArguments {
+                                source: Some(source.clone()),
+                                source_reference: source_reference_id,
+                            }),
+                            debugger_sender_tx.clone(),
+                        )
+                        .await?;
                     if let ResponseResult::Success { body } = source_reference_response {
                         if let ResponseBody::source(source_reference_body) = body {
                             tracing::trace!("source reference {:?}", source_reference_body);
@@ -1604,7 +1512,7 @@ impl Debugger {
         let mut call_stack_buffer_content = Vec::new();
         let current_thread_id = data.lock().await.current_thread_id;
 
-        let response_result = Debugger::do_send_request_and_await_response(
+        let response_result = DapDebugger::do_send_request_and_await_response(
             RequestArguments::threads(None),
             debugger_sender_tx.clone(),
         )
@@ -1619,7 +1527,7 @@ impl Debugger {
                     if current_thread_id == Some(thread_id) {
                         call_stack_buffer_content.push(format!("{} (*)", thread_name));
 
-                        let stack_trace_response = Debugger::do_send_request_and_await_response(
+                        let stack_trace_response = DapDebugger::do_send_request_and_await_response(
                             RequestArguments::stackTrace(StackTraceArguments {
                                 thread_id,
                                 format: None,
@@ -1641,7 +1549,7 @@ impl Debugger {
                                 let frame_id = top_frame.id;
                                 data.lock().await.current_frame_id = Some(frame_id);
 
-                                Debugger::process_variables(
+                                DapDebugger::process_variables(
                                     frame_id,
                                     debugger_sender_tx.clone(),
                                     neovim_vadre_window.clone(),
@@ -1676,7 +1584,7 @@ impl Debugger {
                             }
                         }
                     } else {
-                        let stack_trace_response = Debugger::do_send_request_and_await_response(
+                        let stack_trace_response = DapDebugger::do_send_request_and_await_response(
                             RequestArguments::stackTrace(StackTraceArguments {
                                 thread_id,
                                 format: None,
@@ -1725,7 +1633,7 @@ impl Debugger {
 
         let mut variable_content = Vec::new();
 
-        let scopes_response_result = Debugger::do_send_request_and_await_response(
+        let scopes_response_result = DapDebugger::do_send_request_and_await_response(
             RequestArguments::scopes(ScopesArguments { frame_id }),
             debugger_sender_tx.clone(),
         )
@@ -1736,17 +1644,18 @@ impl Debugger {
                 for scope in scopes_body.scopes {
                     variable_content.push(format!("{}:", scope.name));
 
-                    let variables_response_result = Debugger::do_send_request_and_await_response(
-                        RequestArguments::variables(VariablesArguments {
-                            count: None,
-                            filter: None,
-                            format: None,
-                            start: None,
-                            variables_reference: scope.variables_reference,
-                        }),
-                        debugger_sender_tx.clone(),
-                    )
-                    .await?;
+                    let variables_response_result =
+                        DapDebugger::do_send_request_and_await_response(
+                            RequestArguments::variables(VariablesArguments {
+                                count: None,
+                                filter: None,
+                                format: None,
+                                start: None,
+                                variables_reference: scope.variables_reference,
+                            }),
+                            debugger_sender_tx.clone(),
+                        )
+                        .await?;
 
                     if let ResponseResult::Success { body } = variables_response_result {
                         if let ResponseBody::variables(variables_body) = body {
@@ -1793,9 +1702,134 @@ impl Debugger {
     }
 }
 
-impl Debug for Debugger {
+#[async_trait]
+impl Debugger for DapDebugger {
+    #[tracing::instrument(skip(self))]
+    async fn setup(
+        &mut self,
+        pending_breakpoints: &HashMap<String, HashSet<i64>>,
+        existing_debugger_port: Option<u16>,
+    ) -> Result<()> {
+        log_ret_err!(
+            self.neovim_vadre_window.lock().await.create_ui().await,
+            self.neovim_vadre_window,
+            "Error setting up Vadre UI"
+        );
+
+        let port = match existing_debugger_port {
+            Some(port) => port,
+            None => {
+                let port = util::get_unused_localhost_port();
+
+                log_ret_err!(
+                    self.launch(port).await,
+                    self.neovim_vadre_window,
+                    "Error launching process"
+                );
+
+                port
+            }
+        };
+
+        let (config_done_tx, config_done_rx) = oneshot::channel();
+        match self.debugger_type.get_connection_type() {
+            DebuggerConnectionType::Tcp => log_ret_err!(
+                self.tcp_connect(port, config_done_tx).await,
+                self.neovim_vadre_window,
+                "Error creating TCP connection to process"
+            ),
+            DebuggerConnectionType::Stdio => log_ret_err!(
+                self.stdio_connect(config_done_tx).await,
+                self.neovim_vadre_window,
+                "Error creating TCP connection to process"
+            ),
+        }
+        log_ret_err!(
+            self.init_process(pending_breakpoints, config_done_rx).await,
+            self.neovim_vadre_window,
+            "Error initialising process"
+        );
+        ret_err!(
+            self.log_msg(VadreLogLevel::INFO, "Debugger launched and setup")
+                .await
+        );
+
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn set_source_breakpoints(
+        &self,
+        file_path: String,
+        line_numbers: &HashSet<i64>,
+    ) -> Result<()> {
+        self.set_breakpoints(file_path, line_numbers).await
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn do_step(&self, step_type: DebuggerStepType) -> Result<()> {
+        let thread_id = {
+            let data = self.data.lock().await;
+
+            data.current_thread_id.clone()
+        };
+
+        let thread_id = match thread_id {
+            Some(thread_id) => thread_id,
+            None => {
+                self.log_msg(
+                    VadreLogLevel::ERROR,
+                    "Can't do stepping as no current thread",
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        let request = match step_type {
+            DebuggerStepType::Over => RequestArguments::next(NextArguments {
+                granularity: None,
+                single_thread: Some(false),
+                thread_id,
+            }),
+            DebuggerStepType::In => RequestArguments::stepIn(StepInArguments {
+                granularity: None,
+                single_thread: Some(false),
+                target_id: None,
+                thread_id,
+            }),
+            DebuggerStepType::Continue => RequestArguments::continue_(ContinueArguments {
+                single_thread: Some(false),
+                thread_id,
+            }),
+        };
+
+        self.send_request(request).await?;
+
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn change_output_window(&self, ascending: bool) -> Result<()> {
+        self.neovim_vadre_window
+            .lock()
+            .await
+            .change_output_window(ascending)
+            .await
+    }
+
+    async fn log_msg(&self, level: VadreLogLevel, msg: &str) -> Result<()> {
+        self.neovim_vadre_window
+            .lock()
+            .await
+            .log_msg(level, msg)
+            .await
+    }
+}
+
+impl Debug for DapDebugger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Debugger")
+        f.debug_struct("DapDebugger")
             .field("id", &self.id)
             .field("command", &self.command)
             .field("command_args", &self.command_args)
