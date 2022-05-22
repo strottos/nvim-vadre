@@ -4,10 +4,9 @@ extern crate lazy_static;
 mod debuggers;
 mod logger;
 mod neovim;
-mod tokio_join;
 mod util;
 
-use crate::{debuggers::Debugger, neovim::VadreLogLevel};
+use crate::{debuggers::DebuggerAPI, neovim::VadreLogLevel};
 
 use std::{
     collections::{HashMap, HashSet},
@@ -38,7 +37,7 @@ struct NeovimHandler {
     // really be using more than one debugger at a time and we try and take the second mutex
     // sparingly hopefully this won't be too big a performance hit. I'd prefer to take them out
     // though ideally.
-    debuggers: Arc<Mutex<HashMap<usize, Arc<Mutex<Box<(dyn Debugger + Send + Sync)>>>>>>,
+    debuggers: Arc<Mutex<HashMap<usize, Arc<Mutex<Box<(dyn DebuggerAPI + Send + Sync)>>>>>>,
 
     breakpoints: Arc<Mutex<HashMap<String, HashSet<i64>>>>,
 }

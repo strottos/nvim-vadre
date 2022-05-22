@@ -2,19 +2,17 @@
 // https://github.com/vadimcn/vscode-lldb/tree/master/adapter/crates/adapter-protocol
 #![allow(non_camel_case_types)]
 
-mod dap_schema;
-
-pub use dap_schema::{
+pub use super::schema::{
     Breakpoint, BreakpointEventBody, CancelArguments, Capabilities, CapabilitiesEventBody,
     ContinueArguments, ContinueResponseBody, ContinuedEventBody, ExitedEventBody,
     InitializeRequest, InitializeRequestArguments, InitializeResponse, InvalidatedEventBody,
     LaunchRequestArguments, ModuleEventBody, NextArguments, OutputEventBody, PauseArguments,
-    RunInTerminalRequestArguments, RunInTerminalResponseBody, ScopesArguments, ScopesResponseBody,
-    SetBreakpointsArguments, SetBreakpointsResponseBody, SetExceptionBreakpointsArguments,
-    SetFunctionBreakpointsArguments, Source, SourceArguments, SourceBreakpoint, SourceResponseBody,
-    StackTraceArguments, StackTraceResponseBody, StepInArguments, StoppedEventBody,
-    TerminatedEventBody, ThreadEventBody, ThreadsResponseBody, VariablesArguments,
-    VariablesResponseBody,
+    ProcessEventBody, RunInTerminalRequestArguments, RunInTerminalResponseBody, ScopesArguments,
+    ScopesResponseBody, SetBreakpointsArguments, SetBreakpointsResponseBody,
+    SetExceptionBreakpointsArguments, SetFunctionBreakpointsArguments, Source, SourceArguments,
+    SourceBreakpoint, SourceResponseBody, StackTraceArguments, StackTraceResponseBody,
+    StepInArguments, StoppedEventBody, TerminatedEventBody, ThreadEventBody, ThreadsResponseBody,
+    VariablesArguments, VariablesResponseBody,
 };
 
 use std::{fmt::Write, io, str};
@@ -23,8 +21,6 @@ use bytes::BytesMut;
 use serde_derive::{Deserialize, Serialize};
 use tokio_util::codec;
 use tracing::debug;
-
-use self::dap_schema::ProcessEventBody;
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone)]
 #[serde(untagged)]
