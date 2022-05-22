@@ -23,6 +23,7 @@ use super::{
         SourceBreakpoint, StackTraceArguments, StepInArguments, StoppedEventBody,
         VariablesArguments,
     },
+    dap::shared as dap_shared,
     DebuggerAPI, DebuggerData, DebuggerStepType,
 };
 use crate::{
@@ -175,7 +176,7 @@ impl DebuggerAPI for Debugger {
             }),
         };
 
-        self.send_request(request).await?;
+        dap_shared::do_send_request(request, self.debugger_sender_tx.clone(), None).await?;
 
         Ok(())
     }
@@ -256,16 +257,16 @@ impl Debugger {
 
         let source = Source::new_file(file_name.clone(), file_path.clone());
 
-        let response_result = self
-            .send_request_and_await_response(RequestArguments::setBreakpoints(
-                SetBreakpointsArguments {
-                    breakpoints: Some(breakpoints),
-                    lines: None,
-                    source,
-                    source_modified: Some(false),
-                },
-            ))
-            .await?;
+        let response_result = dap_shared::do_send_request_and_await_response(
+            RequestArguments::setBreakpoints(SetBreakpointsArguments {
+                breakpoints: Some(breakpoints),
+                lines: None,
+                source,
+                source_modified: Some(false),
+            }),
+            self.debugger_sender_tx.clone(),
+        )
+        .await?;
 
         if let ResponseResult::Success { body } = response_result {
             if let ResponseBody::setBreakpoints(breakpoints_body) = body {
@@ -600,9 +601,10 @@ impl Debugger {
         pending_breakpoints: &HashMap<String, HashSet<i64>>,
         config_done_rx: oneshot::Receiver<()>,
     ) -> Result<()> {
-        self.send_request_and_await_response(RequestArguments::initialize(
-            InitializeRequestArguments::new("delve".to_string()),
-        ))
+        dap_shared::do_send_request_and_await_response(
+            RequestArguments::initialize(InitializeRequestArguments::new("delve".to_string())),
+            self.debugger_sender_tx.clone(),
+        )
         .await?;
 
         let program = dunce::canonicalize(&self.command)?;
@@ -635,23 +637,31 @@ impl Debugger {
             "type": "go",
         });
 
-        self.send_request(RequestArguments::launch(dap_protocol::Either::Second(args)))
-            .await?;
-
-        self.send_request(RequestArguments::setFunctionBreakpoints(
-            SetFunctionBreakpointsArguments {
-                breakpoints: vec![],
-            },
-        ))
+        dap_shared::do_send_request(
+            RequestArguments::launch(dap_protocol::Either::Second(args)),
+            self.debugger_sender_tx.clone(),
+            None,
+        )
         .await?;
 
-        self.send_request(RequestArguments::setExceptionBreakpoints(
-            SetExceptionBreakpointsArguments {
+        dap_shared::do_send_request(
+            RequestArguments::setFunctionBreakpoints(SetFunctionBreakpointsArguments {
+                breakpoints: vec![],
+            }),
+            self.debugger_sender_tx.clone(),
+            None,
+        )
+        .await?;
+
+        dap_shared::do_send_request(
+            RequestArguments::setExceptionBreakpoints(SetExceptionBreakpointsArguments {
                 filters: vec![],
                 exception_options: None,
                 filter_options: None,
-            },
-        ))
+            }),
+            self.debugger_sender_tx.clone(),
+            None,
+        )
         .await?;
 
         for breakpoint in pending_breakpoints {
@@ -661,23 +671,13 @@ impl Debugger {
 
         timeout(Duration::new(10, 0), config_done_rx).await??;
 
-        self.send_request_and_await_response(RequestArguments::configurationDone(None))
-            .await?;
+        dap_shared::do_send_request_and_await_response(
+            RequestArguments::configurationDone(None),
+            self.debugger_sender_tx.clone(),
+        )
+        .await?;
 
         Ok(())
-    }
-
-    #[tracing::instrument(skip(self, request))]
-    async fn send_request(&self, request: RequestArguments) -> Result<()> {
-        Debugger::do_send_request(request, self.debugger_sender_tx.clone(), None).await
-    }
-
-    #[tracing::instrument(skip(self, request))]
-    async fn send_request_and_await_response(
-        &self,
-        request: RequestArguments,
-    ) -> Result<ResponseResult> {
-        Debugger::do_send_request_and_await_response(request, self.debugger_sender_tx.clone()).await
     }
 
     fn get_debugger_binary_path(&self) -> Result<PathBuf> {
@@ -1061,48 +1061,6 @@ impl Debugger {
         todo!()
     }
 
-    /// Actually send the request, should be the only function that does this, even the function
-    /// with the `&self` parameter still uses this in turn.
-    #[tracing::instrument(skip(request, debugger_sender_tx))]
-    async fn do_send_request(
-        request: RequestArguments,
-        debugger_sender_tx: mpsc::Sender<(
-            ProtocolMessageType,
-            Option<oneshot::Sender<ResponseResult>>,
-        )>,
-        sender: Option<oneshot::Sender<ResponseResult>>,
-    ) -> Result<()> {
-        let message = ProtocolMessageType::Request(request);
-
-        debugger_sender_tx.send((message, sender)).await?;
-
-        Ok(())
-    }
-
-    /// Actually send the request and await the response. Used in turn by the equivalent function
-    /// with the `&self` parameter.
-    #[tracing::instrument(skip(request, debugger_sender_tx))]
-    async fn do_send_request_and_await_response(
-        request: RequestArguments,
-        debugger_sender_tx: mpsc::Sender<(
-            ProtocolMessageType,
-            Option<oneshot::Sender<ResponseResult>>,
-        )>,
-    ) -> Result<ResponseResult> {
-        let (sender, receiver) = oneshot::channel();
-
-        Debugger::do_send_request(request, debugger_sender_tx, Some(sender)).await?;
-
-        // TODO: configurable timeout
-        let response = match timeout(Duration::new(10, 0), receiver).await {
-            Ok(resp) => resp?,
-            Err(e) => bail!("Timed out waiting for a response: {}", e),
-        };
-        tracing::trace!("Response: {:?}", response);
-
-        Ok(response)
-    }
-
     #[tracing::instrument(skip(thread_id, debugger_sender_tx, neovim_vadre_window))]
     async fn process_stopped(
         thread_id: i64,
@@ -1114,7 +1072,7 @@ impl Debugger {
     ) -> Result<()> {
         tracing::debug!("Thread id {} stopped", thread_id);
 
-        let stack_trace_response = Debugger::do_send_request_and_await_response(
+        let stack_trace_response = dap_shared::do_send_request_and_await_response(
             RequestArguments::stackTrace(StackTraceArguments {
                 thread_id,
                 format: None,
@@ -1146,7 +1104,7 @@ impl Debugger {
                         )
                         .await?;
                 } else if let Some(source_reference_id) = source.source_reference {
-                    let source_reference_response = Debugger::do_send_request_and_await_response(
+                    let source_reference_response = dap_shared::do_send_request_and_await_response(
                         RequestArguments::source(SourceArguments {
                             source: Some(source.clone()),
                             source_reference: source_reference_id,
@@ -1194,7 +1152,7 @@ impl Debugger {
         let mut call_stack_buffer_content = Vec::new();
         let current_thread_id = data.lock().await.current_thread_id;
 
-        let response_result = Debugger::do_send_request_and_await_response(
+        let response_result = dap_shared::do_send_request_and_await_response(
             RequestArguments::threads(None),
             debugger_sender_tx.clone(),
         )
@@ -1209,7 +1167,7 @@ impl Debugger {
                     if current_thread_id == Some(thread_id) {
                         call_stack_buffer_content.push(format!("{} (*)", thread_name));
 
-                        let stack_trace_response = Debugger::do_send_request_and_await_response(
+                        let stack_trace_response = dap_shared::do_send_request_and_await_response(
                             RequestArguments::stackTrace(StackTraceArguments {
                                 thread_id,
                                 format: None,
@@ -1266,7 +1224,7 @@ impl Debugger {
                             }
                         }
                     } else {
-                        let stack_trace_response = Debugger::do_send_request_and_await_response(
+                        let stack_trace_response = dap_shared::do_send_request_and_await_response(
                             RequestArguments::stackTrace(StackTraceArguments {
                                 thread_id,
                                 format: None,
@@ -1315,7 +1273,7 @@ impl Debugger {
 
         let mut variable_content = Vec::new();
 
-        let scopes_response_result = Debugger::do_send_request_and_await_response(
+        let scopes_response_result = dap_shared::do_send_request_and_await_response(
             RequestArguments::scopes(ScopesArguments { frame_id }),
             debugger_sender_tx.clone(),
         )
@@ -1326,7 +1284,7 @@ impl Debugger {
                 for scope in scopes_body.scopes {
                     variable_content.push(format!("{}:", scope.name));
 
-                    let variables_response_result = Debugger::do_send_request_and_await_response(
+                    let variables_response_result = dap_shared::do_send_request_and_await_response(
                         RequestArguments::variables(VariablesArguments {
                             count: None,
                             filter: None,
@@ -1385,7 +1343,7 @@ impl Debugger {
 
 impl Debug for Debugger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DapDebugger")
+        f.debug_struct("GoDelveDebugger")
             .field("id", &self.id)
             .field("command", &self.command)
             .field("command_args", &self.command_args)
