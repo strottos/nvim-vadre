@@ -364,7 +364,7 @@ impl Debugger {
 
         let args = vec!["--port".to_string(), port.to_string()];
 
-        tracing::trace!("Spawning process: {:?} {:?}", path, args);
+        tracing::debug!("Spawning process: {:?} {:?}", path, args);
 
         let mut child = Command::new(path.to_str().unwrap())
             .args(args)
@@ -481,7 +481,7 @@ impl Debugger {
                                         ProtocolMessageType::Request(request) => {
                                             let config_done_tx = config_done_tx.clone();
                                             if let Err(e) = timeout(
-                                                Duration::new(10, 0),
+                                                Duration::new(30, 0),
                                                 Debugger::handle_request(
                                                     message.seq,
                                                     request,
