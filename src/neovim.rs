@@ -86,7 +86,7 @@ impl VadreWindowType {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-enum VadreBufferType {
+pub enum VadreBufferType {
     Code,
     Logs,
     Terminal,
@@ -145,7 +145,10 @@ impl VadreBufferType {
         }
     }
 
-    fn get_next_output_buffer(current_buf_name: &str, ascending: bool) -> VadreBufferType {
+    fn get_output_buffer(
+        current_buf_name: &str,
+        type_: VadreOutputBufferSelector,
+    ) -> VadreBufferType {
         let mut split = current_buf_name.rsplit(" - ");
         let output_buffer_type = split
             .next()
@@ -164,14 +167,19 @@ impl VadreBufferType {
             .position(|r| *r == output_buffer_type)
             .unwrap();
 
-        if ascending {
-            index += 1;
-        } else {
-            if index == 0 {
-                index = buffer_order.len();
+        match type_ {
+            VadreOutputBufferSelector::Next => index += 1,
+            VadreOutputBufferSelector::Previous => {
+                if index == 0 {
+                    index = buffer_order.len();
+                }
+                index -= 1;
             }
-            index -= 1;
-        }
+            VadreOutputBufferSelector::Logs => index = 0,
+            VadreOutputBufferSelector::CallStack => index = 1,
+            VadreOutputBufferSelector::Variables => index = 2,
+            VadreOutputBufferSelector::Breakpoints => index = 3,
+        };
         let index: usize = index % buffer_order.len();
 
         buffer_order.get(index).unwrap().clone()
@@ -194,6 +202,44 @@ impl VadreBufferType {
 pub enum CodeBufferContent<'a> {
     File(&'a str),
     Content(String),
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum VadreOutputBufferSelector {
+    Next,
+    Previous,
+    Logs,
+    CallStack,
+    Variables,
+    Breakpoints,
+}
+
+impl VadreOutputBufferSelector {
+    fn get_type(type_: &str) -> Self {
+        tracing::trace!("Type: {}", type_);
+        match type_.to_lowercase().chars().nth(0).unwrap() {
+            'n' => Self::Next,
+            'p' => Self::Previous,
+            'l' => Self::Logs,
+            's' => Self::CallStack,
+            'v' => Self::Variables,
+            'b' => Self::Breakpoints,
+            _ => panic!("Can't understand type {}", type_),
+        }
+    }
+}
+
+impl Display for VadreOutputBufferSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VadreOutputBufferSelector::Next => write!(f, "Next"),
+            VadreOutputBufferSelector::Previous => write!(f, "Previous"),
+            VadreOutputBufferSelector::Logs => write!(f, "Logs"),
+            VadreOutputBufferSelector::CallStack => write!(f, "CallStack"),
+            VadreOutputBufferSelector::Variables => write!(f, "Variables"),
+            VadreOutputBufferSelector::Breakpoints => write!(f, "Breakpoints"),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -541,14 +587,31 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
-    pub async fn change_output_window(&self, ascending: bool) -> Result<()> {
+    pub async fn get_output_window_type(&self) -> Result<VadreBufferType> {
         let output_window = self
             .windows
             .get(&VadreWindowType::Output)
             .expect("can get output window");
-        let new_buffer_type = VadreBufferType::get_next_output_buffer(
+        let output_buffer_name = &output_window.get_buf().await?.get_name().await?;
+        let mut split = output_buffer_name.rsplit(" - ");
+        let output_buffer_type = split
+            .next()
+            .expect("should be able to retrieve output buffer type");
+        let output_buffer_type = VadreBufferType::get_buffer_type_from_str(output_buffer_type);
+
+        Ok(output_buffer_type)
+    }
+
+    pub async fn change_output_window(&self, type_: &str) -> Result<()> {
+        let type_ = VadreOutputBufferSelector::get_type(type_);
+
+        let output_window = self
+            .windows
+            .get(&VadreWindowType::Output)
+            .expect("can get output window");
+        let new_buffer_type = VadreBufferType::get_output_buffer(
             &output_window.get_buf().await?.get_name().await?,
-            ascending,
+            type_,
         );
         let new_buffer = self
             .buffers
@@ -657,12 +720,36 @@ impl NeovimVadreWindow {
             ("c", &format!(":VadreContinue {}<CR>", self.instance_id)),
             ("C", &format!(":VadreContinue {}<CR>", self.instance_id)),
             (
+                "<localleader>l",
+                &format!(":VadreOutputWindow {} Logs<CR>", self.instance_id),
+            ),
+            (
+                "<localleader>s",
+                &format!(":VadreOutputWindow {} CallStack<CR>", self.instance_id),
+            ),
+            (
+                "<localleader>v",
+                &format!(":VadreOutputWindow {} Variables<CR>", self.instance_id),
+            ),
+            (
+                "<localleader>b",
+                &format!(":VadreOutputWindow {} Breakpoints<CR>", self.instance_id),
+            ),
+            (
                 ">",
-                &format!(":VadreNextOutputWindow {}<CR>", self.instance_id),
+                &format!(
+                    ":VadreOutputWindow {} {}<CR>",
+                    self.instance_id,
+                    VadreOutputBufferSelector::Next
+                ),
             ),
             (
                 "<",
-                &format!(":VadrePrevOutputWindow {}<CR>", self.instance_id),
+                &format!(
+                    ":VadreOutputWindow {} {}<CR>",
+                    self.instance_id,
+                    VadreOutputBufferSelector::Previous
+                ),
             ),
         ] {
             buffer.set_keymap("n", key, action, vec![]).await?; // nnoremap <silent> <buffer> r :PadreRun<cr>

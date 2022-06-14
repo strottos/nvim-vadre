@@ -251,7 +251,7 @@ impl NeovimHandler {
         Ok("".into())
     }
 
-    async fn change_output_window(&self, instance_id: usize, ascending: bool) -> VadreResult {
+    async fn change_output_window(&self, instance_id: usize, type_: &str) -> VadreResult {
         let debuggers = self.debuggers.lock().await;
 
         let debugger = debuggers.get(&instance_id).expect("debugger should exist");
@@ -259,7 +259,7 @@ impl NeovimHandler {
         debugger
             .lock()
             .await
-            .change_output_window(ascending)
+            .change_output_window(type_)
             .await
             .expect("Could print variable");
 
@@ -332,7 +332,14 @@ impl Handler for NeovimHandler {
 
                 self.do_step(DebuggerStepType::Continue, instance_id).await
             }
-            "next_output_window" => {
+            "output_window" => {
+                let args = args
+                    .get(0)
+                    .expect("launch args should be supplied")
+                    .as_array()
+                    .expect("launch args should be an array")
+                    .to_vec();
+
                 let instance_id: usize = args
                     .get(0)
                     .expect("instance_id should be supplied")
@@ -341,18 +348,13 @@ impl Handler for NeovimHandler {
                     .parse::<usize>()
                     .expect("instance_id is usize");
 
-                self.change_output_window(instance_id, true).await
-            }
-            "prev_output_window" => {
-                let instance_id: usize = args
-                    .get(0)
-                    .expect("instance_id should be supplied")
+                let type_: &str = args
+                    .get(1)
+                    .expect("type should be supplied")
                     .as_str()
-                    .expect("instance_id is string")
-                    .parse::<usize>()
-                    .expect("instance_id is usize");
+                    .expect("type is string");
 
-                self.change_output_window(instance_id, false).await
+                self.change_output_window(instance_id, type_).await
             }
             _ => unimplemented!(),
         }

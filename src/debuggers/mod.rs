@@ -67,7 +67,7 @@ pub trait DebuggerAPI: DynClone + Debug {
 
     async fn do_step(&self, step_type: DebuggerStepType) -> Result<()>;
 
-    async fn change_output_window(&self, ascending: bool) -> Result<()>;
+    async fn change_output_window(&self, type_: &str) -> Result<()>;
 
     async fn log_msg(&self, level: VadreLogLevel, msg: &str) -> Result<()>;
 }

@@ -181,11 +181,11 @@ impl DebuggerAPI for Debugger {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn change_output_window(&self, ascending: bool) -> Result<()> {
+    async fn change_output_window(&self, type_: &str) -> Result<()> {
         self.neovim_vadre_window
             .lock()
             .await
-            .change_output_window(ascending)
+            .change_output_window(type_)
             .await
     }
 

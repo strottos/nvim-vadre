@@ -58,8 +58,7 @@ function! s:configureCommands()
     command! -nargs=1 VadreStepIn call s:step_in(<f-args>)
     command! -nargs=1 VadreStepOver call s:step_over(<f-args>)
     command! -nargs=1 VadreContinue call s:continue(<f-args>)
-    command! -nargs=1 VadreNextOutputWindow call s:next_output_window(<f-args>)
-    command! -nargs=1 VadrePrevOutputWindow call s:prev_output_window(<f-args>)
+    command! -nargs=* VadreOutputWindow call s:output_window(<f-args>)
 endfunction
 
 function! s:ping()
@@ -86,12 +85,8 @@ function! s:continue(instance_id)
     call rpcrequest(s:vadreJobId, "continue", a:instance_id)
 endfunction
 
-function! s:next_output_window(instance_id)
-    call rpcrequest(s:vadreJobId, "next_output_window", a:instance_id)
-endfunction
-
-function! s:prev_output_window(instance_id)
-    call rpcrequest(s:vadreJobId, "prev_output_window", a:instance_id)
+function! s:output_window(...)
+    call rpcrequest(s:vadreJobId, "output_window", a:000)
 endfunction
 
 " TODO: Make these log to logs if available??
