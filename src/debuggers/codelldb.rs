@@ -507,7 +507,7 @@ impl Debugger {
                                         ProtocolMessageType::Response(response) => {
                                             // TODO: configurable timeout?
                                             if let Err(e) = timeout(
-                                                Duration::new(10, 0),
+                                                Duration::new(30, 0),
                                                 Debugger::handle_response(
                                                     response,
                                                     pending_outgoing_requests.clone(),
@@ -529,7 +529,7 @@ impl Debugger {
                                         ProtocolMessageType::Event(event) => {
                                             // TODO: configurable timeout?
                                             if let Err(e) = timeout(
-                                                Duration::new(10, 0),
+                                                Duration::new(30, 0),
                                                 Debugger::handle_event(
                                                     event,
                                                     neovim_vadre_window.clone(),
@@ -673,7 +673,7 @@ impl Debugger {
                 .await?;
         }
 
-        timeout(Duration::new(10, 0), config_done_rx).await??;
+        timeout(Duration::new(60, 0), config_done_rx).await??;
 
         dap_shared::do_send_request_and_await_response(
             RequestArguments::configurationDone(None),

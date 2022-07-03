@@ -331,6 +331,7 @@ impl Debugger {
         debugger_dir.push("build");
         debugger_dir.push("lib");
         debugger_dir.push("debugpy");
+        debugger_dir.push("adapter");
         let mut args = vec![
             debugger_dir.to_str().unwrap().to_string(),
             "--port".to_string(),

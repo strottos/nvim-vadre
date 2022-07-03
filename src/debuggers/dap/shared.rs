@@ -41,7 +41,7 @@ pub async fn do_send_request_and_await_response(
     do_send_request(request, debugger_sender_tx, Some(sender)).await?;
 
     // TODO: configurable timeout
-    let response = match timeout(Duration::new(10, 0), receiver).await {
+    let response = match timeout(Duration::new(30, 0), receiver).await {
         Ok(resp) => resp?,
         Err(e) => bail!("Timed out waiting for a response: {}", e),
     };
