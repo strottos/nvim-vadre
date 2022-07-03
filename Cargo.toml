@@ -11,6 +11,7 @@ async-trait = "0.1.53"
 bytes = "1.1.0"
 chrono = "0.4.19"
 dirs = "4.0.0"
+dunce = "1.0.2"
 dyn-clone = "1.0.5"
 futures = "0.3.21"
 is_executable = "1.0.1"
@@ -27,6 +28,3 @@ tracing = "0.1.34"
 tracing-subscriber = { version = "0.3.11", features = [ "env-filter" ] }
 which = "4.2.5"
 zip = "0.6.2"
-
-[target.'cfg(windows)'.dependencies]
-dunce = "1.0.2"
