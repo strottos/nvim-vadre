@@ -63,10 +63,12 @@ impl NeovimHandler {
         let mut debugger_type = None;
         let mut debugger_port = None;
         let mut process_vadre_args = true;
+        let mut get_env_var = true;
         let mut log_debugger = false;
 
         let mut command_args = vec![];
         let mut command = "".to_string();
+        let mut environment_variables = HashMap::new();
 
         for arg in args {
             if Some("--") == arg.as_str() {
@@ -82,6 +84,15 @@ impl NeovimHandler {
                 && arg_string.len() > 16
             {
                 debugger_port = Some(arg_string[16..].to_string());
+            } else if process_vadre_args && (arg_string.starts_with("-e") || arg_string == "--env")
+            {
+                get_env_var = true;
+            } else if get_env_var {
+                get_env_var = false;
+                let mut split = arg_string.split("=");
+                let key = split.next().unwrap();
+                let value = split.next().unwrap();
+                environment_variables.insert(key.to_string(), value.to_string());
             } else if process_vadre_args && arg_string.starts_with("--log-debugger") {
                 log_debugger = true;
             } else {
@@ -112,6 +123,7 @@ impl NeovimHandler {
             instance_id,
             command,
             command_args,
+            environment_variables,
             neovim,
             debugger_type,
             log_debugger,

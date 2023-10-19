@@ -3,8 +3,6 @@ name = "nvim-vadre"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
 anyhow = "*"
 async-trait = "*"
@@ -29,3 +27,13 @@ tracing = "*"
 tracing-subscriber = { version = "*", features = [ "env-filter" ] }
 which = "*"
 zip = "*"
+
+[dev-dependencies]
+assert_fs     = "*"
+escargot      = "*"
+function_name = "*"
+hamcrest2     = "*"
+rmp           = "*"
+rmpv          = "*"
+serde         = "*"
+serde_derive  = "*"

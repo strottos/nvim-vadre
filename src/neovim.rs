@@ -825,60 +825,47 @@ pub async fn setup_signs(neovim: &Neovim<Compat<Stdout>>) -> Result<()> {
 
     if guibg != "" && ctermbg != "" {
         neovim
-            .exec(
-                &format!(
-                    "highlight VadreBreakpointHighlight \
+            .command(&format!(
+                "highlight VadreBreakpointHighlight \
                      guifg=#ff0000 guibg={} ctermfg=red ctermbg={}",
-                    guibg, ctermbg
-                ),
-                false,
-            )
+                guibg, ctermbg
+            ))
             .await?;
         neovim
-            .exec(
-                &format!(
-                    "highlight VadreDebugPointerHighlight \
+            .command(&format!(
+                "highlight VadreDebugPointerHighlight \
                      guifg=#00ff00 guibg={} ctermfg=green ctermbg={}",
-                    guibg, ctermbg
-                ),
-                false,
-            )
+                guibg, ctermbg
+            ))
             .await?;
     } else {
         neovim
-            .exec(
-                "highlight VadreBreakpointHighlight guifg=#ff0000 ctermfg=red",
-                false,
-            )
+            .command("highlight VadreBreakpointHighlight guifg=#ff0000 ctermfg=red")
             .await?;
         neovim
-            .exec(
-                "highlight VadreDebugPointerHighlight guifg=#00ff00 ctermfg=green",
-                false,
-            )
+            .command("highlight VadreDebugPointerHighlight guifg=#00ff00 ctermfg=green")
             .await?;
     }
 
     neovim
-        .exec(
-            "sign define VadreBreakpoint text=() texthl=VadreBreakpointHighlight",
-            false,
-        )
+        .command("sign define VadreBreakpoint text=() texthl=VadreBreakpointHighlight")
         .await?;
     neovim
-        .exec(
-            "sign define VadreDebugPointer text=-> texthl=VadreDebugPointerHighlight",
-            false,
-        )
+        .command("sign define VadreDebugPointer text=-> texthl=VadreDebugPointerHighlight")
         .await?;
 
     Ok(())
 }
 
 pub async fn add_breakpoint_sign(neovim: &Neovim<Compat<Stdout>>, line_number: i64) -> Result<()> {
-    let buffer_number = neovim.get_current_buf().await?.get_number().await?;
+    tracing::trace!("HERE1");
+    let buffer_number_output = neovim.exec(&format!("echo bufnr()"), true).await?;
+    tracing::trace!("HERE2");
+    let buffer_number = buffer_number_output.trim();
+    tracing::trace!("HERE3 {}", buffer_number);
     let pointer_sign_id = VADRE_NEXT_SIGN_ID.fetch_add(1, Ordering::SeqCst);
 
+    tracing::trace!("HERE4");
     neovim
         .exec(
             &format!(
@@ -888,6 +875,7 @@ pub async fn add_breakpoint_sign(neovim: &Neovim<Compat<Stdout>>, line_number: i
             false,
         )
         .await?;
+    tracing::trace!("HERE5");
 
     Ok(())
 }
@@ -921,10 +909,10 @@ pub async fn remove_breakpoint_sign(
     tracing::trace!("breakpoint_id: {:?}", breakpoint_id);
 
     neovim
-        .exec(
-            &format!("sign unplace {} file={}", breakpoint_id, file_name),
-            false,
-        )
+        .command(&format!(
+            "sign unplace {} file={}",
+            breakpoint_id, file_name
+        ))
         .await?;
 
     Ok(())

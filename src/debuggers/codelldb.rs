@@ -56,6 +56,7 @@ pub struct Debugger {
     id: usize,
     command: String,
     command_args: Vec<String>,
+    environment_variables: HashMap<String, String>,
     pub neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
     process: Arc<Mutex<Option<Child>>>,
 
@@ -251,6 +252,7 @@ impl Debugger {
         id: usize,
         command: String,
         command_args: Vec<String>,
+        environment_variables: HashMap<String, String>,
         neovim: Neovim<Compat<Stdout>>,
         _log_debugger: bool,
     ) -> Self {
@@ -260,6 +262,7 @@ impl Debugger {
             id,
             command,
             command_args,
+            environment_variables,
             neovim_vadre_window: Arc::new(Mutex::new(NeovimVadreWindow::new(neovim, id))),
             process: Arc::new(Mutex::new(None)),
 
@@ -661,7 +664,7 @@ impl Debugger {
                 "args": &self.command_args,
                 "cargo": {},
                 "cwd": env::current_dir()?,
-                "env": {},
+                "env": &self.environment_variables,
                 "name": "lldb",
                 "terminal": "integrated",
                 "type": "lldb",
