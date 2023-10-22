@@ -63,7 +63,7 @@ impl NeovimHandler {
         let mut debugger_type = None;
         let mut debugger_port = None;
         let mut process_vadre_args = true;
-        let mut get_env_var = true;
+        let mut get_env_var = false;
         let mut log_debugger = false;
 
         let mut command_args = vec![];
