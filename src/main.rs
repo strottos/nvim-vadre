@@ -21,7 +21,6 @@ use std::{
     },
 };
 
-use anyhow::Result;
 use async_trait::async_trait;
 use debuggers::DebuggerStepType;
 use nvim_rs::{compat::tokio::Compat, create::tokio as create, Handler, Neovim, Value};
@@ -76,7 +75,7 @@ impl NeovimHandler {
                 continue;
             }
 
-            let arg_string = arg.as_str().unwrap().to_string();
+            let arg_string = arg.as_str().ok_or("Argument must be a string")?.to_string();
             if process_vadre_args && arg_string.starts_with("-t=") && arg_string.len() > 3 {
                 debugger_type = Some(arg_string[3..].to_string());
             } else if process_vadre_args
@@ -90,8 +89,12 @@ impl NeovimHandler {
             } else if get_env_var {
                 get_env_var = false;
                 let mut split = arg_string.split("=");
-                let key = split.next().unwrap();
-                let value = split.next().unwrap();
+                let key = split
+                    .next()
+                    .ok_or("Key not found for environment variable")?;
+                let value = split
+                    .next()
+                    .ok_or("Key not found for environment variable")?;
                 environment_variables.insert(key.to_string(), value.to_string());
             } else if process_vadre_args && arg_string.starts_with("--log-debugger") {
                 log_debugger = true;
@@ -132,14 +135,14 @@ impl NeovimHandler {
             Err(e) => return Err(format!("Can't setup debugger: {}", e).into()),
         };
 
-        let debugger_clone = debugger.clone();
-
-        self.debuggers.lock().await.insert(instance_id, debugger);
+        self.debuggers
+            .lock()
+            .await
+            .insert(instance_id, debugger.clone());
 
         let pending_breakpoints = self.breakpoints.lock().await.clone();
 
         tokio::spawn(async move {
-            let debugger = debugger_clone.clone();
             let mut debugger_lock = debugger.lock().await;
             if let Err(e) = debugger_lock
                 .setup(&pending_breakpoints, debugger_port)
@@ -148,9 +151,9 @@ impl NeovimHandler {
                 let log_msg = format!("Can't setup debugger: {}", e);
                 debugger_lock
                     .log_msg(VadreLogLevel::CRITICAL, &log_msg)
-                    .await
-                    .unwrap();
+                    .await?;
             }
+            Ok::<(), anyhow::Error>(())
         });
 
         Ok("process launched".into())
@@ -161,18 +164,18 @@ impl NeovimHandler {
         let cursor_position = neovim
             .get_current_win()
             .await
-            .expect("could get current window")
+            .map_err(|e| format!("Couldn't get current window: {e}"))?
             .get_cursor()
             .await
-            .expect("could get current cursor position");
+            .map_err(|e| format!("Couldn't get current cursor position: {e}"))?;
 
         let file_path = neovim
             .get_current_buf()
             .await
-            .expect("could get current buffer")
+            .map_err(|e| format!("Couldn't get current buffer: {e}"))?
             .get_name()
             .await
-            .expect("could get current cursor position");
+            .map_err(|e| format!("Couldn't get current cursor position: {e}"))?;
 
         let line_number = cursor_position.0;
         let file_path = match dunce::canonicalize(Path::new(&file_path)) {
@@ -188,7 +191,10 @@ impl NeovimHandler {
             );
         }
 
-        let file_path = file_path.to_str().unwrap().to_string();
+        let file_path = file_path
+            .to_str()
+            .ok_or_else(|| format!("Couldn't get file path as string: {:?}", file_path))?
+            .to_string();
 
         let line_numbers;
         let mut adding_breakpoint = true;
@@ -212,7 +218,10 @@ impl NeovimHandler {
                     breakpoints_lock.insert(file_path.clone(), line_numbers);
                 }
             };
-            line_numbers = breakpoints_lock.get(&file_path).unwrap().clone();
+            line_numbers = breakpoints_lock
+                .get(&file_path)
+                .ok_or_else(|| "Couldn't get breakpoint line numbers")?
+                .clone();
         }
 
         tracing::trace!("Breakpoints: {:?} {:?}", file_path, line_numbers);
@@ -225,18 +234,18 @@ impl NeovimHandler {
                 .await
                 .set_source_breakpoints(file_path.clone(), &line_numbers)
                 .await
-                .expect("could set breakpoints");
+                .map_err(|e| format!("Couldn't set breakpoints: {e}"))?;
         }
 
         Ok((if adding_breakpoint {
             crate::neovim::add_breakpoint_sign(&neovim, line_number)
                 .await
-                .expect("breakpoint sign should place");
+                .map_err(|e| format!("Breakpoint sign didn't place: {e}"))?;
             "breakpoint set"
         } else {
             crate::neovim::remove_breakpoint_sign(&neovim, file_path, line_number)
                 .await
-                .expect("breakpoint sign should place");
+                .map_err(|e| format!("Breakpoint sign didn't place: {e}"))?;
             "breakpoint removed"
         })
         .into())
@@ -250,14 +259,14 @@ impl NeovimHandler {
     ) -> VadreResult {
         let debuggers = self.debuggers.lock().await;
 
-        let debugger = debuggers.get(&instance_id).expect("debugger should exist");
+        let debugger = debuggers.get(&instance_id).ok_or("Debugger didn't exist")?;
 
         debugger
             .lock()
             .await
             .do_step(step_type, count)
             .await
-            .expect("Could do code step");
+            .map_err(|e| format!("Couldn't do code step: {e}"))?;
 
         Ok("".into())
     }
@@ -265,14 +274,14 @@ impl NeovimHandler {
     async fn change_output_window(&self, instance_id: usize, type_: &str) -> VadreResult {
         let debuggers = self.debuggers.lock().await;
 
-        let debugger = debuggers.get(&instance_id).expect("debugger should exist");
+        let debugger = debuggers.get(&instance_id).ok_or("Debugger didn't exist")?;
 
         debugger
             .lock()
             .await
             .change_output_window(type_)
             .await
-            .expect("Could print variable");
+            .map_err(|e| format!("Couldn't print variable: {e}"))?;
 
         Ok("".into())
     }
@@ -300,9 +309,9 @@ impl Handler for NeovimHandler {
                 self.launch(
                     instance_id,
                     args.get(0)
-                        .expect("launch args should be supplied")
+                        .ok_or("Launch args must be supplied")?
                         .as_array()
-                        .expect("launch args should be an array")
+                        .ok_or("Launch args must be an array")?
                         .to_vec(),
                     neovim,
                 )
@@ -313,22 +322,22 @@ impl Handler for NeovimHandler {
                 tracing::trace!("Args: {:?}", args);
                 let args = args
                     .get(0)
-                    .expect("step args should be supplied")
+                    .ok_or("Step args must be supplied")?
                     .as_array()
-                    .expect("step args should be an array")
+                    .ok_or("Step args must be an array")?
                     .to_vec();
                 tracing::trace!("Args: {:?}", args);
                 let instance_id: usize = args
                     .get(0)
-                    .expect("instance_id should be supplied")
+                    .ok_or("Instance id must be supplied")?
                     .as_str()
-                    .expect("instance_id is string")
+                    .ok_or("Instance id must be a string")?
                     .replace("\"", "")
                     .parse::<usize>()
-                    .expect("instance_id is usize");
+                    .map_err(|e| format!("Instance id must be usize: {e}"))?;
 
                 let count = match args.get(1) {
-                    Some(x) => x.as_u64().expect("count is u64"),
+                    Some(x) => x.as_u64().ok_or("Count must be u64")?,
                     None => 1,
                 };
 
@@ -338,22 +347,22 @@ impl Handler for NeovimHandler {
                 tracing::trace!("Args: {:?}", args);
                 let args = args
                     .get(0)
-                    .expect("step args should be supplied")
+                    .ok_or("Step args must be supplied")?
                     .as_array()
-                    .expect("step args should be an array")
+                    .ok_or("Step args must be an array")?
                     .to_vec();
                 tracing::trace!("Args: {:?}", args);
                 let instance_id: usize = args
                     .get(0)
-                    .expect("instance_id should be supplied")
+                    .ok_or("Instance id must be supplied")?
                     .as_str()
-                    .expect("instance_id is string")
+                    .ok_or("Instance id must be a string")?
                     .replace("\"", "")
                     .parse::<usize>()
-                    .expect("instance_id is usize");
+                    .map_err(|e| format!("Instance id is usize: {e}"))?;
 
                 let count = match args.get(1) {
-                    Some(x) => x.as_u64().expect("count is u64"),
+                    Some(x) => x.as_u64().ok_or("Count is u64")?,
                     None => 1,
                 };
 
@@ -363,11 +372,11 @@ impl Handler for NeovimHandler {
             "continue" => {
                 let instance_id: usize = args
                     .get(0)
-                    .expect("instance_id should be supplied")
+                    .ok_or("Instance id must be supplied")?
                     .as_str()
-                    .expect("instance_id is string")
+                    .ok_or("Instance id must be a string")?
                     .parse::<usize>()
-                    .expect("instance_id is usize");
+                    .map_err(|e| format!("Instance id is usize: {e}"))?;
 
                 self.do_step(DebuggerStepType::Continue, instance_id, 1)
                     .await
@@ -375,24 +384,24 @@ impl Handler for NeovimHandler {
             "output_window" => {
                 let args = args
                     .get(0)
-                    .expect("launch args should be supplied")
+                    .ok_or("Launch args must be supplied")?
                     .as_array()
-                    .expect("launch args should be an array")
+                    .ok_or("Launch args must be an array")?
                     .to_vec();
 
                 let instance_id: usize = args
                     .get(0)
-                    .expect("instance_id should be supplied")
+                    .ok_or("Instance id must be supplied")?
                     .as_str()
-                    .expect("instance_id is string")
+                    .ok_or("Instance id must be a string")?
                     .parse::<usize>()
-                    .expect("instance_id is usize");
+                    .map_err(|e| format!("Instance id is usize: {e}"))?;
 
                 let type_: &str = args
                     .get(1)
-                    .expect("type should be supplied")
+                    .ok_or("Type must be supplied")?
                     .as_str()
-                    .expect("type is string");
+                    .ok_or("Type must be a string")?;
 
                 self.change_output_window(instance_id, type_).await
             }
@@ -403,7 +412,7 @@ impl Handler for NeovimHandler {
 
 #[tokio::main]
 #[tracing::instrument]
-async fn main() -> Result<()> {
+async fn main() -> anyhow::Result<()> {
     logger::setup_logging(
         env::var("VADRE_LOG_FILE").ok().as_deref(),
         env::var("VADRE_LOG").ok().as_deref(),

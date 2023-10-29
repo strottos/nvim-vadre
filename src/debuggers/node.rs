@@ -115,7 +115,7 @@ impl DebuggerAPI for Debugger {
         let ws_url = match existing_debugger_location {
             Some(ws_url) => ws_url,
             None => {
-                let port = get_unused_localhost_port();
+                let port = get_unused_localhost_port()?;
 
                 match self.launch(port).await {
                     Ok(ws_url) => ws_url,

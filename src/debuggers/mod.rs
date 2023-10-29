@@ -2,6 +2,7 @@ mod codelldb;
 mod dap;
 mod debugpy;
 mod dotnet;
+mod generic;
 mod go_delve;
 mod node;
 

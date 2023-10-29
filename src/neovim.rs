@@ -6,7 +6,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use nvim_rs::{compat::tokio::Compat, Buffer, Neovim, Value, Window};
 use tokio::io::Stdout;
 
@@ -151,12 +151,12 @@ impl VadreBufferType {
     fn get_output_buffer(
         current_buf_name: &str,
         type_: VadreOutputBufferSelector,
-    ) -> VadreBufferType {
+    ) -> Result<VadreBufferType> {
         let mut split = current_buf_name.rsplit(" - ");
         let output_buffer_type = split
             .next()
-            .expect("should be able to retrieve output buffer type");
-        let output_buffer_type = VadreBufferType::get_buffer_type_from_str(output_buffer_type);
+            .ok_or_else(|| anyhow!("Can't retrieve output buffer type"))?;
+        let output_buffer_type = VadreBufferType::get_buffer_type_from_str(&output_buffer_type);
 
         let buffer_order = vec![
             VadreBufferType::Logs,
@@ -168,7 +168,7 @@ impl VadreBufferType {
         let mut index = buffer_order
             .iter()
             .position(|r| *r == output_buffer_type)
-            .unwrap();
+            .ok_or_else(|| anyhow!("Can't find buffer for {output_buffer_type:?}"))?;
 
         match type_ {
             VadreOutputBufferSelector::Next => index += 1,
@@ -185,7 +185,10 @@ impl VadreBufferType {
         };
         let index: usize = index % buffer_order.len();
 
-        buffer_order.get(index).unwrap().clone()
+        Ok(buffer_order
+            .get(index)
+            .ok_or_else(|| anyhow!("Can't find next buffer for {output_buffer_type:?}"))?
+            .clone())
     }
 
     fn get_buffer_type_from_str(s: &str) -> VadreBufferType {
@@ -218,16 +221,21 @@ enum VadreOutputBufferSelector {
 }
 
 impl VadreOutputBufferSelector {
-    fn get_type(type_: &str) -> Self {
+    fn get_type(type_: &str) -> Result<Self> {
         tracing::trace!("Type: {}", type_);
-        match type_.to_lowercase().chars().nth(0).unwrap() {
-            'n' => Self::Next,
-            'p' => Self::Previous,
-            'l' => Self::Logs,
-            's' => Self::CallStack,
-            'v' => Self::Variables,
-            'b' => Self::Breakpoints,
-            _ => panic!("Can't understand type {}", type_),
+        match type_
+            .to_lowercase()
+            .chars()
+            .nth(0)
+            .ok_or_else(|| anyhow!("Empty type"))?
+        {
+            'n' => Ok(Self::Next),
+            'p' => Ok(Self::Previous),
+            'l' => Ok(Self::Logs),
+            's' => Ok(Self::CallStack),
+            'v' => Ok(Self::Variables),
+            'b' => Ok(Self::Breakpoints),
+            _ => Err(anyhow!("Can't understand type {}", type_)),
         }
     }
 }
@@ -291,7 +299,7 @@ impl NeovimVadreWindow {
         self.neovim.command("new").await?;
         let mut windows = current_tabpage.list_wins().await?.into_iter();
         assert_eq!(2, windows.len());
-        let window = windows.next().unwrap();
+        let window = windows.next().ok_or_else(|| anyhow!("No code window"))?;
         self.neovim.set_current_win(&window).await?;
 
         self.neovim.command("vnew").await?;
@@ -299,7 +307,7 @@ impl NeovimVadreWindow {
         assert_eq!(3, windows.len());
 
         // Window 1 is Code
-        let window = windows.next().unwrap();
+        let window = windows.next().ok_or_else(|| anyhow!("No code window"))?;
         let buffer = window.get_buf().await?;
         self.neovim.set_current_win(&window).await?;
         self.set_vadre_buffer_options(&buffer, &VadreBufferType::Code)
@@ -310,7 +318,7 @@ impl NeovimVadreWindow {
         self.buffers.insert(VadreBufferType::Code, buffer);
 
         // Window 2 is Output stuff, logs at the moment
-        let window = windows.next().unwrap();
+        let window = windows.next().ok_or_else(|| anyhow!("No output window"))?;
         window.set_option("wrap", true.into()).await?;
         let log_buffer = window.get_buf().await?;
         self.set_vadre_buffer_options(&log_buffer, &VadreBufferType::Logs)
@@ -320,8 +328,10 @@ impl NeovimVadreWindow {
         self.windows.insert(VadreWindowType::Output, window);
         self.buffers.insert(VadreBufferType::Logs, log_buffer);
 
-        // Window 3 is Output stuff, logs at the moment
-        let window = windows.next().unwrap();
+        // Window 3 is Terminal
+        let window = windows
+            .next()
+            .ok_or_else(|| anyhow!("No terminal window"))?;
         let terminal_buffer = window.get_buf().await?;
         self.set_vadre_buffer_options(&terminal_buffer, &VadreBufferType::Terminal)
             .await?;
@@ -361,7 +371,11 @@ impl NeovimVadreWindow {
         let set_level = match self.neovim.get_var("vadre_log_level").await {
             Ok(x) => match x {
                 Value::Integer(x) => x.to_string(),
-                Value::String(x) => x.as_str().clone().unwrap().to_string(),
+                Value::String(x) => x
+                    .as_str()
+                    .clone()
+                    .ok_or_else(|| anyhow!("Can't convert variable g:vadre_log_level to string"))?
+                    .to_string(),
                 _ => "INFO".to_string(),
             },
             Err(_) => "INFO".to_string(),
@@ -374,11 +388,11 @@ impl NeovimVadreWindow {
         let buffer = self
             .buffers
             .get(&VadreBufferType::Logs)
-            .expect("Logs buffer not found, have you setup the UI?");
+            .ok_or_else(|| anyhow!("Logs buffer not found, have you setup the UI?"))?;
         let window = self
             .windows
             .get(&VadreWindowType::Output)
-            .expect("Logs window not found, have you setup the UI?");
+            .ok_or_else(|| anyhow!("Logs window not found, have you setup the UI?"))?;
 
         let now = chrono::offset::Local::now();
 
@@ -410,7 +424,10 @@ impl NeovimVadreWindow {
     ) -> Result<()> {
         let original_window = self.neovim.get_current_win().await?;
 
-        let terminal_window = self.windows.get(&VadreWindowType::Program).unwrap();
+        let terminal_window = self
+            .windows
+            .get(&VadreWindowType::Program)
+            .ok_or_else(|| anyhow!("Can't find terminal window"))?;
         self.neovim.set_current_win(&terminal_window).await?;
 
         tracing::debug!("Running terminal command {}", command);
@@ -446,7 +463,10 @@ impl NeovimVadreWindow {
     ) -> Result<()> {
         tracing::trace!("Opening in code buffer: {:?}", content);
 
-        let code_buffer = self.buffers.get(&VadreBufferType::Code).unwrap();
+        let code_buffer = self
+            .buffers
+            .get(&VadreBufferType::Code)
+            .ok_or_else(|| anyhow!("Can't find code window"))?;
 
         let old_buffer_name = code_buffer.get_name().await?;
         let buffer_name = self.get_buffer_name(&VadreBufferType::Code, Some(buffer_name));
@@ -462,7 +482,10 @@ impl NeovimVadreWindow {
                         bail!("Source path {:?} doesn't exist", path_name);
                     }
 
-                    if let Some(file_type) = path.extension().map(|x| x.to_str().unwrap()) {
+                    if let Some(file_type) = path.extension() {
+                        let file_type = file_type.to_str().ok_or_else(|| {
+                            anyhow!("Can't convert file type to string from {:?}", file_type)
+                        })?;
                         match VIM_FILE_TYPES.get(&file_type) {
                             Some(file_type) => {
                                 self.set_file_type(file_type).await?;
@@ -512,7 +535,10 @@ impl NeovimVadreWindow {
             )
             .await?;
 
-        let code_window = self.windows.get(&VadreWindowType::Code).unwrap();
+        let code_window = self
+            .windows
+            .get(&VadreWindowType::Code)
+            .ok_or_else(|| anyhow!("Can't find Code window"))?;
         code_window.set_cursor((line_number, 0)).await?;
 
         Ok(())
@@ -530,7 +556,7 @@ impl NeovimVadreWindow {
         let buffer = self
             .buffers
             .get(&VadreBufferType::CallStack)
-            .expect("call stack output buffer exists");
+            .ok_or_else(|| anyhow!("call stack output buffer exists"))?;
         self.write_to_buffer(buffer, 0, 0, content).await?;
 
         Ok(())
@@ -540,7 +566,7 @@ impl NeovimVadreWindow {
         let buffer = self
             .buffers
             .get(&VadreBufferType::Variables)
-            .expect("variables output buffer exists");
+            .ok_or_else(|| anyhow!("variables output buffer exists"))?;
         self.write_to_buffer(buffer, 0, 0, content).await?;
 
         Ok(())
@@ -554,7 +580,7 @@ impl NeovimVadreWindow {
         let buffer = self
             .buffers
             .get(&VadreBufferType::Breakpoints)
-            .expect("breakpoints output buffer exists");
+            .ok_or_else(|| anyhow!("breakpoints output buffer exists"))?;
 
         let mut line_count = buffer.line_count().await?;
         let mut current_contents = buffer.get_lines(0, line_count, false).await?;
@@ -567,16 +593,16 @@ impl NeovimVadreWindow {
                 );
             }
             let breakpoint_info = format!("{}:{}", file_path, breakpoint.line_number);
-            let resolved_to_info = if breakpoint.actual_line_number.is_some()
-                && breakpoint.line_number != breakpoint.actual_line_number.unwrap()
-            {
-                format!(
-                    " (resolved to line {})",
-                    breakpoint.actual_line_number.unwrap()
-                )
-            } else {
-                "".to_string()
-            };
+            let resolved_to_info =
+                if let Some(breakpoint_line_number) = breakpoint.actual_line_number {
+                    if breakpoint.line_number != breakpoint_line_number {
+                        format!(" (resolved to line {})", breakpoint_line_number)
+                    } else {
+                        "".to_string()
+                    }
+                } else {
+                    "".to_string()
+                };
             let line = format!(
                 "({}) {}{}",
                 if breakpoint.enabled { "*" } else { " " },
@@ -604,32 +630,32 @@ impl NeovimVadreWindow {
         let output_window = self
             .windows
             .get(&VadreWindowType::Output)
-            .expect("can get output window");
+            .ok_or_else(|| anyhow!("can get output window"))?;
         let output_buffer_name = &output_window.get_buf().await?.get_name().await?;
         let mut split = output_buffer_name.rsplit(" - ");
         let output_buffer_type = split
             .next()
-            .expect("should be able to retrieve output buffer type");
+            .ok_or_else(|| anyhow!("should be able to retrieve output buffer type"))?;
         let output_buffer_type = VadreBufferType::get_buffer_type_from_str(output_buffer_type);
 
         Ok(output_buffer_type)
     }
 
     pub async fn change_output_window(&self, type_: &str) -> Result<()> {
-        let type_ = VadreOutputBufferSelector::get_type(type_);
+        let type_ = VadreOutputBufferSelector::get_type(type_)?;
 
         let output_window = self
             .windows
             .get(&VadreWindowType::Output)
-            .expect("can get output window");
+            .ok_or_else(|| anyhow!("can get output window"))?;
         let new_buffer_type = VadreBufferType::get_output_buffer(
             &output_window.get_buf().await?.get_name().await?,
             type_,
-        );
+        )?;
         let new_buffer = self
             .buffers
             .get(&new_buffer_type)
-            .expect("can retrieve next buffer");
+            .ok_or_else(|| anyhow!("can retrieve next buffer"))?;
         output_window.set_buf(new_buffer).await?;
         output_window
             .set_option("wrap", new_buffer_type.buffer_should_wrap().into())
@@ -650,7 +676,14 @@ impl NeovimVadreWindow {
             end_line = line_count;
         }
         buffer.set_option("modifiable", true.into()).await?;
-        if line_count == 1 && buffer.get_lines(0, 1, true).await?.get(0).unwrap() == "" {
+        if line_count == 1
+            && buffer
+                .get_lines(0, 1, true)
+                .await?
+                .get(0)
+                .ok_or_else(|| anyhow!("Couldn't get first line"))?
+                == ""
+        {
             buffer.set_lines(0, 1, false, msgs).await?;
         } else {
             buffer.set_lines(start_line, end_line, false, msgs).await?;
@@ -665,7 +698,11 @@ impl NeovimVadreWindow {
         let current_buf = self.neovim.get_current_buf().await?;
         let current_tabpage = self.neovim.get_current_tabpage().await?;
 
-        let modified = current_buf.get_option("modified").await?.as_bool().unwrap();
+        let modified = current_buf
+            .get_option("modified")
+            .await?
+            .as_bool()
+            .ok_or_else(|| anyhow!("Buffer variable modified wasn't a boolean?"))?;
         let line_count = current_buf.line_count().await?;
         let lines = current_buf.get_lines(0, 1, true).await?;
 
@@ -677,7 +714,10 @@ impl NeovimVadreWindow {
             || buffer_name != ""
             || modified
             || line_count > 1
-            || lines.get(0).unwrap() != ""
+            || lines
+                .get(0)
+                .ok_or_else(|| anyhow!("Couldn't get first line: {lines:?}"))?
+                != ""
         {
             self.neovim.command("tab new").await?;
             tracing::trace!("setup a new empty tab");
@@ -815,7 +855,11 @@ pub async fn setup_signs(neovim: &Neovim<Compat<Stdout>>) -> Result<()> {
     let mut ctermbg = "";
     let mut guibg = "";
 
-    for snippet in sign_background_colour_output.get(0).unwrap().split(" ") {
+    for snippet in sign_background_colour_output
+        .get(0)
+        .ok_or_else(|| anyhow!("Couldn't find any background colour output"))?
+        .split(" ")
+    {
         if snippet.len() >= 8 && &snippet[0..8] == "ctermbg=" {
             ctermbg = &snippet[8..];
         } else if snippet.len() >= 6 && &snippet[0..6] == "guibg=" {
@@ -898,11 +942,15 @@ pub async fn remove_breakpoint_sign(
 
     assert_eq!(signs_in_file_on_line.len(), 1);
 
-    let signs_in_file_on_line = signs_in_file_on_line.get(0).unwrap();
+    let signs_in_file_on_line = signs_in_file_on_line
+        .get(0)
+        .ok_or_else(|| anyhow!("Couldn't find existing Vadre breakpoints"))?;
     let mut breakpoint_id = 0;
     for snippet in signs_in_file_on_line.split(" ") {
         if snippet.len() >= 3 && &snippet[0..3] == "id=" {
-            breakpoint_id = snippet[3..].parse::<u64>().expect("id is a u64");
+            breakpoint_id = snippet[3..]
+                .parse::<u64>()
+                .map_err(|e| anyhow!("id is a u64: {e}"))?;
         }
     }
 

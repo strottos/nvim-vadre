@@ -100,7 +100,7 @@ impl DebuggerAPI for Debugger {
         let port = match existing_debugger_port {
             Some(port) => port.parse::<u16>().expect("debugger port is u16"),
             None => {
-                let port = get_unused_localhost_port();
+                let port = get_unused_localhost_port()?;
 
                 log_ret_err!(
                     self.launch(port).await,
@@ -1018,6 +1018,8 @@ impl Debugger {
                         .expect("Can log to Vadre");
                 }
             }
+
+            Ok::<(), anyhow::Error>(())
         });
 
         Ok(())

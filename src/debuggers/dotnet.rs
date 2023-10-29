@@ -934,6 +934,8 @@ impl Debugger {
                         .expect("Can log to Vadre");
                 }
             }
+
+            Ok::<(), anyhow::Error>(())
         });
 
         Ok(())
@@ -960,6 +962,8 @@ impl Debugger {
                 neovim_vadre_window,
                 "can get process info"
             );
+
+            Ok::<(), anyhow::Error>(())
         });
 
         Ok(())

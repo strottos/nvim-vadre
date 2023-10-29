@@ -34,7 +34,7 @@ use crate::{
     },
 };
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use futures::{prelude::*, StreamExt};
 use nvim_rs::{compat::tokio::Compat, Neovim};
@@ -97,9 +97,9 @@ impl DebuggerAPI for Debugger {
         );
 
         let port = match existing_debugger_port {
-            Some(port) => port.parse::<u16>().expect("debugger port is u16"),
+            Some(port) => port.parse::<u16>()?,
             None => {
-                let port = get_unused_localhost_port();
+                let port = get_unused_localhost_port()?;
 
                 log_ret_err!(
                     self.launch(port).await,
@@ -268,9 +268,9 @@ impl Debugger {
 
         let file_name = Path::new(&file_path)
             .file_name()
-            .unwrap()
+            .ok_or_else(|| anyhow!("Can't get file path for: {file_path:?}"))?
             .to_str()
-            .unwrap()
+            .ok_or_else(|| anyhow!("Can't convert file path to string: {file_path:?}"))?
             .to_string();
 
         let line_numbers = line_numbers.into_iter().map(|x| *x).collect::<Vec<i64>>();
@@ -991,6 +991,8 @@ impl Debugger {
                         .expect("Can log to Vadre");
                 }
             }
+
+            Ok::<(), anyhow::Error>(())
         });
 
         Ok(())
@@ -1017,6 +1019,8 @@ impl Debugger {
                 neovim_vadre_window,
                 "can get process info"
             );
+
+            Ok::<(), anyhow::Error>(())
         });
 
         Ok(())

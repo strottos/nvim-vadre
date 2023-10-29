@@ -34,8 +34,7 @@ macro_rules! log_err {
                 .lock()
                 .await
                 .log_msg(VadreLogLevel::ERROR, &msg)
-                .await
-                .expect("logs should be logged");
+                .await?;
         }
     };
     ($e:expr, $logger:expr, $msg:expr) => {
@@ -46,8 +45,7 @@ macro_rules! log_err {
                 .lock()
                 .await
                 .log_msg(VadreLogLevel::ERROR, &msg)
-                .await
-                .expect("logs should be logged");
+                .await?;
         }
     };
 }
@@ -99,9 +97,9 @@ pub fn get_debuggers_dir() -> Result<PathBuf> {
 
 /// Get an unused port on the local system and return it. This port
 /// can subsequently be used.
-pub fn get_unused_localhost_port() -> u16 {
-    let listener = TcpListener::bind(format!("127.0.0.1:0")).unwrap();
-    listener.local_addr().unwrap().port()
+pub fn get_unused_localhost_port() -> Result<u16> {
+    let listener = TcpListener::bind(format!("127.0.0.1:0"))?;
+    Ok(listener.local_addr()?.port())
 }
 
 /// Translate the current machines os and arch to that required for downloading debugger adapters
