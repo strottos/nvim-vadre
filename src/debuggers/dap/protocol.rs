@@ -275,7 +275,7 @@ mod tests {
         assert_matches!(
             request,
             ProtocolMessage {
-                seq: 1,
+                seq: Either::First(1),
                 type_: ProtocolMessageType::Request(RequestArguments::initialize(..))
             }
         );
@@ -284,7 +284,7 @@ mod tests {
         assert_matches!(
             response,
             ProtocolMessage {
-                seq: 2,
+                seq: Either::First(2),
                 type_: ProtocolMessageType::Response(Response {
                     result: ResponseResult::Success {
                         body: ResponseBody::initialize(..)
@@ -311,7 +311,7 @@ mod tests {
         assert_matches!(
             request,
             ProtocolMessage {
-                seq: 2,
+                seq: Either::First(2),
                 type_: ProtocolMessageType::Request(RequestArguments::launch(..))
             }
         );
@@ -321,10 +321,10 @@ mod tests {
         assert_matches!(
             response,
             ProtocolMessage {
-                seq: 3,
+                seq: Either::First(3),
                 type_: ProtocolMessageType::Response(Response {
                     result: ResponseResult::Success {
-                        body: ResponseBody::launch,
+                        body: ResponseBody::launch(..),
                     },
                     ..
                 })
@@ -338,8 +338,8 @@ mod tests {
         assert_matches!(
             event,
             ProtocolMessage {
-                seq: 0,
-                type_: ProtocolMessageType::Event(EventBody::initialized)
+                seq: Either::First(0),
+                type_: ProtocolMessageType::Event(EventBody::initialized(..))
             }
         );
 
@@ -347,7 +347,7 @@ mod tests {
         assert_matches!(
             event,
             ProtocolMessage {
-                seq: 0,
+                seq: Either::First(0),
                 type_: ProtocolMessageType::Event(EventBody::thread(..))
             }
         );
@@ -361,7 +361,7 @@ mod tests {
         assert_matches!(
             request,
             ProtocolMessage {
-                seq: 12,
+                seq: Either::First(12),
                 type_: ProtocolMessageType::Request(RequestArguments::scopes(..)),
             }
         );
@@ -370,9 +370,9 @@ mod tests {
         assert_matches!(
             response,
             ProtocolMessage {
-                seq: 34,
+                seq: Either::First(34),
                 type_: ProtocolMessageType::Response(Response {
-                    request_seq: 12,
+                    request_seq: Either::First(12),
                     success: true,
                     result: ResponseResult::Success {
                         body: ResponseBody::scopes(..),
@@ -390,7 +390,7 @@ mod tests {
         assert_matches!(
             request,
             ProtocolMessage {
-                seq: 12,
+                seq: Either::First(12),
                 type_: ProtocolMessageType::Request(RequestArguments::configurationDone(None)),
             }
         );
@@ -401,7 +401,7 @@ mod tests {
         assert_matches!(
             request,
             ProtocolMessage {
-                seq: 12,
+                seq: Either::First(12),
                 type_: ProtocolMessageType::Request(RequestArguments::configurationDone(Some(_)))
             }
         );
@@ -435,7 +435,7 @@ mod tests {
         assert_matches!(
             request,
             ProtocolMessage {
-                seq: 12,
+                seq: Either::First(12),
                 type_: ProtocolMessageType::Request(RequestArguments::unknown)
             }
         );

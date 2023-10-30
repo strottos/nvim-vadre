@@ -1,4 +1,8 @@
-use std::{env, net::TcpListener, path::PathBuf};
+use std::{
+    env, io,
+    net::TcpListener,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Result;
 
@@ -21,6 +25,7 @@ macro_rules! ret_err {
         }
     };
 }
+use reqwest::Url;
 pub(crate) use ret_err;
 
 // A helper macro to check if a result errored and return early if so and logs the error to Vadre
@@ -135,4 +140,20 @@ pub(crate) fn merge_json(a: &mut serde_json::Value, b: serde_json::Value) {
     }
 
     *a = b;
+}
+
+// We just make this synchronous because although it slows things down, it makes it much
+// easier to do. If anyone wants to make this async and cool be my guest but it seems not
+// easy.
+#[tracing::instrument(skip(url))]
+pub(crate) async fn download_extract_zip(full_path: &Path, url: Url) -> Result<()> {
+    tracing::trace!("Downloading {} and unzipping to {:?}", url, full_path);
+    let zip_contents = reqwest::get(url).await?.bytes().await?;
+
+    let reader = io::Cursor::new(zip_contents);
+    let mut zip = zip::ZipArchive::new(reader)?;
+
+    zip.extract(full_path)?;
+
+    Ok(())
 }

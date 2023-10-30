@@ -7,7 +7,7 @@ mod neovim;
 mod tokio_join;
 mod util;
 
-use crate::{debuggers::DebuggerAPI, neovim::VadreLogLevel};
+use crate::neovim::VadreLogLevel;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -22,7 +22,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use debuggers::DebuggerStepType;
+use debuggers::{Debugger, DebuggerStepType};
 use nvim_rs::{compat::tokio::Compat, create::tokio as create, Handler, Neovim, Value};
 use tokio::{io::Stdout, sync::Mutex};
 
@@ -37,7 +37,7 @@ struct NeovimHandler {
     // really be using more than one debugger at a time and we try and take the second mutex
     // sparingly hopefully this won't be too big a performance hit. I'd prefer to take them out
     // though ideally.
-    debuggers: Arc<Mutex<HashMap<usize, Arc<Mutex<Box<(dyn DebuggerAPI + Send + Sync)>>>>>>,
+    debuggers: Arc<Mutex<HashMap<usize, Arc<Mutex<Box<Debugger>>>>>>,
 
     breakpoints: Arc<Mutex<HashMap<String, HashSet<i64>>>>,
 }
@@ -51,14 +51,7 @@ impl NeovimHandler {
     }
 
     #[tracing::instrument(skip(self, args, neovim))]
-    async fn launch(
-        &self,
-        instance_id: usize,
-        args: Vec<Value>,
-        neovim: Neovim<Compat<Stdout>>,
-    ) -> VadreResult {
-        tracing::debug!("Launching instance {} with args: {:?}", instance_id, args);
-
+    async fn launch(&self, args: Vec<Value>, neovim: Neovim<Compat<Stdout>>) -> VadreResult {
         let mut debugger_type = None;
         let mut debugger_port = None;
         let mut process_vadre_args = true;
@@ -68,6 +61,28 @@ impl NeovimHandler {
         let mut command_args = vec![];
         let mut command = "".to_string();
         let mut environment_variables = HashMap::new();
+
+        if args.len() == 0 {
+            tracing::debug!("Launching Vadre create Debugger UI");
+
+            neovim
+                .exec_lua(
+                    r#"
+                    local vadre_ui = require('vadre.ui')
+
+                    vadre_ui.start_debugger_ui()
+                    "#,
+                    vec![],
+                )
+                .await
+                .map_err(|e| format!("Lua error: {e:?}"))?;
+
+            return Ok("".into());
+        }
+
+        let instance_id = VADRE_NEXT_INSTANCE_NUM.fetch_add(1, Ordering::SeqCst);
+
+        tracing::debug!("Launching instance {} with args: {:?}", instance_id, args);
 
         for arg in args {
             if Some("--") == arg.as_str() {
@@ -122,18 +137,19 @@ impl NeovimHandler {
             debugger_type
         );
 
-        let debugger = match debuggers::new_debugger(
-            instance_id,
-            command,
-            command_args,
-            environment_variables,
-            neovim,
+        let history_command = format!(
+            "let g:vadre_last_command[\"{}\"] = \"{} {}\"",
             debugger_type,
-            log_debugger,
-        ) {
-            Ok(x) => Arc::new(Mutex::new(x)),
-            Err(e) => return Err(format!("Can't setup debugger: {}", e).into()),
-        };
+            command,
+            command_args.join(" ")
+        );
+
+        let debugger =
+            match debuggers::new_debugger(instance_id, neovim.clone(), debugger_type, log_debugger)
+            {
+                Ok(x) => Arc::new(Mutex::new(x)),
+                Err(e) => return Err(format!("Can't setup debugger: {}", e).into()),
+            };
 
         self.debuggers
             .lock()
@@ -143,16 +159,34 @@ impl NeovimHandler {
         let pending_breakpoints = self.breakpoints.lock().await.clone();
 
         tokio::spawn(async move {
+            let neovim = neovim.clone();
+
             let mut debugger_lock = debugger.lock().await;
             if let Err(e) = debugger_lock
-                .setup(&pending_breakpoints, debugger_port)
+                .setup(
+                    command,
+                    command_args,
+                    environment_variables,
+                    &pending_breakpoints,
+                    debugger_port,
+                )
                 .await
             {
                 let log_msg = format!("Can't setup debugger: {}", e);
-                debugger_lock
+                if let Err(_) = debugger_lock
                     .log_msg(VadreLogLevel::CRITICAL, &log_msg)
-                    .await?;
+                    .await
+                {
+                    neovim.err_writeln(&log_msg).await.unwrap_or_else(|e| {
+                        tracing::error!("Couldn't write to neovim: {}", e);
+                    });
+                };
             }
+
+            neovim.command(&history_command).await.unwrap_or_else(|e| {
+                tracing::error!("Couldn't create vadre last command: {}", e);
+            });
+
             Ok::<(), anyhow::Error>(())
         });
 
@@ -184,11 +218,11 @@ impl NeovimHandler {
         };
 
         if !file_path.exists() {
-            // TODO: Better erroring
-            panic!(
+            return Err(format!(
                 "Requested to set breakpoints in non-existent file: {:?}",
-                file_path,
-            );
+                file_path
+            )
+            .into());
         }
 
         let file_path = file_path
@@ -238,11 +272,13 @@ impl NeovimHandler {
         }
 
         Ok((if adding_breakpoint {
+            tracing::trace!("Adding breakpoint sign {line_number}");
             crate::neovim::add_breakpoint_sign(&neovim, line_number)
                 .await
                 .map_err(|e| format!("Breakpoint sign didn't place: {e}"))?;
             "breakpoint set"
         } else {
+            tracing::trace!("Removing breakpoint sign {file_path} {line_number}");
             crate::neovim::remove_breakpoint_sign(&neovim, file_path, line_number)
                 .await
                 .map_err(|e| format!("Breakpoint sign didn't place: {e}"))?;
@@ -305,9 +341,7 @@ impl Handler for NeovimHandler {
         match name.as_ref() {
             "ping" => Ok("pong".into()),
             "launch" => {
-                let instance_id = VADRE_NEXT_INSTANCE_NUM.fetch_add(1, Ordering::SeqCst);
                 self.launch(
-                    instance_id,
                     args.get(0)
                         .ok_or("Launch args must be supplied")?
                         .as_array()

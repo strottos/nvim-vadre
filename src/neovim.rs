@@ -277,34 +277,14 @@ impl NeovimVadreWindow {
         let eventignore_old = self.neovim.get_var("eventignore").await;
         self.neovim.set_var("eventignore", "all".into()).await?;
 
-        self.check_if_new_tab_needed().await?;
+        self.neovim.command("tab new").await?;
 
         // Now setup the current window which must by construction be empty
-        let current_window = self.neovim.get_current_win().await?;
         let current_tabpage = self.neovim.get_current_tabpage().await?;
-
-        let default_height = current_window
-            .get_height()
-            .await
-            .map_or(10, |x| cmp::max(x / 4, 10));
-        tracing::trace!("default height is {:?}", default_height);
-
-        let output_window_height = self
-            .neovim
-            .get_var("vadre_output_window_height")
-            .await
-            .map_or(default_height, |x| x.as_i64().unwrap_or(default_height));
-        tracing::trace!("output window size {:?}", output_window_height);
-
-        self.neovim.command("new").await?;
-        let mut windows = current_tabpage.list_wins().await?.into_iter();
-        assert_eq!(2, windows.len());
-        let window = windows.next().ok_or_else(|| anyhow!("No code window"))?;
-        self.neovim.set_current_win(&window).await?;
 
         self.neovim.command("vnew").await?;
         let mut windows = current_tabpage.list_wins().await?.into_iter();
-        assert_eq!(3, windows.len());
+        assert_eq!(2, windows.len());
 
         // Window 1 is Code
         let window = windows.next().ok_or_else(|| anyhow!("No code window"))?;
@@ -317,25 +297,13 @@ impl NeovimVadreWindow {
         self.windows.insert(VadreWindowType::Code, window);
         self.buffers.insert(VadreBufferType::Code, buffer);
 
-        // Window 2 is Output stuff, logs at the moment
-        let window = windows.next().ok_or_else(|| anyhow!("No output window"))?;
-        window.set_option("wrap", true.into()).await?;
-        let log_buffer = window.get_buf().await?;
-        self.set_vadre_buffer_options(&log_buffer, &VadreBufferType::Logs)
-            .await?;
-        self.set_vadre_debugger_keys_for_buffer(&log_buffer).await?;
-
-        self.windows.insert(VadreWindowType::Output, window);
-        self.buffers.insert(VadreBufferType::Logs, log_buffer);
-
-        // Window 3 is Terminal
+        // Window 2 is Terminal
         let window = windows
             .next()
             .ok_or_else(|| anyhow!("No terminal window"))?;
         let terminal_buffer = window.get_buf().await?;
         self.set_vadre_buffer_options(&terminal_buffer, &VadreBufferType::Terminal)
             .await?;
-        window.set_height(output_window_height).await?;
 
         self.windows.insert(VadreWindowType::Program, window);
         self.buffers
@@ -343,6 +311,7 @@ impl NeovimVadreWindow {
 
         // Extra output buffers
         for buffer_type in vec![
+            VadreBufferType::Logs,
             VadreBufferType::CallStack,
             VadreBufferType::Variables,
             VadreBufferType::Breakpoints,
@@ -389,10 +358,7 @@ impl NeovimVadreWindow {
             .buffers
             .get(&VadreBufferType::Logs)
             .ok_or_else(|| anyhow!("Logs buffer not found, have you setup the UI?"))?;
-        let window = self
-            .windows
-            .get(&VadreWindowType::Output)
-            .ok_or_else(|| anyhow!("Logs window not found, have you setup the UI?"))?;
+        let window = self.windows.get(&VadreWindowType::Output);
 
         let now = chrono::offset::Local::now();
 
@@ -402,16 +368,20 @@ impl NeovimVadreWindow {
             .collect();
 
         let mut cursor_at_end = true;
-        let current_cursor = window.get_cursor().await?;
         let line_count = buffer.line_count().await?;
 
-        if current_cursor.0 < line_count {
-            cursor_at_end = false;
+        if let Some(window) = window {
+            let current_cursor = window.get_cursor().await?;
+            if current_cursor.0 < line_count {
+                cursor_at_end = false;
+            }
         }
         self.write_to_buffer(&buffer, -1, -1, msgs).await?;
 
-        if cursor_at_end && line_count > 1 {
-            window.set_cursor((line_count + 1, 0)).await?;
+        if let Some(window) = window {
+            if cursor_at_end && line_count > 1 {
+                window.set_cursor((line_count + 1, 0)).await?;
+            }
         }
 
         Ok(())
@@ -587,15 +557,16 @@ impl NeovimVadreWindow {
 
         for breakpoint in breakpoints {
             if breakpoint.file_path != file_path {
-                panic!(
+                return Err(anyhow!(
                     "Breakpoints with wrong file_path: {:?} != {:?}",
-                    breakpoint.file_path, file_path
-                );
+                    breakpoint.file_path,
+                    file_path
+                ));
             }
-            let breakpoint_info = format!("{}:{}", file_path, breakpoint.line_number);
+            let breakpoint_info = format!("{}:{}", file_path, breakpoint.source_line_number);
             let resolved_to_info =
                 if let Some(breakpoint_line_number) = breakpoint.actual_line_number {
-                    if breakpoint.line_number != breakpoint_line_number {
+                    if breakpoint.source_line_number != breakpoint_line_number {
                         format!(" (resolved to line {})", breakpoint_line_number)
                     } else {
                         "".to_string()
@@ -689,39 +660,6 @@ impl NeovimVadreWindow {
             buffer.set_lines(start_line, end_line, false, msgs).await?;
         }
         buffer.set_option("modifiable", false.into()).await?;
-
-        Ok(())
-    }
-
-    async fn check_if_new_tab_needed(&self) -> Result<()> {
-        // Check if we need a new tab first
-        let current_buf = self.neovim.get_current_buf().await?;
-        let current_tabpage = self.neovim.get_current_tabpage().await?;
-
-        let modified = current_buf
-            .get_option("modified")
-            .await?
-            .as_bool()
-            .ok_or_else(|| anyhow!("Buffer variable modified wasn't a boolean?"))?;
-        let line_count = current_buf.line_count().await?;
-        let lines = current_buf.get_lines(0, 1, true).await?;
-
-        let window_count = current_tabpage.list_wins().await?.len();
-        let buffer_name = current_buf.get_name().await?;
-
-        // New tab if we're not completely single window empty pane, otherwise just use current
-        if window_count > 1
-            || buffer_name != ""
-            || modified
-            || line_count > 1
-            || lines
-                .get(0)
-                .ok_or_else(|| anyhow!("Couldn't get first line: {lines:?}"))?
-                != ""
-        {
-            self.neovim.command("tab new").await?;
-            tracing::trace!("setup a new empty tab");
-        }
 
         Ok(())
     }
@@ -902,14 +840,10 @@ pub async fn setup_signs(neovim: &Neovim<Compat<Stdout>>) -> Result<()> {
 }
 
 pub async fn add_breakpoint_sign(neovim: &Neovim<Compat<Stdout>>, line_number: i64) -> Result<()> {
-    tracing::trace!("HERE1");
     let buffer_number_output = neovim.exec(&format!("echo bufnr()"), true).await?;
-    tracing::trace!("HERE2");
     let buffer_number = buffer_number_output.trim();
-    tracing::trace!("HERE3 {}", buffer_number);
     let pointer_sign_id = VADRE_NEXT_SIGN_ID.fetch_add(1, Ordering::SeqCst);
 
-    tracing::trace!("HERE4");
     neovim
         .exec(
             &format!(
@@ -919,7 +853,6 @@ pub async fn add_breakpoint_sign(neovim: &Neovim<Compat<Stdout>>, line_number: i
             false,
         )
         .await?;
-    tracing::trace!("HERE5");
 
     Ok(())
 }

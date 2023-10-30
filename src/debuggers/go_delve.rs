@@ -83,147 +83,6 @@ pub struct Debugger {
     data: Arc<Mutex<DebuggerData>>,
 }
 
-#[async_trait]
-impl DebuggerAPI for Debugger {
-    #[tracing::instrument(skip(self))]
-    async fn setup(
-        &mut self,
-        pending_breakpoints: &HashMap<String, HashSet<i64>>,
-        existing_debugger_port: Option<String>,
-    ) -> Result<()> {
-        log_ret_err!(
-            self.neovim_vadre_window.lock().await.create_ui().await,
-            self.neovim_vadre_window,
-            "Error setting up Vadre UI"
-        );
-
-        let port = match existing_debugger_port {
-            Some(port) => port.parse::<u16>().expect("debugger port is u16"),
-            None => {
-                let port = get_unused_localhost_port()?;
-
-                log_ret_err!(
-                    self.launch(port).await,
-                    self.neovim_vadre_window,
-                    "Error launching process"
-                );
-
-                port
-            }
-        };
-
-        let (config_done_tx, config_done_rx) = oneshot::channel();
-        log_ret_err!(
-            self.tcp_connect(port, config_done_tx).await,
-            self.neovim_vadre_window,
-            "Error creating TCP connection to process"
-        );
-        log_ret_err!(
-            self.init_process(pending_breakpoints, config_done_rx).await,
-            self.neovim_vadre_window,
-            "Error initialising process"
-        );
-        ret_err!(
-            self.log_msg(VadreLogLevel::INFO, "Debugger launched and setup")
-                .await
-        );
-
-        Ok(())
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn set_source_breakpoints(
-        &self,
-        file_path: String,
-        line_numbers: &HashSet<i64>,
-    ) -> Result<()> {
-        self.set_breakpoints(file_path, line_numbers).await
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn do_step(&self, step_type: DebuggerStepType, count: u64) -> Result<()> {
-        let thread_id = {
-            let data = self.data.lock().await;
-
-            data.current_thread_id.clone()
-        };
-
-        let thread_id = match thread_id {
-            Some(thread_id) => thread_id,
-            None => {
-                self.log_msg(
-                    VadreLogLevel::ERROR,
-                    "Can't do stepping as no current thread",
-                )
-                .await?;
-                return Ok(());
-            }
-        };
-
-        let request = match step_type {
-            DebuggerStepType::Over => RequestArguments::next(NextArguments {
-                granularity: None,
-                single_thread: Some(false),
-                thread_id,
-            }),
-            DebuggerStepType::In => RequestArguments::stepIn(StepInArguments {
-                granularity: None,
-                single_thread: Some(false),
-                target_id: None,
-                thread_id,
-            }),
-            DebuggerStepType::Continue => RequestArguments::continue_(ContinueArguments {
-                single_thread: Some(false),
-                thread_id,
-            }),
-        };
-
-        for _ in 1..count {
-            let (tx, rx) = oneshot::channel();
-
-            *self.stopped_listener_tx.lock().await = Some(tx);
-
-            let resp = dap_shared::do_send_request_and_await_response(
-                request.clone(),
-                self.debugger_sender_tx.clone(),
-            )
-            .await?;
-
-            match resp {
-                ResponseResult::Success { .. } => {}
-                ResponseResult::Error {
-                    command: _,
-                    message,
-                    show_user: _,
-                } => bail!("An error occurred stepping {}", message),
-            };
-
-            timeout(Duration::new(2, 0), rx).await??;
-        }
-
-        dap_shared::do_send_request(request, self.debugger_sender_tx.clone(), None).await?;
-
-        Ok(())
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn change_output_window(&self, type_: &str) -> Result<()> {
-        self.neovim_vadre_window
-            .lock()
-            .await
-            .change_output_window(type_)
-            .await
-    }
-
-    async fn log_msg(&self, level: VadreLogLevel, msg: &str) -> Result<()> {
-        self.neovim_vadre_window
-            .lock()
-            .await
-            .log_msg(level, msg)
-            .await
-    }
-}
-
 impl Debugger {
     #[tracing::instrument(skip(neovim))]
     pub fn new(
@@ -297,7 +156,6 @@ impl Debugger {
 
         if let ResponseResult::Success { body } = response_result {
             if let ResponseBody::setBreakpoints(breakpoints_body) = body {
-                tracing::debug!("Breakpoints body: {:#?}", breakpoints_body);
                 let ids_left = breakpoints_body
                     .breakpoints
                     .iter()
@@ -1362,6 +1220,147 @@ impl Debugger {
         zip.extract(full_path)?;
 
         Ok(())
+    }
+}
+
+#[async_trait]
+impl DebuggerAPI for Debugger {
+    #[tracing::instrument(skip(self))]
+    async fn setup(
+        &mut self,
+        pending_breakpoints: &HashMap<String, HashSet<i64>>,
+        existing_debugger_port: Option<String>,
+    ) -> Result<()> {
+        log_ret_err!(
+            self.neovim_vadre_window.lock().await.create_ui().await,
+            self.neovim_vadre_window,
+            "Error setting up Vadre UI"
+        );
+
+        let port = match existing_debugger_port {
+            Some(port) => port.parse::<u16>().expect("debugger port is u16"),
+            None => {
+                let port = get_unused_localhost_port()?;
+
+                log_ret_err!(
+                    self.launch(port).await,
+                    self.neovim_vadre_window,
+                    "Error launching process"
+                );
+
+                port
+            }
+        };
+
+        let (config_done_tx, config_done_rx) = oneshot::channel();
+        log_ret_err!(
+            self.tcp_connect(port, config_done_tx).await,
+            self.neovim_vadre_window,
+            "Error creating TCP connection to process"
+        );
+        log_ret_err!(
+            self.init_process(pending_breakpoints, config_done_rx).await,
+            self.neovim_vadre_window,
+            "Error initialising process"
+        );
+        ret_err!(
+            self.log_msg(VadreLogLevel::INFO, "Debugger launched and setup")
+                .await
+        );
+
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn set_source_breakpoints(
+        &self,
+        file_path: String,
+        line_numbers: &HashSet<i64>,
+    ) -> Result<()> {
+        self.set_breakpoints(file_path, line_numbers).await
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn do_step(&self, step_type: DebuggerStepType, count: u64) -> Result<()> {
+        let thread_id = {
+            let data = self.data.lock().await;
+
+            data.current_thread_id.clone()
+        };
+
+        let thread_id = match thread_id {
+            Some(thread_id) => thread_id,
+            None => {
+                self.log_msg(
+                    VadreLogLevel::ERROR,
+                    "Can't do stepping as no current thread",
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        let request = match step_type {
+            DebuggerStepType::Over => RequestArguments::next(NextArguments {
+                granularity: None,
+                single_thread: Some(false),
+                thread_id,
+            }),
+            DebuggerStepType::In => RequestArguments::stepIn(StepInArguments {
+                granularity: None,
+                single_thread: Some(false),
+                target_id: None,
+                thread_id,
+            }),
+            DebuggerStepType::Continue => RequestArguments::continue_(ContinueArguments {
+                single_thread: Some(false),
+                thread_id,
+            }),
+        };
+
+        for _ in 1..count {
+            let (tx, rx) = oneshot::channel();
+
+            *self.stopped_listener_tx.lock().await = Some(tx);
+
+            let resp = dap_shared::do_send_request_and_await_response(
+                request.clone(),
+                self.debugger_sender_tx.clone(),
+            )
+            .await?;
+
+            match resp {
+                ResponseResult::Success { .. } => {}
+                ResponseResult::Error {
+                    command: _,
+                    message,
+                    show_user: _,
+                } => bail!("An error occurred stepping {}", message),
+            };
+
+            timeout(Duration::new(2, 0), rx).await??;
+        }
+
+        dap_shared::do_send_request(request, self.debugger_sender_tx.clone(), None).await?;
+
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn change_output_window(&self, type_: &str) -> Result<()> {
+        self.neovim_vadre_window
+            .lock()
+            .await
+            .change_output_window(type_)
+            .await
+    }
+
+    async fn log_msg(&self, level: VadreLogLevel, msg: &str) -> Result<()> {
+        self.neovim_vadre_window
+            .lock()
+            .await
+            .log_msg(level, msg)
+            .await
     }
 }
 

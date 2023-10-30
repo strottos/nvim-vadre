@@ -8,6 +8,8 @@ endif
 " loading the script.
 let g:loaded_vadre_plugin = 1
 
+let g:vadre_last_command = {}
+
 " Initialize the channel
 if !exists("s:vadreJobId")
     let s:vadreJobId = 0

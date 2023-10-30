@@ -1,17 +1,22 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use super::protocol::{ProtocolMessageType, RequestArguments, ResponseResult};
+use crate::{
+    neovim::NeovimVadreWindow,
+    util::{log_ret_err, ret_err},
+    VadreLogLevel,
+};
 
 use anyhow::{bail, Result};
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, Mutex},
     time::timeout,
 };
 
 /// Actually send the request, should be the only function that does this, even the function
 /// with the `&self` parameter still uses this in turn.
 #[tracing::instrument(skip(request, debugger_sender_tx))]
-pub async fn do_send_request(
+pub(crate) async fn do_send_request(
     request: RequestArguments,
     debugger_sender_tx: mpsc::Sender<(
         ProtocolMessageType,
@@ -29,7 +34,7 @@ pub async fn do_send_request(
 /// Actually send the request and await the response. Used in turn by the equivalent function
 /// with the `&self` parameter.
 #[tracing::instrument(skip(request, debugger_sender_tx))]
-pub async fn do_send_request_and_await_response(
+pub(crate) async fn do_send_request_and_await_response(
     request: RequestArguments,
     debugger_sender_tx: mpsc::Sender<(
         ProtocolMessageType,
