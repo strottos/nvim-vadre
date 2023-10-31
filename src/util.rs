@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::Result;
+use reqwest::Url;
 
 // A helper macro to check if a result errored and return early if so. Prevents having to write
 // this kind of code all over the place:
@@ -25,7 +26,6 @@ macro_rules! ret_err {
         }
     };
 }
-use reqwest::Url;
 pub(crate) use ret_err;
 
 // A helper macro to check if a result errored and return early if so and logs the error to Vadre

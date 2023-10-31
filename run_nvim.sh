@@ -44,8 +44,7 @@ function setup_environment() {
 }
 
 function run_nvim() {
-    cargo build --manifest-path="${vadre_root}/Cargo.toml"
-    nvim --clean -u "${vadre_root}/test_files/vimfiles/mininit.lua" ${@}
+    cargo build --manifest-path="${vadre_root}/Cargo.toml" && nvim --clean -u "${vadre_root}/test_files/vimfiles/mininit.lua" ${@}
 }
 
 setup_environment

@@ -75,15 +75,13 @@ impl Display for VadreLogLevel {
 enum VadreWindowType {
     Code,
     Output,
-    Program,
 }
 
 impl VadreWindowType {
     fn window_name_prefix(&self) -> &str {
         match self {
             VadreWindowType::Code => "Vadre Code",
-            VadreWindowType::Output => "Vadre Output",
-            VadreWindowType::Program => "Vadre Program",
+            VadreWindowType::Output => "Vadre Program",
         }
     }
 }
@@ -103,7 +101,7 @@ impl VadreBufferType {
         match self {
             VadreBufferType::Code => VadreWindowType::Code,
             VadreBufferType::Logs => VadreWindowType::Output,
-            VadreBufferType::Terminal => VadreWindowType::Program,
+            VadreBufferType::Terminal => VadreWindowType::Output,
             VadreBufferType::CallStack => VadreWindowType::Output,
             VadreBufferType::Variables => VadreWindowType::Output,
             VadreBufferType::Breakpoints => VadreWindowType::Output,
@@ -202,6 +200,39 @@ impl VadreBufferType {
             _ => panic!("Can't understand string {}", s),
         }
     }
+
+    fn next_output_type(&self) -> VadreBufferType {
+        match self {
+            VadreBufferType::Code => unreachable!(),
+            VadreBufferType::Terminal => VadreBufferType::Logs,
+            VadreBufferType::Logs => VadreBufferType::CallStack,
+            VadreBufferType::CallStack => VadreBufferType::Variables,
+            VadreBufferType::Variables => VadreBufferType::Breakpoints,
+            VadreBufferType::Breakpoints => VadreBufferType::Terminal,
+        }
+    }
+
+    fn previous_output_type(&self) -> VadreBufferType {
+        match self {
+            VadreBufferType::Code => unreachable!(),
+            VadreBufferType::Terminal => VadreBufferType::Breakpoints,
+            VadreBufferType::Logs => VadreBufferType::Terminal,
+            VadreBufferType::CallStack => VadreBufferType::Logs,
+            VadreBufferType::Variables => VadreBufferType::CallStack,
+            VadreBufferType::Breakpoints => VadreBufferType::Variables,
+        }
+    }
+
+    fn lua_name(&self) -> &str {
+        match self {
+            VadreBufferType::Code => unreachable!(),
+            VadreBufferType::Terminal => "terminal",
+            VadreBufferType::Logs => "logs",
+            VadreBufferType::CallStack => "callstack",
+            VadreBufferType::Variables => "variables",
+            VadreBufferType::Breakpoints => "breakpoints",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -257,6 +288,7 @@ impl Display for VadreOutputBufferSelector {
 pub struct NeovimVadreWindow {
     neovim: Neovim<Compat<Stdout>>,
     instance_id: usize,
+    current_output: VadreBufferType,
     windows: HashMap<VadreWindowType, Window<Compat<Stdout>>>,
     buffers: HashMap<VadreBufferType, Buffer<Compat<Stdout>>>,
     pointer_sign_id: usize,
@@ -267,6 +299,7 @@ impl NeovimVadreWindow {
         Self {
             neovim,
             instance_id,
+            current_output: VadreBufferType::Terminal,
             buffers: HashMap::new(),
             windows: HashMap::new(),
             pointer_sign_id: VADRE_NEXT_SIGN_ID.fetch_add(1, Ordering::SeqCst),
@@ -305,11 +338,19 @@ impl NeovimVadreWindow {
         self.set_vadre_buffer_options(&terminal_buffer, &VadreBufferType::Terminal)
             .await?;
 
-        self.windows.insert(VadreWindowType::Program, window);
+        self.windows.insert(VadreWindowType::Output, window);
         self.buffers
             .insert(VadreBufferType::Terminal, terminal_buffer);
 
         // Extra output buffers
+        let code_window = self.neovim.get_current_win().await?;
+
+        let terminal_window = self
+            .windows
+            .get(&VadreWindowType::Output)
+            .ok_or_else(|| anyhow!("Can't find terminal window"))?;
+        self.neovim.set_current_win(&terminal_window).await?;
+
         for buffer_type in vec![
             VadreBufferType::Logs,
             VadreBufferType::CallStack,
@@ -317,9 +358,25 @@ impl NeovimVadreWindow {
             VadreBufferType::Breakpoints,
         ] {
             let buffer = self.neovim.create_buf(false, false).await?;
+
             self.set_vadre_buffer_options(&buffer, &buffer_type).await?;
+
+            self.neovim
+                .exec_lua(
+                    &format!(
+                        "require('vadre.ui').set_popup('{}', {})",
+                        buffer_type.lua_name(),
+                        buffer.get_number().await?,
+                    ),
+                    vec![],
+                )
+                .await
+                .map_err(|e| anyhow!("Lua error: {e:?}"))?;
+
             self.buffers.insert(buffer_type, buffer);
         }
+
+        self.neovim.set_current_win(&code_window).await?;
 
         // Special first log line to get rid of the annoying
         self.log_msg(VadreLogLevel::INFO, "Vadre Setup UI").await?;
@@ -396,7 +453,7 @@ impl NeovimVadreWindow {
 
         let terminal_window = self
             .windows
-            .get(&VadreWindowType::Program)
+            .get(&VadreWindowType::Output)
             .ok_or_else(|| anyhow!("Can't find terminal window"))?;
         self.neovim.set_current_win(&terminal_window).await?;
 
@@ -601,36 +658,64 @@ impl NeovimVadreWindow {
         let output_window = self
             .windows
             .get(&VadreWindowType::Output)
-            .ok_or_else(|| anyhow!("can get output window"))?;
+            .ok_or_else(|| anyhow!("can't get output window"))?;
         let output_buffer_name = &output_window.get_buf().await?.get_name().await?;
         let mut split = output_buffer_name.rsplit(" - ");
         let output_buffer_type = split
             .next()
-            .ok_or_else(|| anyhow!("should be able to retrieve output buffer type"))?;
+            .ok_or_else(|| anyhow!("can't retrieve output buffer type"))?;
         let output_buffer_type = VadreBufferType::get_buffer_type_from_str(output_buffer_type);
 
         Ok(output_buffer_type)
     }
 
-    pub async fn change_output_window(&self, type_: &str) -> Result<()> {
+    pub async fn change_output_window(&mut self, type_: &str) -> Result<()> {
         let type_ = VadreOutputBufferSelector::get_type(type_)?;
 
-        let output_window = self
-            .windows
-            .get(&VadreWindowType::Output)
-            .ok_or_else(|| anyhow!("can get output window"))?;
-        let new_buffer_type = VadreBufferType::get_output_buffer(
-            &output_window.get_buf().await?.get_name().await?,
-            type_,
-        )?;
-        let new_buffer = self
-            .buffers
-            .get(&new_buffer_type)
-            .ok_or_else(|| anyhow!("can retrieve next buffer"))?;
-        output_window.set_buf(new_buffer).await?;
-        output_window
-            .set_option("wrap", new_buffer_type.buffer_should_wrap().into())
-            .await?;
+        let new_output_type = match type_ {
+            VadreOutputBufferSelector::Next => self.current_output.next_output_type(),
+            VadreOutputBufferSelector::Previous => self.current_output.previous_output_type(),
+            VadreOutputBufferSelector::Logs => VadreBufferType::Logs,
+            VadreOutputBufferSelector::CallStack => VadreBufferType::CallStack,
+            VadreOutputBufferSelector::Variables => VadreBufferType::Variables,
+            VadreOutputBufferSelector::Breakpoints => VadreBufferType::Breakpoints,
+        };
+
+        self.neovim
+            .exec_lua(
+                &format!(
+                    "require('vadre.ui').display_output_window('{}')",
+                    new_output_type.lua_name()
+                ),
+                vec![],
+            )
+            .await
+            .map_err(|e| anyhow!("Lua error: {e:?}"))?;
+        self.neovim
+            .exec_lua(
+                &format!(
+                    "require('vadre.ui').hide_output_window('{}')",
+                    self.current_output.lua_name()
+                ),
+                vec![],
+            )
+            .await
+            .map_err(|e| anyhow!("Lua error: {e:?}"))?;
+
+        self.current_output = new_output_type;
+
+        //        let output_window = self
+        //            .windows
+        //            .get(&VadreWindowType::Output)
+        //            .ok_or_else(|| anyhow!("can get output window"))?;
+        //        let new_buffer = self
+        //            .buffers
+        //            .get(&new_buffer_type)
+        //            .ok_or_else(|| anyhow!("can retrieve next buffer"))?;
+        //        output_window.set_buf(new_buffer).await?;
+        //        output_window
+        //            .set_option("wrap", new_buffer_type.buffer_should_wrap().into())
+        //            .await?;
 
         Ok(())
     }

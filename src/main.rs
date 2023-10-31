@@ -317,7 +317,7 @@ impl NeovimHandler {
             .await
             .change_output_window(type_)
             .await
-            .map_err(|e| format!("Couldn't print variable: {e}"))?;
+            .map_err(|e| format!("Couldn't show output window: {e}"))?;
 
         Ok("".into())
     }

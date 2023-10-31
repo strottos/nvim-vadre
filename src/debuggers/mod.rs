@@ -17,7 +17,7 @@ use std::{
 
 use crate::{
     neovim::{NeovimVadreWindow, VadreBufferType, VadreLogLevel},
-    util::{get_unused_localhost_port, log_err, log_ret_err, ret_err},
+    util::get_unused_localhost_port,
 };
 use dap::{
     protocol::{
@@ -193,12 +193,8 @@ impl Debugger {
             None => {
                 let port = get_unused_localhost_port()?;
 
-                log_ret_err!(
-                    self.launch(command, command_args, environment_variables, port)
-                        .await,
-                    self.neovim_vadre_window,
-                    "Error launching process"
-                );
+                self.launch(command, command_args, environment_variables, port)
+                    .await?;
 
                 port
             }

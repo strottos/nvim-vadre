@@ -1,6 +1,7 @@
 local Input = require("nui.input")
 local NuiText = require("nui.text")
 local Menu = require("nui.menu")
+local Popup = require("nui.popup")
 local event = require("nui.utils.autocmd").event
 
 local debuggers = {
@@ -102,8 +103,164 @@ local function start_debugger_ui()
     end)
 end
 
+local logs_window_popup
+local callstack_window_popup
+local variables_window_popup
+local breakpoints_window_popup
+
+local function set_popup(type, bufnr)
+    if type == "logs" then
+        logs_window_popup = Popup({
+            enter = false,
+            focusable = true,
+            bufnr = bufnr,
+            border = {
+                style = "rounded",
+            },
+            relative = {
+                type = "buf",
+                position = {
+                    row = 0,
+                    col = 0,
+                }
+            },
+            position = {
+                row = 0,
+                col = 0,
+            },
+            size = {
+                width = "95%",
+                height = "95%",
+            },
+            win_options = {
+                winblend = 10,
+                winhighlight = "Normal:Normal,FloatBorder:Normal",
+            },
+        })
+    elseif type == "callstack" then
+        callstack_window_popup = Popup({
+            enter = false,
+            focusable = true,
+            bufnr = bufnr,
+            border = {
+                style = "rounded",
+            },
+            relative = {
+                type = "buf",
+                position = {
+                    row = 0,
+                    col = 0,
+                }
+            },
+            position = {
+                row = 0,
+                col = 0,
+            },
+            size = {
+                width = "95%",
+                height = "95%",
+            },
+            win_options = {
+                winblend = 10,
+                winhighlight = "Normal:Normal,FloatBorder:Normal",
+            },
+        })
+    elseif type == "variables" then
+        variables_window_popup = Popup({
+            enter = false,
+            focusable = true,
+            bufnr = bufnr,
+            border = {
+                style = "rounded",
+            },
+            relative = {
+                type = "buf",
+                position = {
+                    row = 0,
+                    col = 0,
+                }
+            },
+            position = {
+                row = 0,
+                col = 0,
+            },
+            size = {
+                width = "95%",
+                height = "95%",
+            },
+            win_options = {
+                winblend = 10,
+                winhighlight = "Normal:Normal,FloatBorder:Normal",
+            },
+        })
+    elseif type == "breakpoints" then
+        breakpoints_window_popup = Popup({
+            enter = false,
+            focusable = true,
+            bufnr = bufnr,
+            border = {
+                style = "rounded",
+            },
+            relative = {
+                type = "buf",
+                position = {
+                    row = 0,
+                    col = 0,
+                }
+            },
+            position = {
+                row = 0,
+                col = 0,
+            },
+            size = {
+                width = "95%",
+                height = "95%",
+            },
+            win_options = {
+                winblend = 10,
+                winhighlight = "Normal:Normal,FloatBorder:Normal",
+            },
+        })
+    else
+        vim.notify("Unknown output type: " .. type, vim.log.levels.CRITICAL)
+    end
+end
+
+local function display_output_window(type)
+    if type == "logs" then
+        logs_window_popup:mount()
+    elseif type == "callstack" then
+        callstack_window_popup:mount()
+    elseif type == "variables" then
+        variables_window_popup:mount()
+    elseif type == "breakpoints" then
+        breakpoints_window_popup:mount()
+    elseif type == "terminal" then
+    else
+        vim.notify("Unknown output type: " .. type, vim.log.levels.CRITICAL)
+    end
+end
+
+local function hide_output_window(type)
+    if type == "logs" then
+        logs_window_popup:unmount()
+    elseif type == "callstack" then
+        callstack_window_popup:unmount()
+    elseif type == "variables" then
+        variables_window_popup:unmount()
+    elseif type == "breakpoints" then
+        breakpoints_window_popup:unmount()
+    elseif type == "terminal" then
+    else
+        vim.notify("Unknown output type: " .. type, vim.log.levels.CRITICAL)
+    end
+end
+
 local M = {
     start_debugger_ui = start_debugger_ui,
+    set_popup = set_popup,
+    display_output_window = display_output_window,
+    hide_output_window = hide_output_window,
 }
 
 return M
