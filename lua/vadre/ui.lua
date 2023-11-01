@@ -108,119 +108,49 @@ local callstack_window_popup
 local variables_window_popup
 local breakpoints_window_popup
 
+local function capitalize(str)
+    return (str:gsub("^%l", string.upper))
+end
+
 local function set_popup(type, bufnr)
+    local new_popup = Popup({
+        enter = false,
+        focusable = true,
+        bufnr = bufnr,
+        border = {
+            style = "rounded",
+            text = {
+                top = " " .. capitalize(type) .. " ",
+            }
+        },
+        relative = {
+            type = "buf",
+            position = {
+                row = 0,
+                col = 0,
+            }
+        },
+        position = {
+            row = 0,
+            col = 0,
+        },
+        size = {
+            width = "100%",
+            height = "100%",
+        },
+        win_options = {
+            winhighlight = "Normal:Normal,FloatBorder:Normal",
+        },
+    })
+
     if type == "logs" then
-        logs_window_popup = Popup({
-            enter = false,
-            focusable = true,
-            bufnr = bufnr,
-            border = {
-                style = "rounded",
-            },
-            relative = {
-                type = "buf",
-                position = {
-                    row = 0,
-                    col = 0,
-                }
-            },
-            position = {
-                row = 0,
-                col = 0,
-            },
-            size = {
-                width = "95%",
-                height = "95%",
-            },
-            win_options = {
-                winblend = 10,
-                winhighlight = "Normal:Normal,FloatBorder:Normal",
-            },
-        })
+        logs_window_popup = new_popup
     elseif type == "callstack" then
-        callstack_window_popup = Popup({
-            enter = false,
-            focusable = true,
-            bufnr = bufnr,
-            border = {
-                style = "rounded",
-            },
-            relative = {
-                type = "buf",
-                position = {
-                    row = 0,
-                    col = 0,
-                }
-            },
-            position = {
-                row = 0,
-                col = 0,
-            },
-            size = {
-                width = "95%",
-                height = "95%",
-            },
-            win_options = {
-                winblend = 10,
-                winhighlight = "Normal:Normal,FloatBorder:Normal",
-            },
-        })
+        callstack_window_popup = new_popup
     elseif type == "variables" then
-        variables_window_popup = Popup({
-            enter = false,
-            focusable = true,
-            bufnr = bufnr,
-            border = {
-                style = "rounded",
-            },
-            relative = {
-                type = "buf",
-                position = {
-                    row = 0,
-                    col = 0,
-                }
-            },
-            position = {
-                row = 0,
-                col = 0,
-            },
-            size = {
-                width = "95%",
-                height = "95%",
-            },
-            win_options = {
-                winblend = 10,
-                winhighlight = "Normal:Normal,FloatBorder:Normal",
-            },
-        })
+        variables_window_popup = new_popup
     elseif type == "breakpoints" then
-        breakpoints_window_popup = Popup({
-            enter = false,
-            focusable = true,
-            bufnr = bufnr,
-            border = {
-                style = "rounded",
-            },
-            relative = {
-                type = "buf",
-                position = {
-                    row = 0,
-                    col = 0,
-                }
-            },
-            position = {
-                row = 0,
-                col = 0,
-            },
-            size = {
-                width = "95%",
-                height = "95%",
-            },
-            win_options = {
-                winblend = 10,
-                winhighlight = "Normal:Normal,FloatBorder:Normal",
-            },
-        })
+        breakpoints_window_popup = new_popup
     else
         vim.notify("Unknown output type: " .. type, vim.log.levels.CRITICAL)
     end

@@ -1,4 +1,10 @@
-use std::{env::consts::EXE_SUFFIX, fmt::Debug, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    env::{self, consts::EXE_SUFFIX},
+    fmt::Debug,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use anyhow::Result;
 use reqwest::Url;
@@ -9,7 +15,9 @@ use crate::{
     util::{download_extract_zip, get_debuggers_dir, get_os_and_cpu_architecture},
 };
 
-const VERSION: &str = "1.8.1";
+use super::dap::protocol::{Either, RequestArguments};
+
+const VERSION: &str = "1.10.0";
 
 #[derive(Clone)]
 pub(crate) struct Debugger {
@@ -46,6 +54,7 @@ impl Debugger {
     pub(crate) async fn download_plugin(&mut self) -> Result<()> {
         let mut path = get_debuggers_dir()?;
         path.push("codelldb");
+        path.push(VERSION);
 
         if !path.exists() {
             let (os, arch) = get_os_and_cpu_architecture();
@@ -68,6 +77,29 @@ impl Debugger {
         Ok(())
     }
 
+    pub(crate) fn get_launch_request(
+        &self,
+        command: String,
+        command_args: Vec<String>,
+        environment_variables: HashMap<String, String>,
+    ) -> Result<RequestArguments> {
+        let program = dunce::canonicalize(command)?;
+
+        Ok(RequestArguments::launch(Either::Second(
+            serde_json::json!({
+                "args": command_args,
+                "cargo": {},
+                "cwd": env::current_dir()?,
+                "env": environment_variables,
+                "name": "lldb",
+                "terminal": "integrated",
+                "type": "lldb",
+                "request": "launch",
+                "program": program,
+            }),
+        )))
+    }
+
     pub(crate) fn get_binary_name(&self) -> Result<String> {
         Ok(format!("codelldb{}", EXE_SUFFIX))
     }
@@ -75,6 +107,7 @@ impl Debugger {
     pub(crate) fn get_debugger_path(&self) -> Result<PathBuf> {
         let mut path = get_debuggers_dir()?;
         path.push("codelldb");
+        path.push(VERSION);
         path.push("extension");
         path.push("adapter");
         path.push(&self.get_binary_name()?);

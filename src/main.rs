@@ -19,10 +19,11 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use async_trait::async_trait;
-use debuggers::{Debugger, DebuggerStepType};
+use debuggers::{Breakpoints, Debugger, DebuggerStepType};
 use nvim_rs::{compat::tokio::Compat, create::tokio as create, Handler, Neovim, Value};
 use tokio::{io::Stdout, sync::Mutex};
 
@@ -39,14 +40,15 @@ struct NeovimHandler {
     // though ideally.
     debuggers: Arc<Mutex<HashMap<usize, Arc<Mutex<Box<Debugger>>>>>>,
 
-    breakpoints: Arc<Mutex<HashMap<String, HashSet<i64>>>>,
+    // Record of breakpoints for when new debuggers are spawned
+    pending_breakpoints: Arc<Mutex<Breakpoints>>,
 }
 
 impl NeovimHandler {
     fn new() -> Self {
         NeovimHandler {
             debuggers: Arc::new(Mutex::new(HashMap::new())),
-            breakpoints: Arc::new(Mutex::new(HashMap::new())),
+            pending_breakpoints: Arc::new(Mutex::new(Breakpoints::new())),
         }
     }
 
@@ -56,7 +58,6 @@ impl NeovimHandler {
         let mut debugger_port = None;
         let mut process_vadre_args = true;
         let mut get_env_var = false;
-        let mut log_debugger = false;
 
         let mut command_args = vec![];
         let mut command = "".to_string();
@@ -111,8 +112,6 @@ impl NeovimHandler {
                     .next()
                     .ok_or("Key not found for environment variable")?;
                 environment_variables.insert(key.to_string(), value.to_string());
-            } else if process_vadre_args && arg_string.starts_with("--log-debugger") {
-                log_debugger = true;
             } else {
                 if command == "" {
                     command = arg_string.clone();
@@ -144,43 +143,59 @@ impl NeovimHandler {
             command_args.join(" ")
         );
 
-        let debugger =
-            match debuggers::new_debugger(instance_id, neovim.clone(), debugger_type, log_debugger)
-            {
-                Ok(x) => Arc::new(Mutex::new(x)),
-                Err(e) => return Err(format!("Can't setup debugger: {}", e).into()),
-            };
+        let debugger = match debuggers::new_debugger(instance_id, neovim.clone(), debugger_type) {
+            Ok(x) => Arc::new(Mutex::new(x)),
+            Err(e) => return Err(format!("Can't setup debugger: {}", e).into()),
+        };
 
         self.debuggers
             .lock()
             .await
             .insert(instance_id, debugger.clone());
 
-        let pending_breakpoints = self.breakpoints.lock().await.clone();
+        let pending_breakpoints = self.pending_breakpoints.lock().await.clone();
 
         tokio::spawn(async move {
             let neovim = neovim.clone();
 
             let mut debugger_lock = debugger.lock().await;
+
+            let request_timeout = match neovim.get_var("vadre_request_timeout").await {
+                Ok(duration) => Duration::new(duration.as_u64().unwrap_or(30), 0),
+                Err(_) => Duration::new(30, 0),
+            };
+
             if let Err(e) = debugger_lock
                 .setup(
                     command,
                     command_args,
                     environment_variables,
                     &pending_breakpoints,
+                    request_timeout,
                     debugger_port,
                 )
                 .await
             {
-                let log_msg = format!("Can't setup debugger: {}", e);
-                if let Err(_) = debugger_lock
+                let log_msg = format!("Critical error setting up debugger: {}", e);
+                tracing::error!("{}", e);
+                if let Err(log_err) = debugger_lock
                     .log_msg(VadreLogLevel::CRITICAL, &log_msg)
                     .await
                 {
-                    neovim.err_writeln(&log_msg).await.unwrap_or_else(|e| {
-                        tracing::error!("Couldn't write to neovim: {}", e);
-                    });
+                    tracing::error!("Couldn't write to neovim logs: {}", log_err);
+                    neovim
+                        .err_writeln(&log_msg)
+                        .await
+                        .unwrap_or_else(|vim_err| {
+                            tracing::error!("Couldn't write to neovim: {}", vim_err);
+                        });
                 };
+                neovim
+                    .err_writeln(&log_msg)
+                    .await
+                    .unwrap_or_else(|vim_err| {
+                        tracing::error!("Couldn't write to neovim: {}", vim_err);
+                    });
             }
 
             neovim.command(&history_command).await.unwrap_or_else(|e| {
@@ -230,58 +245,49 @@ impl NeovimHandler {
             .ok_or_else(|| format!("Couldn't get file path as string: {:?}", file_path))?
             .to_string();
 
-        let line_numbers;
-        let mut adding_breakpoint = true;
+        let adding_breakpoint = crate::neovim::toggle_breakpoint_sign(&neovim, line_number)
+            .await
+            .map_err(|e| format!("Breakpoint sign didn't place: {e}"))?;
 
         {
-            let mut breakpoints_lock = self.breakpoints.lock().await;
+            let mut breakpoints_lock = self.pending_breakpoints.lock().await;
 
-            match breakpoints_lock.remove(&file_path) {
-                Some(mut line_numbers) => {
-                    if line_numbers.contains(&line_number) {
-                        line_numbers.remove(&line_number);
-                        adding_breakpoint = false;
-                    } else {
-                        line_numbers.insert(line_number);
-                    }
-                    breakpoints_lock.insert(file_path.clone(), line_numbers);
-                }
-                None => {
-                    let mut line_numbers = HashSet::new();
-                    line_numbers.insert(line_number);
-                    breakpoints_lock.insert(file_path.clone(), line_numbers);
-                }
-            };
-            line_numbers = breakpoints_lock
-                .get(&file_path)
-                .ok_or_else(|| "Couldn't get breakpoint line numbers")?
-                .clone();
+            if adding_breakpoint {
+                breakpoints_lock
+                    .add_pending_breakpoint(file_path.clone(), line_number)
+                    .map_err(|e| format!("Couldn't add breakpoint to pending breakpoints: {e}"))?;
+            } else {
+                breakpoints_lock
+                    .remove_breakpoint(file_path.clone(), line_number)
+                    .map_err(|e| {
+                        format!("Couldn't remove breakpoint from pending breakpoints: {e}")
+                    })?;
+            }
         }
-
-        tracing::trace!("Breakpoints: {:?} {:?}", file_path, line_numbers);
 
         let debuggers = self.debuggers.lock().await;
 
         for debugger in debuggers.values() {
-            debugger
-                .lock()
-                .await
-                .set_source_breakpoints(file_path.clone(), &line_numbers)
-                .await
-                .map_err(|e| format!("Couldn't set breakpoints: {e}"))?;
+            let debugger_lock = debugger.lock().await;
+
+            if adding_breakpoint {
+                debugger_lock
+                    .add_breakpoint(file_path.clone(), line_number)
+                    .await
+                    .map_err(|e| format!("Couldn't set breakpoints: {e}"))?;
+            } else {
+                debugger_lock
+                    .remove_breakpoint(file_path.clone(), line_number)
+                    .await
+                    .map_err(|e| format!("Couldn't remove breakpoints: {e}"))?;
+            }
         }
 
         Ok((if adding_breakpoint {
-            tracing::trace!("Adding breakpoint sign {line_number}");
-            crate::neovim::add_breakpoint_sign(&neovim, line_number)
-                .await
-                .map_err(|e| format!("Breakpoint sign didn't place: {e}"))?;
+            tracing::trace!("Adding breakpoint sign {file_path} {line_number}");
             "breakpoint set"
         } else {
             tracing::trace!("Removing breakpoint sign {file_path} {line_number}");
-            crate::neovim::remove_breakpoint_sign(&neovim, file_path, line_number)
-                .await
-                .map_err(|e| format!("Breakpoint sign didn't place: {e}"))?;
             "breakpoint removed"
         })
         .into())
@@ -353,14 +359,12 @@ impl Handler for NeovimHandler {
             }
             "breakpoint" => self.breakpoint(neovim).await,
             "step_in" => {
-                tracing::trace!("Args: {:?}", args);
                 let args = args
                     .get(0)
                     .ok_or("Step args must be supplied")?
                     .as_array()
                     .ok_or("Step args must be an array")?
                     .to_vec();
-                tracing::trace!("Args: {:?}", args);
                 let instance_id: usize = args
                     .get(0)
                     .ok_or("Instance id must be supplied")?
@@ -378,14 +382,12 @@ impl Handler for NeovimHandler {
                 self.do_step(DebuggerStepType::In, instance_id, count).await
             }
             "step_over" => {
-                tracing::trace!("Args: {:?}", args);
                 let args = args
                     .get(0)
                     .ok_or("Step args must be supplied")?
                     .as_array()
                     .ok_or("Step args must be an array")?
                     .to_vec();
-                tracing::trace!("Args: {:?}", args);
                 let instance_id: usize = args
                     .get(0)
                     .ok_or("Instance id must be supplied")?

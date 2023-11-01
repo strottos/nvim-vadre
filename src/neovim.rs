@@ -8,13 +8,14 @@ use std::{
 
 use anyhow::{anyhow, bail, Result};
 use nvim_rs::{compat::tokio::Compat, Buffer, Neovim, Value, Window};
-use tokio::io::Stdout;
+use tokio::{io::Stdout, sync::OnceCell};
 
-use crate::debuggers::Breakpoint;
+use crate::debuggers::DebuggerBreakpoint;
 
 // Arbitrary number so no clashes with other plugins (hopefully)
 // TODO: Find a better solution
 static VADRE_NEXT_SIGN_ID: AtomicUsize = AtomicUsize::new(1157831);
+static NAMESPACE_ID: OnceCell<i64> = OnceCell::const_new();
 
 lazy_static! {
     static ref VIM_FILE_TYPES: HashMap<&'static str, &'static str> = {
@@ -28,6 +29,19 @@ lazy_static! {
         m.insert("py", "python");
         m
     };
+}
+
+async fn get_namespace_id(neovim: &Neovim<Compat<Stdout>>) -> Result<i64> {
+    let namespace_id: &i64 = NAMESPACE_ID
+        .get_or_init(|| async {
+            neovim
+                .create_namespace("vadre")
+                .await
+                .unwrap_or_else(|_| panic!("Can't create namespace"))
+        })
+        .await;
+
+    Ok(*namespace_id)
 }
 
 #[derive(Clone, Debug)]
@@ -146,6 +160,7 @@ impl VadreBufferType {
         }
     }
 
+    #[must_use]
     fn get_output_buffer(
         current_buf_name: &str,
         type_: VadreOutputBufferSelector,
@@ -252,8 +267,8 @@ enum VadreOutputBufferSelector {
 }
 
 impl VadreOutputBufferSelector {
+    #[must_use]
     fn get_type(type_: &str) -> Result<Self> {
-        tracing::trace!("Type: {}", type_);
         match type_
             .to_lowercase()
             .chars()
@@ -306,6 +321,7 @@ impl NeovimVadreWindow {
         }
     }
 
+    #[must_use]
     pub async fn create_ui(&mut self) -> Result<()> {
         let eventignore_old = self.neovim.get_var("eventignore").await;
         self.neovim.set_var("eventignore", "all".into()).await?;
@@ -390,9 +406,8 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
+    #[must_use]
     pub async fn log_msg(&self, level: VadreLogLevel, msg: &str) -> Result<()> {
-        tracing::trace!("Logging message: {}", msg);
-
         // TODO: Cache this for a while?
         let set_level = match self.neovim.get_var("vadre_log_level").await {
             Ok(x) => match x {
@@ -444,6 +459,7 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
+    #[must_use]
     pub async fn spawn_terminal_command(
         &self,
         command: String,
@@ -465,13 +481,19 @@ impl NeovimVadreWindow {
 
         match debug_program_str {
             Some(debug_program_str) => {
-                self.neovim
+                if let Err(e) = self
+                    .neovim
                     .get_current_win()
                     .await?
                     .get_buf()
                     .await?
                     .set_name(debug_program_str)
-                    .await?;
+                    .await
+                {
+                    // TODO: Find out why we can't do this more than once, I simply don't know at
+                    // present
+                    tracing::error!("Can't set name of terminal buffer: {:?}", e);
+                }
             }
             None => {}
         };
@@ -481,6 +503,7 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
+    #[must_use]
     pub async fn set_code_buffer<'a>(
         &self,
         content: CodeBufferContent<'a>,
@@ -571,6 +594,7 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
+    #[must_use]
     pub async fn set_file_type(&self, file_type: &str) -> Result<()> {
         self.neovim
             .command(&format!("set filetype={}", file_type))
@@ -579,81 +603,96 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
+    #[must_use]
     pub async fn set_call_stack_buffer(&self, content: Vec<String>) -> Result<()> {
         let buffer = self
             .buffers
             .get(&VadreBufferType::CallStack)
-            .ok_or_else(|| anyhow!("call stack output buffer exists"))?;
+            .ok_or_else(|| anyhow!("call stack output buffer doesn't exist"))?;
         self.write_to_buffer(buffer, 0, 0, content).await?;
 
         Ok(())
     }
 
+    #[must_use]
     pub async fn set_variables_buffer(&self, content: Vec<String>) -> Result<()> {
         let buffer = self
             .buffers
             .get(&VadreBufferType::Variables)
-            .ok_or_else(|| anyhow!("variables output buffer exists"))?;
+            .ok_or_else(|| anyhow!("variables output buffer doesn't exist"))?;
         self.write_to_buffer(buffer, 0, 0, content).await?;
 
         Ok(())
     }
 
-    pub async fn toggle_breakpoint_in_buffer(
-        &self,
-        file_path: &str,
-        breakpoints: Vec<&Breakpoint>,
-    ) -> Result<()> {
+    #[must_use]
+    pub async fn set_breakpoints_buffer(&self, content: Vec<String>) -> Result<()> {
         let buffer = self
             .buffers
             .get(&VadreBufferType::Breakpoints)
-            .ok_or_else(|| anyhow!("breakpoints output buffer exists"))?;
-
-        let mut line_count = buffer.line_count().await?;
-        let mut current_contents = buffer.get_lines(0, line_count, false).await?;
-
-        for breakpoint in breakpoints {
-            if breakpoint.file_path != file_path {
-                return Err(anyhow!(
-                    "Breakpoints with wrong file_path: {:?} != {:?}",
-                    breakpoint.file_path,
-                    file_path
-                ));
-            }
-            let breakpoint_info = format!("{}:{}", file_path, breakpoint.source_line_number);
-            let resolved_to_info =
-                if let Some(breakpoint_line_number) = breakpoint.actual_line_number {
-                    if breakpoint.source_line_number != breakpoint_line_number {
-                        format!(" (resolved to line {})", breakpoint_line_number)
-                    } else {
-                        "".to_string()
-                    }
-                } else {
-                    "".to_string()
-                };
-            let line = format!(
-                "({}) {}{}",
-                if breakpoint.enabled { "*" } else { " " },
-                breakpoint_info,
-                resolved_to_info,
-            );
-            if let Some(pos) = current_contents
-                .iter()
-                .position(|x| x.contains(&breakpoint_info))
-            {
-                self.write_to_buffer(buffer, pos.try_into()?, pos.try_into()?, vec![line])
-                    .await?;
-                current_contents = buffer.get_lines(0, line_count, false).await?;
-            } else {
-                self.write_to_buffer(buffer, line_count, line_count, vec![line])
-                    .await?;
-                line_count = buffer.line_count().await?;
-            }
-        }
+            .ok_or_else(|| anyhow!("breakpoints output buffer doesn't exist"))?;
+        self.write_to_buffer(buffer, 0, 0, content).await?;
 
         Ok(())
     }
 
+    // #[must_use]
+    // pub async fn toggle_breakpoint_in_buffer(
+    //     &self,
+    //     file_path: &str,
+    //     breakpoints: Vec<&Breakpoint>,
+    // ) -> Result<()> {
+    //     let buffer = self
+    //         .buffers
+    //         .get(&VadreBufferType::Breakpoints)
+    //         .ok_or_else(|| anyhow!("breakpoints output buffer exists"))?;
+
+    //     let mut line_count = buffer.line_count().await?;
+    //     let mut current_contents = buffer.get_lines(0, line_count, false).await?;
+
+    //     for breakpoint in breakpoints {
+    //         if breakpoint.file_path != file_path {
+    //             return Err(anyhow!(
+    //                 "Breakpoints with wrong file_path: {:?} != {:?}",
+    //                 breakpoint.file_path,
+    //                 file_path
+    //             ));
+    //         }
+    //         let breakpoint_info = format!("{}:{}", file_path, breakpoint.source_line_number);
+    //         let resolved_to_info =
+    //             if let Some(breakpoint_line_number) = breakpoint.actual_line_number {
+    //                 if breakpoint.source_line_number != breakpoint_line_number {
+    //                     format!(" (resolved to line {})", breakpoint_line_number)
+    //                 } else {
+    //                     "".to_string()
+    //                 }
+    //             } else {
+    //                 "".to_string()
+    //             };
+    //         let line = format!(
+    //             "({}) {}{}",
+    //             if breakpoint.enabled { "*" } else { " " },
+    //             breakpoint_info,
+    //             resolved_to_info,
+    //         );
+    //         if let Some(pos) = current_contents
+    //             .iter()
+    //             .position(|x| x.contains(&breakpoint_info))
+    //         {
+    //             self.write_to_buffer(buffer, pos.try_into()?, pos.try_into()?, vec![line])
+    //                 .await?;
+    //             current_contents = buffer.get_lines(0, line_count, false).await?;
+    //         } else {
+    //             self.write_to_buffer(buffer, line_count, line_count, vec![line])
+    //                 .await?;
+    //             line_count = buffer.line_count().await?;
+    //         }
+    //     }
+
+    //     Ok(())
+    // }
+
+    #[must_use]
     pub async fn get_output_window_type(&self) -> Result<VadreBufferType> {
         let output_window = self
             .windows
@@ -669,6 +708,7 @@ impl NeovimVadreWindow {
         Ok(output_buffer_type)
     }
 
+    #[must_use]
     pub async fn change_output_window(&mut self, type_: &str) -> Result<()> {
         let type_ = VadreOutputBufferSelector::get_type(type_)?;
 
@@ -720,6 +760,7 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
+    #[must_use]
     async fn write_to_buffer(
         &self,
         buffer: &Buffer<Compat<Stdout>>,
@@ -749,6 +790,7 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
+    #[must_use]
     async fn set_vadre_buffer_options(
         &self,
         buffer: &Buffer<Compat<Stdout>>,
@@ -784,6 +826,7 @@ impl NeovimVadreWindow {
         }
     }
 
+    #[must_use]
     async fn set_vadre_debugger_keys_for_buffer(
         &self,
         buffer: &Buffer<Compat<Stdout>>,
@@ -866,120 +909,194 @@ impl NeovimVadreWindow {
             .ok()
             .map(|x| x.to_string())
     }
+
+    pub async fn err_writeln(&self, log_msg: &str) -> Result<()> {
+        self.neovim
+            .err_writeln(log_msg)
+            .await
+            .map_err(|e| anyhow!(e))
+    }
 }
 
+#[must_use]
 pub async fn setup_signs(neovim: &Neovim<Compat<Stdout>>) -> Result<()> {
-    let sign_background_colour_output = neovim.exec("highlight SignColumn", true).await?;
-    let sign_background_colour_output = sign_background_colour_output
-        .split("\n")
-        .collect::<Vec<&str>>();
-    assert_eq!(sign_background_colour_output.len(), 1);
+    let sign_background_colour_output = neovim
+        .get_hl(0.into(), vec![("name".into(), "SignColumn".into())])
+        .await?;
 
-    let mut ctermbg = "";
-    let mut guibg = "";
+    tracing::trace!(
+        "sign_background_colour_output: {:?}",
+        sign_background_colour_output
+    );
 
-    for snippet in sign_background_colour_output
-        .get(0)
-        .ok_or_else(|| anyhow!("Couldn't find any background colour output"))?
-        .split(" ")
-    {
-        if snippet.len() >= 8 && &snippet[0..8] == "ctermbg=" {
-            ctermbg = &snippet[8..];
-        } else if snippet.len() >= 6 && &snippet[0..6] == "guibg=" {
-            guibg = &snippet[6..];
+    let mut bg = Value::Nil;
+    let mut ctermbg = Value::Nil;
+
+    for (key, value) in sign_background_colour_output {
+        if key.as_str() == Some("bg") {
+            bg = value;
+        } else if key.as_str() == Some("ctermbg") {
+            ctermbg = value;
         }
     }
 
-    if guibg != "" && ctermbg != "" {
-        neovim
-            .command(&format!(
-                "highlight VadreBreakpointHighlight \
-                     guifg=#ff0000 guibg={} ctermfg=red ctermbg={}",
-                guibg, ctermbg
-            ))
-            .await?;
-        neovim
-            .command(&format!(
-                "highlight VadreDebugPointerHighlight \
-                     guifg=#00ff00 guibg={} ctermfg=green ctermbg={}",
-                guibg, ctermbg
-            ))
-            .await?;
-    } else {
-        neovim
-            .command("highlight VadreBreakpointHighlight guifg=#ff0000 ctermfg=red")
-            .await?;
-        neovim
-            .command("highlight VadreDebugPointerHighlight guifg=#00ff00 ctermfg=green")
-            .await?;
+    let mut source_breakpoint_options = vec![
+        ("fg".into(), "#ff0000".into()),
+        ("ctermfg".into(), "red".into()),
+        ("bold".into(), true.into()),
+    ];
+
+    let mut enabled_breakpoint_options = vec![
+        ("fg".into(), "#ff0000".into()),
+        ("ctermfg".into(), "red".into()),
+        ("bold".into(), true.into()),
+    ];
+
+    let mut debug_pointer_options = vec![
+        ("fg".into(), "#00ff00".into()),
+        ("ctermfg".into(), "green".into()),
+        ("bold".into(), true.into()),
+    ];
+
+    if bg != Value::Nil {
+        source_breakpoint_options.push(("bg".into(), bg.clone()));
+        enabled_breakpoint_options.push(("bg".into(), bg.clone()));
+        debug_pointer_options.push(("bg".into(), bg));
+    }
+
+    if ctermbg != Value::Nil {
+        source_breakpoint_options.push(("ctermbg".into(), ctermbg.clone()));
+        enabled_breakpoint_options.push(("ctermbg".into(), ctermbg.clone()));
+        debug_pointer_options.push(("ctermbg".into(), ctermbg));
     }
 
     neovim
-        .command("sign define VadreBreakpoint text=() texthl=VadreBreakpointHighlight")
+        .set_hl(
+            0,
+            "VadreSourceBreakpointHighlight",
+            source_breakpoint_options,
+        )
         .await?;
     neovim
-        .command("sign define VadreDebugPointer text=-> texthl=VadreDebugPointerHighlight")
+        .set_hl(
+            0,
+            "VadreEnabledBreakpointHighlight",
+            enabled_breakpoint_options,
+        )
+        .await?;
+    neovim
+        .set_hl(0, "VadreDebugPointerHighlight", debug_pointer_options)
         .await?;
 
-    Ok(())
-}
-
-pub async fn add_breakpoint_sign(neovim: &Neovim<Compat<Stdout>>, line_number: i64) -> Result<()> {
-    let buffer_number_output = neovim.exec(&format!("echo bufnr()"), true).await?;
-    let buffer_number = buffer_number_output.trim();
-    let pointer_sign_id = VADRE_NEXT_SIGN_ID.fetch_add(1, Ordering::SeqCst);
-
     neovim
-        .exec(
-            &format!(
-                "sign place {} line={} name=VadreBreakpoint buffer={}",
-                pointer_sign_id, line_number, buffer_number,
-            ),
-            false,
+        .call_function(
+            "sign_define",
+            vec![
+                "VadreSourceBreakpoint".into(),
+                Value::Map(vec![
+                    ("text".into(), "○".into()),
+                    ("texthl".into(), "VadreSourceBreakpointHighlight".into()),
+                ]),
+            ],
+        )
+        .await?;
+    neovim
+        .call_function(
+            "sign_define",
+            vec![
+                "VadreEnabledBreakpoint".into(),
+                Value::Map(vec![
+                    ("text".into(), "⬤".into()),
+                    ("texthl".into(), "VadreEnabledBreakpointHighlight".into()),
+                ]),
+            ],
+        )
+        .await?;
+    neovim
+        .call_function(
+            "sign_define",
+            vec![
+                "VadreDebugPointer".into(),
+                Value::Map(vec![
+                    ("text".into(), "->".into()),
+                    ("texthl".into(), "VadreDebugPointerHighlight".into()),
+                ]),
+            ],
         )
         .await?;
 
     Ok(())
 }
 
-pub async fn remove_breakpoint_sign(
+#[must_use]
+pub async fn toggle_breakpoint_sign(
     neovim: &Neovim<Compat<Stdout>>,
-    file_name: String,
     line_number: i64,
-) -> Result<()> {
+) -> Result<bool> {
+    let buffer_number_output = neovim.exec(&format!("echo bufnr()"), true).await?;
+    let buffer_number = buffer_number_output.trim();
+
+    if let Some(breakpoint_id) = line_is_breakpoint(neovim, buffer_number, line_number).await? {
+        neovim
+            .command(&format!(
+                "sign unplace {} buffer={}",
+                breakpoint_id, buffer_number,
+            ))
+            .await?;
+
+        Ok(false)
+    } else {
+        let pointer_sign_id = VADRE_NEXT_SIGN_ID.fetch_add(1, Ordering::SeqCst);
+
+        neovim
+            .exec(
+                &format!(
+                    "sign place {} line={} name=VadreSourceBreakpoint buffer={}",
+                    pointer_sign_id, line_number, buffer_number,
+                ),
+                false,
+            )
+            .await?;
+
+        Ok(true)
+    }
+}
+
+#[must_use]
+pub async fn line_is_breakpoint(
+    neovim: &Neovim<Compat<Stdout>>,
+    buffer_number: &str,
+    line_number: i64,
+) -> Result<Option<u64>> {
     let signs_in_file = neovim
-        .exec(&format!("sign place file={}", file_name), true)
+        .exec(&format!("sign place buffer={}", buffer_number), true)
         .await?;
+
     let signs_in_file_on_line = signs_in_file
         .split("\n")
         .into_iter()
         .filter(|line| {
-            line.contains("name=VadreBreakpoint") && line.contains(&format!("line={}", line_number))
+            line.contains("name=VadreSourceBreakpoint")
+                && line.contains(&format!("line={}", line_number))
         })
         .collect::<Vec<&str>>();
 
-    assert_eq!(signs_in_file_on_line.len(), 1);
+    assert!(signs_in_file_on_line.len() <= 1);
 
-    let signs_in_file_on_line = signs_in_file_on_line
-        .get(0)
-        .ok_or_else(|| anyhow!("Couldn't find existing Vadre breakpoints"))?;
-    let mut breakpoint_id = 0;
-    for snippet in signs_in_file_on_line.split(" ") {
-        if snippet.len() >= 3 && &snippet[0..3] == "id=" {
-            breakpoint_id = snippet[3..]
-                .parse::<u64>()
-                .map_err(|e| anyhow!("id is a u64: {e}"))?;
+    if let Some(signs_in_file_on_line) = signs_in_file_on_line.get(0) {
+        let mut breakpoint_id = 0;
+        for snippet in signs_in_file_on_line.split(" ") {
+            if snippet.len() >= 3 && &snippet[0..3] == "id=" {
+                breakpoint_id = snippet[3..]
+                    .parse::<u64>()
+                    .map_err(|e| anyhow!("id is a u64: {e}"))?;
+            }
         }
+
+        assert_ne!(breakpoint_id, 0);
+
+        Ok(Some(breakpoint_id))
+    } else {
+        Ok(None)
     }
-
-    tracing::trace!("breakpoint_id: {:?}", breakpoint_id);
-
-    neovim
-        .command(&format!(
-            "sign unplace {} file={}",
-            breakpoint_id, file_name
-        ))
-        .await?;
-
-    Ok(())
 }

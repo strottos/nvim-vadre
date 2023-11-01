@@ -25,4 +25,4 @@ vim.o.expandtab = true
 
 vim.g.vadre_log_level=5
 vim.g.maplocalleader='-'
--- nnoremap <silent> <localleader>b <cmd>VadreBreakpoint<CR>
+vim.api.nvim_set_keymap('n', '<localleader>b', ":VadreBreakpoint<CR>", {noremap = true, silent = true})

@@ -2,7 +2,7 @@
 
 vadre_root=$(dirname "$(realpath $0)")
 
-function setup_environment() {
+function setup_environment {
     local plugins_dir="${vadre_root}/test_files/site/pack/vendor/start"
 
     echo "Installing plugins to ${plugins_dir}"
@@ -43,9 +43,9 @@ function setup_environment() {
   echo "Done setup"
 }
 
-function run_nvim() {
+function run_nvim {
     cargo build --manifest-path="${vadre_root}/Cargo.toml" && nvim --clean -u "${vadre_root}/test_files/vimfiles/mininit.lua" ${@}
 }
 
 setup_environment
-run_nvim
+run_nvim ${@}

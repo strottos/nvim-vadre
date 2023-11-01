@@ -62,25 +62,25 @@ macro_rules! log_ret_err {
     ($e:expr, $logger:expr) => {
         if let Err(e) = $e {
             let msg = format!("Generic error: {}", e);
-            ret_err!(
-                $logger
-                    .lock()
-                    .await
-                    .log_msg(VadreLogLevel::ERROR, &msg)
-                    .await
-            );
+            tracing::error!("{}", msg);
+            $logger
+                .lock()
+                .await
+                .log_msg(VadreLogLevel::ERROR, &msg)
+                .await?;
+            return Err(e);
         }
     };
     ($e:expr, $logger:expr, $msg:expr) => {
         if let Err(e) = $e {
             let msg = format!("{}: {}", $msg, e);
-            ret_err!(
-                $logger
-                    .lock()
-                    .await
-                    .log_msg(VadreLogLevel::ERROR, &msg)
-                    .await
-            );
+            tracing::error!("{}", msg);
+            $logger
+                .lock()
+                .await
+                .log_msg(VadreLogLevel::ERROR, &msg)
+                .await?;
+            return Err(e);
         }
     };
 }
