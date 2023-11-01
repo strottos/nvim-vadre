@@ -103,16 +103,17 @@ local function start_debugger_ui()
     end)
 end
 
-local logs_window_popup
-local callstack_window_popup
-local variables_window_popup
-local breakpoints_window_popup
+local logs_window_popup = {}
+local callstack_window_popup = {}
+local variables_window_popup = {}
+local breakpoints_window_popup = {}
+local displayed_window = {}
 
 local function capitalize(str)
     return (str:gsub("^%l", string.upper))
 end
 
-local function set_popup(type, bufnr)
+local function set_popup(instance_id, type, bufnr)
     local new_popup = Popup({
         enter = false,
         focusable = true,
@@ -143,54 +144,61 @@ local function set_popup(type, bufnr)
         },
     })
 
+    new_popup:map("n", "<Esc>", "<cmd>lua require('vadre.ui').hide_output_window(" .. instance_id .. ")<CR>")
+    new_popup:map("n", "q", "<cmd>lua require('vadre.ui').hide_output_window(" .. instance_id .. ")<CR>")
+    new_popup:map("n", "<", "<cmd>VadreOutputWindow " .. instance_id .. " previous<CR>")
+    new_popup:map("n", ">", "<cmd>VadreOutputWindow " .. instance_id .. " next<CR>")
+
     if type == "logs" then
-        logs_window_popup = new_popup
+        logs_window_popup[instance_id] = new_popup
     elseif type == "callstack" then
-        callstack_window_popup = new_popup
+        callstack_window_popup[instance_id] = new_popup
     elseif type == "variables" then
-        variables_window_popup = new_popup
+        variables_window_popup[instance_id] = new_popup
     elseif type == "breakpoints" then
-        breakpoints_window_popup = new_popup
+        breakpoints_window_popup[instance_id] = new_popup
     else
         vim.notify("Unknown output type: " .. type, vim.log.levels.CRITICAL)
     end
 end
 
-local function display_output_window(type)
+local function hide_output_window(instance_id)
+    logs_window_popup[instance_id]:unmount()
+    callstack_window_popup[instance_id]:unmount()
+    variables_window_popup[instance_id]:unmount()
+    breakpoints_window_popup[instance_id]:unmount()
+    displayed_window[instance_id] = "terminal"
+end
+
+local function display_output_window(instance_id, type)
+    hide_output_window(instance_id)
     if type == "logs" then
-        logs_window_popup:mount()
+        logs_window_popup[instance_id]:mount()
+        displayed_window[instance_id] = "logs"
     elseif type == "callstack" then
-        callstack_window_popup:mount()
+        callstack_window_popup[instance_id]:mount()
+        displayed_window[instance_id] = "callstack"
     elseif type == "variables" then
-        variables_window_popup:mount()
+        variables_window_popup[instance_id]:mount()
+        displayed_window[instance_id] = "variables"
     elseif type == "breakpoints" then
-        breakpoints_window_popup:mount()
+        breakpoints_window_popup[instance_id]:mount()
+        displayed_window[instance_id] = "breakpoints"
     elseif type == "terminal" then
+        displayed_window[instance_id] = "terminal"
     else
         vim.notify("Unknown output type: " .. type, vim.log.levels.CRITICAL)
     end
 end
 
-local function hide_output_window(type)
-    if type == "logs" then
-        logs_window_popup:unmount()
-    elseif type == "callstack" then
-        callstack_window_popup:unmount()
-    elseif type == "variables" then
-        variables_window_popup:unmount()
-    elseif type == "breakpoints" then
-        breakpoints_window_popup:unmount()
-    elseif type == "terminal" then
-    else
-        vim.notify("Unknown output type: " .. type, vim.log.levels.CRITICAL)
-    end
+local function get_current_output_window(instance_id)
+    return displayed_window[instance_id] or "terminal"
 end
 
-local M = {
+return {
     start_debugger_ui = start_debugger_ui,
     set_popup = set_popup,
     display_output_window = display_output_window,
     hide_output_window = hide_output_window,
+    get_current_output_window = get_current_output_window,
 }
-
-return M

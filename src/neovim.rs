@@ -13,9 +13,9 @@ use tokio::{io::Stdout, sync::OnceCell};
 use crate::debuggers::DebuggerBreakpoint;
 
 // Arbitrary number so no clashes with other plugins (hopefully)
-// TODO: Find a better solution
+// TODO: Find a better solution (looked into a few times and not sure current neovim API supports
+// anything better).
 static VADRE_NEXT_SIGN_ID: AtomicUsize = AtomicUsize::new(1157831);
-static NAMESPACE_ID: OnceCell<i64> = OnceCell::const_new();
 
 lazy_static! {
     static ref VIM_FILE_TYPES: HashMap<&'static str, &'static str> = {
@@ -29,19 +29,6 @@ lazy_static! {
         m.insert("py", "python");
         m
     };
-}
-
-async fn get_namespace_id(neovim: &Neovim<Compat<Stdout>>) -> Result<i64> {
-    let namespace_id: &i64 = NAMESPACE_ID
-        .get_or_init(|| async {
-            neovim
-                .create_namespace("vadre")
-                .await
-                .unwrap_or_else(|_| panic!("Can't create namespace"))
-        })
-        .await;
-
-    Ok(*namespace_id)
 }
 
 #[derive(Clone, Debug)]
@@ -336,36 +323,24 @@ impl NeovimVadreWindow {
         assert_eq!(2, windows.len());
 
         // Window 1 is Code
-        let window = windows.next().ok_or_else(|| anyhow!("No code window"))?;
-        let buffer = window.get_buf().await?;
-        self.neovim.set_current_win(&window).await?;
-        self.set_vadre_buffer_options(&buffer, &VadreBufferType::Code)
+        let code_window = windows.next().ok_or_else(|| anyhow!("No code window"))?;
+        let code_buffer = code_window.get_buf().await?;
+        self.neovim.set_current_win(&code_window).await?;
+        self.set_vadre_buffer_options(&code_buffer, &VadreBufferType::Code)
             .await?;
-        self.set_vadre_debugger_keys_for_buffer(&buffer).await?;
-
-        self.windows.insert(VadreWindowType::Code, window);
-        self.buffers.insert(VadreBufferType::Code, buffer);
+        self.set_vadre_debugger_keys_for_buffer(&code_buffer)
+            .await?;
 
         // Window 2 is Terminal
-        let window = windows
+        let output_window = windows
             .next()
             .ok_or_else(|| anyhow!("No terminal window"))?;
-        let terminal_buffer = window.get_buf().await?;
+        let terminal_buffer = output_window.get_buf().await?;
         self.set_vadre_buffer_options(&terminal_buffer, &VadreBufferType::Terminal)
             .await?;
 
-        self.windows.insert(VadreWindowType::Output, window);
-        self.buffers
-            .insert(VadreBufferType::Terminal, terminal_buffer);
-
         // Extra output buffers
-        let code_window = self.neovim.get_current_win().await?;
-
-        let terminal_window = self
-            .windows
-            .get(&VadreWindowType::Output)
-            .ok_or_else(|| anyhow!("Can't find terminal window"))?;
-        self.neovim.set_current_win(&terminal_window).await?;
+        self.neovim.set_current_win(&output_window).await?;
 
         for buffer_type in vec![
             VadreBufferType::Logs,
@@ -380,7 +355,8 @@ impl NeovimVadreWindow {
             self.neovim
                 .exec_lua(
                     &format!(
-                        "require('vadre.ui').set_popup('{}', {})",
+                        "require('vadre.ui').set_popup({}, '{}', {})",
+                        self.instance_id,
                         buffer_type.lua_name(),
                         buffer.get_number().await?,
                     ),
@@ -394,8 +370,39 @@ impl NeovimVadreWindow {
 
         self.neovim.set_current_win(&code_window).await?;
 
+        self.windows.insert(VadreWindowType::Code, code_window);
+        self.windows.insert(VadreWindowType::Output, output_window);
+        self.buffers.insert(VadreBufferType::Code, code_buffer);
+        self.buffers
+            .insert(VadreBufferType::Terminal, terminal_buffer);
+
         // Special first log line to get rid of the annoying
         self.log_msg(VadreLogLevel::INFO, "Vadre Setup UI").await?;
+
+        let au_group_name = format!("vadre_{}", self.instance_id);
+
+        self.neovim.create_augroup(&au_group_name, vec![]).await?;
+        self.neovim
+            .exec_lua(
+                &format!(
+                    r#"vim.api.nvim_create_autocmd(
+                        {{"BufHidden"}},
+                        {{
+                             callback = require("vadre.autocmds").on_close_vadre_window,
+                             group = "{}",
+                             buffer = {},
+                         }}
+                    )"#,
+                    au_group_name,
+                    self.buffers
+                        .get(&VadreBufferType::Code)
+                        .ok_or_else(|| anyhow!("Can't find Code buffer"))?
+                        .get_number()
+                        .await?,
+                ),
+                vec![],
+            )
+            .await?;
 
         match eventignore_old {
             Ok(x) => self.neovim.set_var("eventignore", x).await?,
@@ -461,7 +468,7 @@ impl NeovimVadreWindow {
 
     #[must_use]
     pub async fn spawn_terminal_command(
-        &self,
+        &mut self,
         command: String,
         debug_program_str: Option<&str>,
     ) -> Result<()> {
@@ -479,15 +486,51 @@ impl NeovimVadreWindow {
             .command(&format!("terminal! {}", command))
             .await?;
 
+        let terminal_buffer = terminal_window.get_buf().await?;
+
+        let au_group_name = format!("vadre_{}", self.instance_id);
+        self.neovim
+            .exec_lua(
+                &format!(
+                    r#"vim.api.nvim_create_autocmd(
+                        {{"BufHidden"}},
+                        {{
+                            callback = require("vadre.autocmds").on_close_vadre_window,
+                            group = "{}",
+                            buffer = {},
+                        }}
+                    )"#,
+                    au_group_name,
+                    terminal_buffer.get_number().await?,
+                ),
+                vec![],
+            )
+            .await?;
+        self.neovim
+            .exec_lua(
+                &format!(
+                    r#"vim.api.nvim_create_autocmd(
+                        {{"BufEnter"}},
+                        {{
+                            callback = require("vadre.autocmds").on_enter_vadre_output_window,
+                            group = "{}",
+                            buffer = {},
+                        }}
+                    )"#,
+                    au_group_name,
+                    terminal_buffer.get_number().await?,
+                ),
+                vec![],
+            )
+            .await?;
+
         match debug_program_str {
             Some(debug_program_str) => {
-                if let Err(e) = self
-                    .neovim
-                    .get_current_win()
-                    .await?
-                    .get_buf()
-                    .await?
-                    .set_name(debug_program_str)
+                if let Err(e) = terminal_buffer
+                    .set_name(&format!(
+                        "Vadre Program ({}) - {}",
+                        self.instance_id, debug_program_str
+                    ))
                     .await
                 {
                     // TODO: Find out why we can't do this more than once, I simply don't know at
@@ -497,6 +540,9 @@ impl NeovimVadreWindow {
             }
             None => {}
         };
+
+        self.buffers
+            .insert(VadreBufferType::Terminal, terminal_buffer);
 
         self.neovim.set_current_win(&original_window).await?;
 
@@ -636,76 +682,9 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
-    // #[must_use]
-    // pub async fn toggle_breakpoint_in_buffer(
-    //     &self,
-    //     file_path: &str,
-    //     breakpoints: Vec<&Breakpoint>,
-    // ) -> Result<()> {
-    //     let buffer = self
-    //         .buffers
-    //         .get(&VadreBufferType::Breakpoints)
-    //         .ok_or_else(|| anyhow!("breakpoints output buffer exists"))?;
-
-    //     let mut line_count = buffer.line_count().await?;
-    //     let mut current_contents = buffer.get_lines(0, line_count, false).await?;
-
-    //     for breakpoint in breakpoints {
-    //         if breakpoint.file_path != file_path {
-    //             return Err(anyhow!(
-    //                 "Breakpoints with wrong file_path: {:?} != {:?}",
-    //                 breakpoint.file_path,
-    //                 file_path
-    //             ));
-    //         }
-    //         let breakpoint_info = format!("{}:{}", file_path, breakpoint.source_line_number);
-    //         let resolved_to_info =
-    //             if let Some(breakpoint_line_number) = breakpoint.actual_line_number {
-    //                 if breakpoint.source_line_number != breakpoint_line_number {
-    //                     format!(" (resolved to line {})", breakpoint_line_number)
-    //                 } else {
-    //                     "".to_string()
-    //                 }
-    //             } else {
-    //                 "".to_string()
-    //             };
-    //         let line = format!(
-    //             "({}) {}{}",
-    //             if breakpoint.enabled { "*" } else { " " },
-    //             breakpoint_info,
-    //             resolved_to_info,
-    //         );
-    //         if let Some(pos) = current_contents
-    //             .iter()
-    //             .position(|x| x.contains(&breakpoint_info))
-    //         {
-    //             self.write_to_buffer(buffer, pos.try_into()?, pos.try_into()?, vec![line])
-    //                 .await?;
-    //             current_contents = buffer.get_lines(0, line_count, false).await?;
-    //         } else {
-    //             self.write_to_buffer(buffer, line_count, line_count, vec![line])
-    //                 .await?;
-    //             line_count = buffer.line_count().await?;
-    //         }
-    //     }
-
-    //     Ok(())
-    // }
-
     #[must_use]
     pub async fn get_output_window_type(&self) -> Result<VadreBufferType> {
-        let output_window = self
-            .windows
-            .get(&VadreWindowType::Output)
-            .ok_or_else(|| anyhow!("can't get output window"))?;
-        let output_buffer_name = &output_window.get_buf().await?.get_name().await?;
-        let mut split = output_buffer_name.rsplit(" - ");
-        let output_buffer_type = split
-            .next()
-            .ok_or_else(|| anyhow!("can't retrieve output buffer type"))?;
-        let output_buffer_type = VadreBufferType::get_buffer_type_from_str(output_buffer_type);
-
-        Ok(output_buffer_type)
+        Ok(self.current_output.clone())
     }
 
     #[must_use]
@@ -724,18 +703,9 @@ impl NeovimVadreWindow {
         self.neovim
             .exec_lua(
                 &format!(
-                    "require('vadre.ui').display_output_window('{}')",
+                    "require('vadre.ui').display_output_window({}, '{}')",
+                    self.instance_id,
                     new_output_type.lua_name()
-                ),
-                vec![],
-            )
-            .await
-            .map_err(|e| anyhow!("Lua error: {e:?}"))?;
-        self.neovim
-            .exec_lua(
-                &format!(
-                    "require('vadre.ui').hide_output_window('{}')",
-                    self.current_output.lua_name()
                 ),
                 vec![],
             )
@@ -743,19 +713,6 @@ impl NeovimVadreWindow {
             .map_err(|e| anyhow!("Lua error: {e:?}"))?;
 
         self.current_output = new_output_type;
-
-        //        let output_window = self
-        //            .windows
-        //            .get(&VadreWindowType::Output)
-        //            .ok_or_else(|| anyhow!("can get output window"))?;
-        //        let new_buffer = self
-        //            .buffers
-        //            .get(&new_buffer_type)
-        //            .ok_or_else(|| anyhow!("can retrieve next buffer"))?;
-        //        output_window.set_buf(new_buffer).await?;
-        //        output_window
-        //            .set_option("wrap", new_buffer_type.buffer_should_wrap().into())
-        //            .await?;
 
         Ok(())
     }

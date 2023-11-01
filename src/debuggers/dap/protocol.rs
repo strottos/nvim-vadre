@@ -4,11 +4,11 @@
 
 pub use super::schema::{
     Breakpoint, BreakpointEventBody, CancelArguments, Capabilities, CapabilitiesEventBody,
-    ContinueArguments, ContinueResponseBody, ContinuedEventBody, ExitedEventBody,
-    InitializeRequest, InitializeRequestArguments, InitializeResponse, InvalidatedEventBody,
-    LaunchRequestArguments, ModuleEventBody, NextArguments, OutputEventBody, PauseArguments,
-    ProcessEventBody, RunInTerminalRequestArguments, RunInTerminalResponseBody, ScopesArguments,
-    ScopesResponseBody, SetBreakpointsArguments, SetBreakpointsResponseBody,
+    ContinueArguments, ContinueResponseBody, ContinuedEventBody, DisconnectArguments,
+    ExitedEventBody, InitializeRequest, InitializeRequestArguments, InitializeResponse,
+    InvalidatedEventBody, LaunchRequestArguments, ModuleEventBody, NextArguments, OutputEventBody,
+    PauseArguments, ProcessEventBody, RunInTerminalRequestArguments, RunInTerminalResponseBody,
+    ScopesArguments, ScopesResponseBody, SetBreakpointsArguments, SetBreakpointsResponseBody,
     SetExceptionBreakpointsArguments, SetFunctionBreakpointsArguments, Source, SourceArguments,
     SourceBreakpoint, SourceResponseBody, StackTraceArguments, StackTraceResponseBody,
     StepInArguments, StoppedEventBody, TerminatedEventBody, ThreadEventBody, ThreadsResponseBody,
@@ -86,6 +86,7 @@ pub enum RequestArguments {
     scopes(ScopesArguments),
     source(SourceArguments),
     variables(VariablesArguments),
+    disconnect(DisconnectArguments),
     // Reverse
     runInTerminal(RunInTerminalRequestArguments),
     #[serde(other)]
@@ -134,6 +135,7 @@ pub enum ResponseBody {
     scopes(ScopesResponseBody),
     source(SourceResponseBody),
     variables(VariablesResponseBody),
+    disconnect(Option<Empty>),
     // Reverse
     runInTerminal(RunInTerminalResponseBody),
 }

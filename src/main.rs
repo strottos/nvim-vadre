@@ -25,7 +25,7 @@ use std::{
 use async_trait::async_trait;
 use debuggers::{Breakpoints, Debugger, DebuggerStepType};
 use nvim_rs::{compat::tokio::Compat, create::tokio as create, Handler, Neovim, Value};
-use tokio::{io::Stdout, sync::Mutex};
+use tokio::{io::Stdout, sync::Mutex, time::timeout};
 
 static VADRE_NEXT_INSTANCE_NUM: AtomicUsize = AtomicUsize::new(1);
 
@@ -327,6 +327,30 @@ impl NeovimHandler {
 
         Ok("".into())
     }
+
+    async fn stop_debugger(&self, instance_id: usize) -> VadreResult {
+        let mut debuggers_lock = self.debuggers.lock().await;
+
+        let debugger = debuggers_lock
+            .get(&instance_id)
+            .ok_or("Debugger didn't exist")?;
+
+        let ret;
+
+        if let Err(e) = timeout(Duration::new(5, 0), debugger.lock().await.stop())
+            .await
+            .map_err(|e| format!("Couldn't stop debugger: {e}"))?
+        {
+            tracing::error!("Timed out stopping debugger: {e}");
+            ret = Err(format!("Debugger instance {} stopped", instance_id).into());
+        } else {
+            ret = Ok(format!("Debugger instance {} failed to stop", instance_id).into());
+        }
+
+        debuggers_lock.remove(&instance_id);
+
+        ret
+    }
 }
 
 #[async_trait]
@@ -441,7 +465,18 @@ impl Handler for NeovimHandler {
 
                 self.change_output_window(instance_id, type_).await
             }
-            _ => unimplemented!(),
+            "stop_debugger" => {
+                let instance_id: usize = args
+                    .get(0)
+                    .ok_or("Instance id must be supplied")?
+                    .as_str()
+                    .ok_or("Instance id must be a string")?
+                    .parse::<usize>()
+                    .map_err(|e| format!("Instance id is usize: {e}"))?;
+
+                self.stop_debugger(instance_id).await
+            }
+            _ => Err(format!("Unimplemented {}", name).into()),
         }
     }
 }

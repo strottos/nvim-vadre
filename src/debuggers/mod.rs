@@ -26,9 +26,9 @@ use crate::{
 use dap::{
     protocol::{
         self as dap_protocol, BreakpointEventBody, ContinueArguments, DAPCodec, DecoderResult,
-        Either, EventBody, InitializeRequestArguments, NextArguments, ProtocolMessage,
-        ProtocolMessageType, RequestArguments, Response, ResponseBody, ResponseResult,
-        RunInTerminalResponseBody, ScopesArguments, SetBreakpointsArguments,
+        DisconnectArguments, Either, EventBody, InitializeRequestArguments, NextArguments,
+        ProtocolMessage, ProtocolMessageType, RequestArguments, Response, ResponseBody,
+        ResponseResult, RunInTerminalResponseBody, ScopesArguments, SetBreakpointsArguments,
         SetExceptionBreakpointsArguments, SetFunctionBreakpointsArguments, Source, SourceArguments,
         SourceBreakpoint, StackTraceArguments, StepInArguments, StoppedEventBody,
         VariablesArguments,
@@ -177,7 +177,6 @@ impl Breakpoints {
     }
 
     fn get_breakpoint_for_id(&self, id: &i64) -> Option<(String, i64)> {
-        tracing::trace!("get_breakpoint_for_id {:?}: {:#?}", id, self);
         for (source_file_path, line_map) in self.0.iter() {
             for (source_line_number, breakpoint) in line_map.iter() {
                 if breakpoint.resolved.contains_key(&id.to_string()) {
@@ -942,29 +941,58 @@ impl Debugger {
             .change_output_window(type_)
             .await?;
 
-        // let current_output_window_type = self
-        //     .neovim_vadre_window
-        //     .lock()
-        //     .await
-        //     .get_output_window_type()
-        //     .await?;
+        let current_output_window_type = self
+            .neovim_vadre_window
+            .lock()
+            .await
+            .get_output_window_type()
+            .await?;
 
-        // TODO: Get callstack or variables when needed
-        // match current_output_window_type {
-        //     VadreBufferType::CallStack | VadreBufferType::Variables => {
-        //         log_err!(
-        //             Debugger::process_output_info(
-        //                 self.debugger_sender_tx.clone(),
-        //                 self.neovim_vadre_window.clone(),
-        //                 self.data.clone(),
-        //             )
-        //             .await,
-        //             self.neovim_vadre_window.clone(),
-        //             "can get thread info"
-        //         );
-        //     }
-        //     _ => {}
-        // };
+        match current_output_window_type {
+            VadreBufferType::CallStack | VadreBufferType::Variables => {
+                log_err!(
+                    Debugger::process_output_info(
+                        self.debugger_sender_tx.clone(),
+                        self.neovim_vadre_window.clone(),
+                        self.data.clone(),
+                    )
+                    .await,
+                    self.neovim_vadre_window.clone(),
+                    "can get thread info"
+                );
+            }
+            _ => {}
+        };
+
+        Ok(())
+    }
+
+    #[must_use]
+    pub(crate) async fn stop(&self) -> Result<()> {
+        if let Some(child) = self.process.lock().await.as_mut() {
+            let request = RequestArguments::disconnect(DisconnectArguments {
+                restart: Some(false),
+                suspend_debuggee: None,
+                terminate_debuggee: Some(true),
+            });
+
+            let resp = dap_shared::do_send_request_and_await_response(
+                request.clone(),
+                self.debugger_sender_tx.clone(),
+            )
+            .await?;
+
+            match resp {
+                ResponseResult::Success { .. } => {}
+                ResponseResult::Error {
+                    command: _,
+                    message,
+                    show_user: _,
+                } => bail!("An error occurred stepping {}", message),
+            };
+
+            child.kill().await?;
+        }
 
         Ok(())
     }
@@ -1123,20 +1151,11 @@ impl Debugger {
             }
             EventBody::continued(_) => Ok(()),
             EventBody::breakpoint(breakpoint_event) => {
-                Debugger::handle_event_breakpoint(breakpoint_event, neovim_vadre_window, data)
-                    .await?;
-                Ok(())
+                Debugger::handle_event_breakpoint(breakpoint_event, neovim_vadre_window, data).await
             }
             _ => {
                 tracing::trace!("Got unhandled event {:?}", event);
-                neovim_vadre_window
-                    .lock()
-                    .await
-                    .log_msg(
-                        VadreLogLevel::WARN,
-                        &format!("Debugger unhandled event: {:?}", event),
-                    )
-                    .await
+                Ok(())
             }
         }
     }
@@ -1349,129 +1368,193 @@ impl Debugger {
     ) -> Result<()> {
         tracing::debug!("Getting thread information");
 
-        //         let mut call_stack_buffer_content = Vec::new();
-        //         let current_thread_id = data.lock().await.current_thread_id;
-        //
-        //         let current_output_window_type = neovim_vadre_window
-        //             .lock()
-        //             .await
-        //             .get_output_window_type()
-        //             .await?;
-        //
-        //         let response_result = dap_shared::do_send_request_and_await_response(
-        //             RequestArguments::threads(None),
-        //             debugger_sender_tx.clone(),
-        //         )
-        //         .await?;
-        //
-        //         if let ResponseResult::Success { body } = response_result {
-        //             if let ResponseBody::threads(threads_body) = body {
-        //                 for thread in threads_body.threads {
-        //                     let thread_id = thread.id;
-        //                     let thread_name = thread.name;
-        //
-        //                     if current_thread_id == Some(thread_id) {
-        //                         call_stack_buffer_content.push(format!("{} (*)", thread_name));
-        //
-        //                         let stack_trace_response = dap_shared::do_send_request_and_await_response(
-        //                             RequestArguments::stackTrace(StackTraceArguments {
-        //                                 thread_id,
-        //                                 format: None,
-        //                                 levels: None,
-        //                                 start_frame: None,
-        //                             }),
-        //                             debugger_sender_tx.clone(),
-        //                         )
-        //                         .await?;
-        //
-        //                         // Sometimes we don't get a body here as we get a message saying invalid thread,
-        //                         // normally when the thread is doing something in blocking.
-        //                         if let ResponseResult::Success { body } = stack_trace_response {
-        //                             if let ResponseBody::stackTrace(stack_trace_body) = body {
-        //                                 let frames = stack_trace_body.stack_frames;
-        //
-        //                                 let top_frame =
-        //                                     frames.get(0).expect("has a frame on the stack trace");
-        //                                 let frame_id = top_frame.id;
-        //                                 data.lock().await.current_frame_id = Some(frame_id);
-        //
-        //                                 if current_output_window_type == VadreBufferType::Variables {
-        //                                     Debugger::process_variables(
-        //                                         frame_id,
-        //                                         debugger_sender_tx.clone(),
-        //                                         neovim_vadre_window.clone(),
-        //                                     )
-        //                                     .await?;
-        //                                 }
-        //
-        //                                 if current_output_window_type == VadreBufferType::CallStack {
-        //                                     for frame in frames {
-        //                                         call_stack_buffer_content.push(format!("+ {}", frame.name));
-        //
-        //                                         let line_number = frame.line;
-        //                                         let source = frame.source.unwrap();
-        //                                         if let Some(source_name) = source.name {
-        //                                             if let Some(_) = source.path {
-        //                                                 call_stack_buffer_content.push(format!(
-        //                                                     "  - {}:{}",
-        //                                                     source_name, line_number
-        //                                                 ));
-        //                                             } else {
-        //                                                 call_stack_buffer_content.push(format!(
-        //                                                     "  - {}:{} (dissassembled)",
-        //                                                     source_name, line_number
-        //                                                 ));
-        //                                             }
-        //                                         } else if let Some(source_path) = source.path {
-        //                                             call_stack_buffer_content.push(format!(
-        //                                                 "  - {}:{}",
-        //                                                 source_path, line_number
-        //                                             ));
-        //                                         } else {
-        //                                             call_stack_buffer_content.push(format!(
-        //                                                 " - source not understood {:?}",
-        //                                                 source
-        //                                             ));
-        //                                         }
-        //                                     }
-        //                                 }
-        //                             }
-        //                         }
-        //                     } else if current_output_window_type == VadreBufferType::CallStack {
-        //                         let stack_trace_response = dap_shared::do_send_request_and_await_response(
-        //                             RequestArguments::stackTrace(StackTraceArguments {
-        //                                 thread_id,
-        //                                 format: None,
-        //                                 levels: None,
-        //                                 start_frame: None,
-        //                             }),
-        //                             debugger_sender_tx.clone(),
-        //                         )
-        //                         .await?;
-        //
-        //                         if let ResponseResult::Success { body } = stack_trace_response {
-        //                             if let ResponseBody::stackTrace(stack_trace_body) = body {
-        //                                 let frame_name =
-        //                                     &stack_trace_body.stack_frames.get(0).unwrap().name;
-        //
-        //                                 call_stack_buffer_content
-        //                                     .push(format!("{} - {}", thread_name, frame_name));
-        //                             } else {
-        //                                 call_stack_buffer_content.push(format!("{}", thread_name));
-        //                             }
-        //                         }
-        //                     }
-        //                 }
-        //             }
-        //         }
-        //
-        //         if current_output_window_type == VadreBufferType::CallStack {
-        //             neovim_vadre_window
-        //                 .lock()
-        //                 .await
-        //                 .set_call_stack_buffer(call_stack_buffer_content)
-        //                 .await?;
-        //         }
+        let mut call_stack_buffer_content = Vec::new();
+        let current_thread_id = data.lock().await.current_thread_id;
+
+        let current_output_window_type = neovim_vadre_window
+            .lock()
+            .await
+            .get_output_window_type()
+            .await?;
+
+        let response_result = dap_shared::do_send_request_and_await_response(
+            RequestArguments::threads(None),
+            debugger_sender_tx.clone(),
+        )
+        .await?;
+
+        if let ResponseResult::Success { body } = response_result {
+            if let ResponseBody::threads(threads_body) = body {
+                for thread in threads_body.threads {
+                    let thread_id = thread.id;
+                    let thread_name = thread.name;
+
+                    if current_thread_id == Some(thread_id) {
+                        call_stack_buffer_content.push(format!("{} (*)", thread_name));
+
+                        let stack_trace_response = dap_shared::do_send_request_and_await_response(
+                            RequestArguments::stackTrace(StackTraceArguments {
+                                thread_id,
+                                format: None,
+                                levels: None,
+                                start_frame: None,
+                            }),
+                            debugger_sender_tx.clone(),
+                        )
+                        .await?;
+
+                        // Sometimes we don't get a body here as we get a message saying invalid thread,
+                        // normally when the thread is doing something in blocking.
+                        if let ResponseResult::Success { body } = stack_trace_response {
+                            if let ResponseBody::stackTrace(stack_trace_body) = body {
+                                let frames = stack_trace_body.stack_frames;
+
+                                let top_frame =
+                                    frames.get(0).expect("has a frame on the stack trace");
+                                let frame_id = top_frame.id;
+                                data.lock().await.current_frame_id = Some(frame_id);
+
+                                if current_output_window_type == VadreBufferType::Variables {
+                                    Debugger::process_variables(
+                                        frame_id,
+                                        debugger_sender_tx.clone(),
+                                        neovim_vadre_window.clone(),
+                                    )
+                                    .await?;
+                                }
+
+                                if current_output_window_type == VadreBufferType::CallStack {
+                                    for frame in frames {
+                                        call_stack_buffer_content.push(format!("+ {}", frame.name));
+
+                                        let line_number = frame.line;
+                                        let source = frame.source.unwrap();
+                                        if let Some(source_name) = source.name {
+                                            if let Some(_) = source.path {
+                                                call_stack_buffer_content.push(format!(
+                                                    "  - {}:{}",
+                                                    source_name, line_number
+                                                ));
+                                            } else {
+                                                call_stack_buffer_content.push(format!(
+                                                    "  - {}:{} (dissassembled)",
+                                                    source_name, line_number
+                                                ));
+                                            }
+                                        } else if let Some(source_path) = source.path {
+                                            call_stack_buffer_content.push(format!(
+                                                "  - {}:{}",
+                                                source_path, line_number
+                                            ));
+                                        } else {
+                                            call_stack_buffer_content.push(format!(
+                                                " - source not understood {:?}",
+                                                source
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if current_output_window_type == VadreBufferType::CallStack {
+                        let stack_trace_response = dap_shared::do_send_request_and_await_response(
+                            RequestArguments::stackTrace(StackTraceArguments {
+                                thread_id,
+                                format: None,
+                                levels: None,
+                                start_frame: None,
+                            }),
+                            debugger_sender_tx.clone(),
+                        )
+                        .await?;
+
+                        if let ResponseResult::Success { body } = stack_trace_response {
+                            if let ResponseBody::stackTrace(stack_trace_body) = body {
+                                let frame_name =
+                                    &stack_trace_body.stack_frames.get(0).unwrap().name;
+
+                                call_stack_buffer_content
+                                    .push(format!("{} - {}", thread_name, frame_name));
+                            } else {
+                                call_stack_buffer_content.push(format!("{}", thread_name));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if current_output_window_type == VadreBufferType::CallStack {
+            neovim_vadre_window
+                .lock()
+                .await
+                .set_call_stack_buffer(call_stack_buffer_content)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(debugger_sender_tx, neovim_vadre_window,))]
+    async fn process_variables(
+        frame_id: i64,
+        debugger_sender_tx: mpsc::Sender<(
+            ProtocolMessageType,
+            Option<oneshot::Sender<ResponseResult>>,
+        )>,
+        neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
+    ) -> Result<()> {
+        tracing::debug!("Getting variable information");
+
+        let mut variable_content = Vec::new();
+
+        let scopes_response_result = dap_shared::do_send_request_and_await_response(
+            RequestArguments::scopes(ScopesArguments { frame_id }),
+            debugger_sender_tx.clone(),
+        )
+        .await?;
+
+        if let ResponseResult::Success { body } = scopes_response_result {
+            if let ResponseBody::scopes(scopes_body) = body {
+                for scope in scopes_body.scopes {
+                    variable_content.push(format!("{}:", scope.name));
+
+                    let variables_response_result = dap_shared::do_send_request_and_await_response(
+                        RequestArguments::variables(VariablesArguments {
+                            count: None,
+                            filter: None,
+                            format: None,
+                            start: None,
+                            variables_reference: scope.variables_reference,
+                        }),
+                        debugger_sender_tx.clone(),
+                    )
+                    .await?;
+
+                    if let ResponseResult::Success { body } = variables_response_result {
+                        if let ResponseBody::variables(variables_body) = body {
+                            for variable in variables_body.variables {
+                                let name = variable.name;
+                                let value = variable.value;
+
+                                if let Some(type_) = variable.type_ {
+                                    variable_content
+                                        .push(format!("+ ({}) {} = {:?}", type_, name, value));
+                                } else {
+                                    variable_content.push(format!("+ {} = {:?}", name, value));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                neovim_vadre_window
+                    .lock()
+                    .await
+                    .set_variables_buffer(variable_content)
+                    .await?;
+            }
+        }
 
         Ok(())
     }

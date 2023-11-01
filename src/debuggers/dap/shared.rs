@@ -1,15 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use super::protocol::{ProtocolMessageType, RequestArguments, ResponseResult};
-use crate::{
-    neovim::NeovimVadreWindow,
-    util::{log_ret_err, ret_err},
-    VadreLogLevel,
-};
 
 use anyhow::{bail, Result};
 use tokio::{
-    sync::{mpsc, oneshot, Mutex},
+    sync::{mpsc, oneshot},
     time::timeout,
 };
 
