@@ -21,7 +21,7 @@ use std::{
 
 use crate::{
     neovim::{CodeBufferContent, NeovimVadreWindow, VadreBufferType, VadreLogLevel},
-    util::{get_unused_localhost_port, log_err, log_ret_err, ret_err},
+    util::get_unused_localhost_port,
 };
 use dap::{
     protocol::{
@@ -379,20 +379,23 @@ impl Debugger {
         let path = self.debugger_type.get_debugger_path()?;
 
         if !path.exists() {
-            bail!("The binary doesn't exist: {}", path.to_str().unwrap());
+            bail!("The binary doesn't exist: {:?}", path);
         }
 
         let args = vec!["--port".to_string(), port.to_string()];
 
         tracing::debug!("Spawning process: {:?} {:?}", path, args);
 
-        let mut child = Command::new(path.to_str().unwrap())
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| anyhow!("Failed to spawn debugger: {}", e))?;
+        let mut child = Command::new(
+            path.to_str()
+                .ok_or_else(|| anyhow!("Can't convert path to string: {:?}", path))?,
+        )
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow!("Failed to spawn debugger: {}", e))?;
 
         let stdout = child
             .stdout
@@ -537,33 +540,33 @@ impl Debugger {
             let mut pending_responses: HashMap<u32, oneshot::Sender<ResponseResult>> =
                 HashMap::new();
 
+            async fn report_error(
+                msg: String,
+                neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
+            ) -> Result<()> {
+                tracing::error!("{}", msg);
+                neovim_vadre_window
+                    .lock()
+                    .await
+                    .log_msg(VadreLogLevel::ERROR, &msg)
+                    .await?;
+                neovim_vadre_window
+                    .lock()
+                    .await
+                    .err_writeln(&msg)
+                    .await
+                    .unwrap_or_else(|vim_err| {
+                        tracing::error!("Couldn't write to neovim: {}", vim_err);
+                    });
+
+                Ok(())
+            }
             loop {
                 tokio::select! {
                     msg = framed_stream.next() => {
                         tracing::trace!("Got message from debugger {:?}", msg);
                         match msg {
                             Some(Ok(decoder_result)) => {
-                                async fn report_error(
-                                    msg: String,
-                                    neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>
-                                ) -> Result<()> {
-                                    tracing::error!("{}", msg);
-                                    neovim_vadre_window
-                                        .lock()
-                                        .await
-                                        .log_msg(VadreLogLevel::ERROR, &msg)
-                                        .await?;
-                                    neovim_vadre_window
-                                        .lock()
-                                        .await
-                                        .err_writeln(&msg)
-                                        .await
-                                        .unwrap_or_else(|vim_err| {
-                                            tracing::error!("Couldn't write to neovim: {}", vim_err);
-                                        });
-
-                                    Ok(())
-                                }
                                 match decoder_result {
                                     Ok(message) => match message.type_ {
                                         ProtocolMessageType::Request(request) => {
@@ -636,14 +639,12 @@ impl Debugger {
                                     },
 
                                     Err(err) => {
-                                        tracing::error!("An error occurred, panic: {:?}", err);
-                                        panic!("An error occurred, panic: {:?}", err);
+                                        report_error(format!("An decoder error occurred: {:?}", err), neovim_vadre_window.clone()).await?;
                                     }
                                 };
                             }
                             Some(Err(err)) => {
-                                tracing::error!("Frame decoder error: {:?}", err);
-                                panic!("Frame decoder error: {}", err);
+                                report_error(format!("Frame decoder error: {:?}", err), neovim_vadre_window.clone()).await?;
                             }
                             None => {
                                 tracing::debug!("Client has disconnected");
@@ -798,9 +799,11 @@ impl Debugger {
 
         let file_name = Path::new(&file_path)
             .file_name()
-            .unwrap()
+            .ok_or_else(|| anyhow!("Can't find filename for file path: {:?}", file_path))?;
+
+        let file_name = file_name
             .to_str()
-            .unwrap()
+            .ok_or_else(|| anyhow!("Can't covert filename to string: {:?}", file_name))?
             .to_string();
 
         let breakpoints: Vec<SourceBreakpoint> = line_numbers
@@ -833,9 +836,19 @@ impl Debugger {
 
                 for (i, breakpoint_response) in breakpoints_body.breakpoints.into_iter().enumerate()
                 {
-                    let source_line_number = line_numbers.get(i).unwrap().clone();
+                    let source_line_number = line_numbers
+                        .get(i)
+                        .ok_or_else(|| {
+                            anyhow!("Can't get {i}th line number from: {:?}", line_numbers)
+                        })?
+                        .clone();
 
-                    let breakpoint_id = breakpoint_response.id.unwrap();
+                    let breakpoint_id = breakpoint_response.id.ok_or_else(|| {
+                        anyhow!(
+                            "Id wasn't set in breakpoint setting response as expected: {:?}",
+                            breakpoint_response
+                        )
+                    })?;
 
                     let breakpoint_is_enabled =
                         Debugger::breakpoint_is_enabled(&breakpoint_response)?;
@@ -843,7 +856,12 @@ impl Debugger {
                     data_lock.breakpoints.set_breakpoint_resolved(
                         file_path.clone(),
                         source_line_number,
-                        breakpoint_response.line.unwrap(),
+                        breakpoint_response.line.ok_or_else(|| {
+                            anyhow!(
+                                "Line wasn't set in breakpoint setting response as expected: {:?}",
+                                breakpoint_response
+                            )
+                        })?,
                         breakpoint_id.to_string(),
                     )?;
 
@@ -950,16 +968,12 @@ impl Debugger {
 
         match current_output_window_type {
             VadreBufferType::CallStack | VadreBufferType::Variables => {
-                log_err!(
-                    Debugger::process_output_info(
-                        self.debugger_sender_tx.clone(),
-                        self.neovim_vadre_window.clone(),
-                        self.data.clone(),
-                    )
-                    .await,
+                Debugger::process_output_info(
+                    self.debugger_sender_tx.clone(),
                     self.neovim_vadre_window.clone(),
-                    "can get thread info"
-                );
+                    self.data.clone(),
+                )
+                .await?;
             }
             _ => {}
         };
@@ -1065,7 +1079,11 @@ impl Debugger {
                 debugger_sender_tx.clone().send((response, None)).await?;
 
                 match config_done_tx.take() {
-                    Some(x) => x.send(()).unwrap(),
+                    Some(x) => {
+                        if let Err(_) = x.send(()) {
+                            bail!("Couldn't send config_done_tx");
+                        }
+                    }
                     None => {}
                 };
 
@@ -1087,7 +1105,17 @@ impl Debugger {
         match response.success {
             true => {
                 if let Some(sender) = pending_responses.remove(&request_id) {
-                    sender.send(response.result).unwrap();
+                    if let Err(e) = sender.send(response.result) {
+                        tracing::error!("Couldn't send response to request: {:?}", e);
+                        neovim_vadre_window
+                            .lock()
+                            .await
+                            .log_msg(
+                                VadreLogLevel::WARN,
+                                &format!("Couldn't send response to request: {:?}", e),
+                            )
+                            .await?;
+                    }
                     tracing::trace!("Sent JSON response to request");
                     return Ok(());
                 }
@@ -1182,7 +1210,14 @@ impl Debugger {
 
         if let Some(listener_tx) = stopped_listener_tx.lock().await.take() {
             // If we're here we're about to do more stepping so no need to do more
-            listener_tx.send(()).unwrap();
+            if let Err(_) = listener_tx.send(()) {
+                tracing::error!("Couldn't send stopped_listener_tx");
+                neovim_vadre_window
+                    .lock()
+                    .await
+                    .log_msg(VadreLogLevel::WARN, "Couldn't send stopped_listener_tx")
+                    .await?;
+            }
             return Ok(());
         }
 
@@ -1211,8 +1246,7 @@ impl Debugger {
                             VadreLogLevel::WARN,
                             &format!("An error occurred while displaying code pointer: {}", e),
                         )
-                        .await
-                        .expect("Can log to Vadre");
+                        .await?;
                 }
             }
 
@@ -1246,7 +1280,10 @@ impl Debugger {
         data_lock.breakpoints.set_breakpoint_resolved(
             file_path.clone(),
             source_line_number,
-            breakpoint_event.breakpoint.line.unwrap(),
+            breakpoint_event
+                .breakpoint
+                .line
+                .ok_or_else(|| anyhow!("Couldn't find line from event: {:?}", breakpoint_event))?,
             breakpoint_id.to_string(),
         )?;
 
@@ -1305,8 +1342,13 @@ impl Debugger {
         if let ResponseResult::Success { body } = stack_trace_response {
             if let ResponseBody::stackTrace(stack_trace_body) = body {
                 let stack = stack_trace_body.stack_frames;
-                let current_frame = stack.get(0).expect("should have a top frame");
-                let source = current_frame.source.as_ref().expect("should have a source");
+                let current_frame = stack
+                    .get(0)
+                    .ok_or_else(|| anyhow!("stack should have a top frame: {:?}", stack))?;
+                let source = current_frame
+                    .source
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("stack should have a source: {:?}", current_frame))?;
                 let line_number = current_frame.line;
 
                 tracing::trace!("Stop at {:?}:{}", source, line_number);
@@ -1409,8 +1451,9 @@ impl Debugger {
                             if let ResponseBody::stackTrace(stack_trace_body) = body {
                                 let frames = stack_trace_body.stack_frames;
 
-                                let top_frame =
-                                    frames.get(0).expect("has a frame on the stack trace");
+                                let top_frame = frames.get(0).ok_or_else(|| {
+                                    anyhow!("Stack trace should have a first frame: {:?}", frames)
+                                })?;
                                 let frame_id = top_frame.id;
                                 data.lock().await.current_frame_id = Some(frame_id);
 
@@ -1428,8 +1471,13 @@ impl Debugger {
                                         call_stack_buffer_content.push(format!("+ {}", frame.name));
 
                                         let line_number = frame.line;
-                                        let source = frame.source.unwrap();
-                                        if let Some(source_name) = source.name {
+                                        let source = frame.source.as_ref().ok_or_else(|| {
+                                            anyhow!(
+                                                "Couldn't get source from frame as expected: {:?}",
+                                                frame
+                                            )
+                                        })?;
+                                        if let Some(source_name) = &source.name {
                                             if let Some(_) = source.path {
                                                 call_stack_buffer_content.push(format!(
                                                     "  - {}:{}",
@@ -1437,11 +1485,11 @@ impl Debugger {
                                                 ));
                                             } else {
                                                 call_stack_buffer_content.push(format!(
-                                                    "  - {}:{} (dissassembled)",
+                                                    "  - {}:{} (disassembled)",
                                                     source_name, line_number
                                                 ));
                                             }
-                                        } else if let Some(source_path) = source.path {
+                                        } else if let Some(source_path) = &source.path {
                                             call_stack_buffer_content.push(format!(
                                                 "  - {}:{}",
                                                 source_path, line_number
@@ -1470,8 +1518,11 @@ impl Debugger {
 
                         if let ResponseResult::Success { body } = stack_trace_response {
                             if let ResponseBody::stackTrace(stack_trace_body) = body {
-                                let frame_name =
-                                    &stack_trace_body.stack_frames.get(0).unwrap().name;
+                                let frame_name = &stack_trace_body
+                                    .stack_frames
+                                    .get(0)
+                                    .ok_or_else(|| anyhow!("Coudln't find first stack frame as expected from stack trace response: {:?}", stack_trace_body.stack_frames))?
+                                    .name;
 
                                 call_stack_buffer_content
                                     .push(format!("{} - {}", thread_name, frame_name));
