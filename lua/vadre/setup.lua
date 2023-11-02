@@ -23,16 +23,28 @@ if plugin_binary == "" then
     return
 end
 
+local function dump(o)
+   if type(o) == 'table' then
+      local s = '{ '
+      for k,v in pairs(o) do
+         if type(k) ~= 'number' then k = '"'..k..'"' end
+         s = s .. '['..k..'] = ' .. dump(v) .. ','
+      end
+      return s .. '} '
+   else
+      return tostring(o)
+   end
+end
+
 local jobid = vim.fn.jobstart({plugin_binary}, {
   rpc = true,
-  on_stdout = function(_, data, _)
-    vim.echom('Vadre stdout: ' .. data)
-  end,
+  -- Vadre is intended to not spit something to stderr, we log it as critical if it does
   on_stderr = function(_, data, _)
-    vim.echom('Vadre stderr: ' .. data)
+    vim.api.nvim_err_writeln('Vadre stderr: ' .. dump(data))
   end,
+  -- Stdout is handled by rpcrequest
   on_exit = function()
-    vim.echom('Vadre exited: ' .. data)
+    vim.api.nvim_err_writeln("vadre exited")
   end,
 })
 
@@ -64,6 +76,9 @@ end, {nargs = 1})
 vim.api.nvim_create_user_command("VadreStopDebugger", function(opts)
     print(vim.rpcrequest(jobid, "stop_debugger", opts.fargs[1]))
 end, {nargs = 1})
+vim.api.nvim_create_user_command("VadreLogMsg", function(opts)
+    print(vim.rpcrequest(jobid, "log_msg", opts.fargs))
+end, {nargs = "*"})
 vim.api.nvim_create_user_command("VadreOutputWindow", function(opts)
     print(vim.rpcrequest(jobid, "output_window", opts.fargs))
 end, {nargs = "*"})
