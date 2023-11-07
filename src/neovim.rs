@@ -1,5 +1,4 @@
 use std::{
-    cmp,
     collections::HashMap,
     fmt::Display,
     path::Path,
@@ -8,9 +7,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Result};
 use nvim_rs::{compat::tokio::Compat, Buffer, Neovim, Value, Window};
-use tokio::{io::Stdout, sync::OnceCell};
-
-use crate::debuggers::DebuggerBreakpoint;
+use tokio::io::Stdout;
 
 // Arbitrary number so no clashes with other plugins (hopefully)
 // TODO: Find a better solution (looked into a few times and not sure current neovim API supports

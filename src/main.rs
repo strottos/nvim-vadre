@@ -1,7 +1,7 @@
 #[macro_use]
 extern crate lazy_static;
 
-mod debuggers;
+mod dap;
 mod logger;
 mod neovim;
 mod tokio_join;
@@ -23,7 +23,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use debuggers::{Breakpoints, Debugger, DebuggerStepType};
+use dap::{Breakpoints, Debugger, DebuggerStepType};
 use nvim_rs::{compat::tokio::Compat, create::tokio as create, Handler, Neovim, Value};
 use tokio::{io::Stdout, sync::Mutex, time::timeout};
 
@@ -145,7 +145,7 @@ impl NeovimHandler {
 
         let debug_program_string = command.clone() + " " + &command_args.join(" ");
 
-        let debugger = match debuggers::new_debugger(
+        let debugger = match dap::new_debugger(
             instance_id,
             debug_program_string,
             neovim.clone(),

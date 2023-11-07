@@ -11,11 +11,10 @@ use reqwest::Url;
 use tokio::sync::Mutex;
 
 use crate::{
+    dap::protocol::{Either, RequestArguments},
     neovim::{NeovimVadreWindow, VadreLogLevel},
     util::{download_extract_zip, get_debuggers_dir, get_os_and_cpu_architecture},
 };
-
-use super::dap::protocol::{Either, RequestArguments};
 
 const VERSION: &str = "1.10.0";
 
