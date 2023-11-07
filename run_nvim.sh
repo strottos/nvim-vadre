@@ -35,12 +35,12 @@ function setup_environment {
 
     echo "All plugins installed, doing remainder of setup"
 
-  # If logging enabled spit the neovim logs out
-  export NVIM_LOG_FILE="$(pwd)/nvim_log"
-  export VADRE_LOG="trace"
-  export VADRE_LOG_FILE="$(pwd)/vadre_log"
+    # If logging enabled spit the neovim logs out
+    export NVIM_LOG_FILE="$(pwd)/nvim_log"
+    export VADRE_LOG="trace"
+    export VADRE_LOG_FILE="$(pwd)/vadre_log"
 
-  echo "Done setup"
+    echo "Done setup"
 }
 
 function run_nvim {

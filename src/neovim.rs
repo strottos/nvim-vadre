@@ -470,7 +470,7 @@ impl NeovimVadreWindow {
     pub async fn spawn_terminal_command(
         &mut self,
         command: String,
-        debug_program_str: Option<&str>,
+        debug_program_str: &str,
     ) -> Result<()> {
         let original_window = self.neovim.get_current_win().await?;
 
@@ -524,22 +524,17 @@ impl NeovimVadreWindow {
             )
             .await?;
 
-        match debug_program_str {
-            Some(debug_program_str) => {
-                if let Err(e) = terminal_buffer
-                    .set_name(&format!(
-                        "Vadre Program ({}) - {}",
-                        self.instance_id, debug_program_str
-                    ))
-                    .await
-                {
-                    // TODO: Find out why we can't do this more than once, I simply don't know at
-                    // present
-                    tracing::error!("Can't set name of terminal buffer: {:?}", e);
-                }
-            }
-            None => {}
-        };
+        if let Err(e) = terminal_buffer
+            .set_name(&format!(
+                "Vadre Program ({}) - {}",
+                self.instance_id, debug_program_str
+            ))
+            .await
+        {
+            // TODO: Find out why we can't do this more than once, I simply don't know at
+            // present
+            tracing::error!("Can't set name of terminal buffer: {:?}", e);
+        }
 
         self.buffers
             .insert(VadreBufferType::Terminal, terminal_buffer);
@@ -859,12 +854,8 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
-    pub async fn get_var(&self, var_name: &str) -> Option<String> {
-        self.neovim
-            .get_var(var_name)
-            .await
-            .ok()
-            .map(|x| x.to_string())
+    pub async fn get_var(&self, var_name: &str) -> Result<Value> {
+        self.neovim.get_var(var_name).await.map_err(|e| anyhow!(e))
     }
 
     pub async fn err_writeln(&self, log_msg: &str) -> Result<()> {

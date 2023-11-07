@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, thread, time::Duration};
 
 fn a() -> io::Result<()> {
     b()?;
@@ -23,6 +23,29 @@ fn c(num: i32) -> io::Result<()> {
 
 fn main() -> io::Result<()> {
     a()?;
+
+    let thread_1 = thread::spawn(|| {
+        for i in 0..10 {
+            c(i)?;
+
+            thread::sleep(Duration::from_secs(1));
+        }
+
+        Ok::<(), io::Error>(())
+    });
+
+    let thread_2 = thread::spawn(|| {
+        for i in 50..60 {
+            c(i)?;
+
+            thread::sleep(Duration::from_secs(1));
+        }
+
+        Ok::<(), io::Error>(())
+    });
+
+    assert_eq!(thread_1.join().is_ok(), true);
+    assert_eq!(thread_2.join().is_ok(), true);
 
     Ok(())
 }

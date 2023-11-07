@@ -10,7 +10,7 @@ mod util;
 use crate::neovim::VadreLogLevel;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     env,
     error::Error,
     fmt::Debug,
@@ -143,7 +143,14 @@ impl NeovimHandler {
             command_args.join(" ")
         );
 
-        let debugger = match debuggers::new_debugger(instance_id, neovim.clone(), debugger_type) {
+        let debug_program_string = command.clone() + " " + &command_args.join(" ");
+
+        let debugger = match debuggers::new_debugger(
+            instance_id,
+            debug_program_string,
+            neovim.clone(),
+            debugger_type,
+        ) {
             Ok(x) => Arc::new(Mutex::new(x)),
             Err(e) => return Err(format!("Can't setup debugger: {}", e).into()),
         };
@@ -160,18 +167,12 @@ impl NeovimHandler {
 
             let mut debugger_lock = debugger.lock().await;
 
-            let request_timeout = match neovim.get_var("vadre_request_timeout").await {
-                Ok(duration) => Duration::new(duration.as_u64().unwrap_or(30), 0),
-                Err(_) => Duration::new(30, 0),
-            };
-
             if let Err(e) = debugger_lock
                 .setup(
                     command,
                     command_args,
                     environment_variables,
                     &pending_breakpoints,
-                    request_timeout,
                     debugger_port,
                 )
                 .await

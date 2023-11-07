@@ -22,26 +22,6 @@ const VERSION: &str = "1.10.0";
 #[derive(Clone)]
 pub(crate) struct Debugger {
     pub neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
-    // process: Arc<Mutex<Option<Child>>>,
-
-    // debugger_sender_tx:
-    //     mpsc::Sender<(ProtocolMessageType, Option<oneshot::Sender<ResponseResult>>)>,
-    // // Following should be empty most of the time and will be taken by the tcp_connection.
-    // //
-    // // We use a mutex here and steal it once for performance reasons, rather than have an
-    // // unnecessary mutex on the debugger_sender_tx part if this were created when needed. This just
-    // // gets stolen once and we never use the mutex again.
-    // debugger_sender_rx: Arc<
-    //     Mutex<
-    //         Option<mpsc::Receiver<(ProtocolMessageType, Option<oneshot::Sender<ResponseResult>>)>>,
-    //     >,
-    // >,
-
-    // pending_outgoing_requests: Arc<Mutex<HashMap<u32, oneshot::Sender<ResponseResult>>>>,
-
-    // stopped_listener_tx: Arc<Mutex<Option<oneshot::Sender<bool>>>>,
-
-    // data: Arc<Mutex<DebuggerData>>,
 }
 
 impl Debugger {
@@ -51,7 +31,7 @@ impl Debugger {
         }
     }
 
-    pub(crate) async fn download_plugin(&mut self) -> Result<()> {
+    pub(crate) async fn download_plugin(&self) -> Result<()> {
         let mut path = get_debuggers_dir()?;
         path.push("codelldb");
         path.push(VERSION);
