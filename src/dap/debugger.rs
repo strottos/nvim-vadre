@@ -111,8 +111,6 @@ impl Debugger {
             loop {
                 let message = debugger_rx.recv().await?;
 
-                tracing::trace!("Message found: {:?}", message);
-
                 if let ProtocolMessageType::Request(request_args) = message.type_ {
                     debugger_handler
                         .lock()

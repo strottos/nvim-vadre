@@ -174,8 +174,6 @@ impl DebuggerProcessor {
             type_: ProtocolMessageType::Request(request_args),
         };
 
-        tracing::trace!("Sending request to send to debugger {:?}", message);
-
         let request_timeout = self.request_timeout.get_or_set().await;
 
         let mut debugger_receiver_rx = self
@@ -198,11 +196,8 @@ impl DebuggerProcessor {
                     Err(e) => bail!("Timed out waiting for a response: {}", e),
                 };
 
-                tracing::trace!("Checking debugger msg: {:?}", response);
-
                 if let ProtocolMessageType::Response(response) = response.type_ {
                     if *response.request_seq.first() == seq {
-                        tracing::trace!("Got expected response with seq {}: {:?}", seq, response);
                         break response;
                     }
                 }
@@ -219,8 +214,6 @@ impl DebuggerProcessor {
 
             Ok(())
         });
-
-        tracing::trace!("Sent request");
 
         Ok(())
     }
@@ -295,7 +288,7 @@ impl DebuggerProcessor {
                 .await
                 .map_err(|e| anyhow!("Can't read stdout: {}", e))?
             {
-                tracing::info!("Debugger stdout: {}", line);
+                tracing::error!("Debugger stdout (could interfere with running): {}", line);
                 neovim_vadre_window
                     .lock()
                     .await
@@ -428,7 +421,6 @@ impl DebuggerProcessor {
             loop {
                 tokio::select! {
                     msg = framed_stream.next() => {
-                        tracing::trace!("Got message from debugger {:?}", msg);
                         match msg {
                             Some(Ok(decoder_result)) => match decoder_result {
                                 Ok(message) => {
@@ -456,7 +448,6 @@ impl DebuggerProcessor {
                         };
                     }
                     Some(message) = debugger_sender_rx.recv() => {
-                        tracing::trace!("Got message to send to debugger {:?}", message);
                         framed_stream.send(message).await?;
                     }
                 }

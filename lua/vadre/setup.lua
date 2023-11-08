@@ -84,16 +84,6 @@ local function output_window(instance_id, type)
     print(vim.rpcrequest(jobid, "output_window", instance_id, type))
 end
 
-local function toggle_single_thread()
-    if vim.g.vadre_single_thread_mode == 1 then
-        vim.g.vadre_single_thread_mode = 0
-        print('Turned off single thread mode')
-    else
-        vim.g.vadre_single_thread_mode = 1
-        print('Turned on single thread mode')
-    end
-end
-
 local function handle_output_window_enter(instance_id)
     print(vim.rpcrequest(jobid, "handle_output_window_enter", instance_id))
 end
@@ -104,7 +94,6 @@ end
 
 return {
     output_window = output_window,
-    toggle_single_thread = toggle_single_thread,
     handle_output_window_enter = handle_output_window_enter,
     handle_output_window_space = handle_output_window_space,
 }

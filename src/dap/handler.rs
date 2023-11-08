@@ -1,4 +1,10 @@
-use std::{collections::HashMap, fmt::Debug, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Debug,
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 
 use super::{
     breakpoints::Breakpoints,
@@ -13,12 +19,11 @@ use super::{
         SourceBreakpoint, StackTraceArguments, StepInArguments, StoppedEventBody,
         VariablesArguments,
     },
-    DebuggerStepType, DebuggerThread,
+    DebuggerStepType,
 };
 use crate::neovim::{CodeBufferContent, NeovimVadreWindow, VadreBufferType, VadreLogLevel};
 
 use anyhow::{anyhow, bail, Result};
-use indexmap::IndexMap;
 use tokio::{
     sync::{broadcast, oneshot, Mutex},
     time::timeout,
@@ -35,7 +40,7 @@ pub(crate) struct DebuggerHandler {
     current_frame_id: Option<i64>,
     breakpoints: Breakpoints,
 
-    threads: IndexMap<i64, DebuggerThread>,
+    stack_expanded_threads: HashSet<i64>,
 
     debug_program_string: String,
 
@@ -61,7 +66,7 @@ impl DebuggerHandler {
             current_frame_id: None,
             breakpoints: Breakpoints::new(),
 
-            threads: IndexMap::new(),
+            stack_expanded_threads: HashSet::new(),
 
             debug_program_string,
 
@@ -70,7 +75,7 @@ impl DebuggerHandler {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self, config_done_tx))]
     pub(crate) async fn init(
         &mut self,
         existing_debugger_port: Option<String>,
@@ -206,22 +211,20 @@ impl DebuggerHandler {
             }
         };
 
-        let single_thread_mode = self.get_single_thread_mode().await?;
-
         let request = match step_type {
             DebuggerStepType::Over => RequestArguments::next(NextArguments {
                 granularity: None,
-                single_thread: Some(single_thread_mode),
+                single_thread: Some(false),
                 thread_id,
             }),
             DebuggerStepType::In => RequestArguments::stepIn(StepInArguments {
                 granularity: None,
-                single_thread: Some(single_thread_mode),
+                single_thread: Some(false),
                 target_id: None,
                 thread_id,
             }),
             DebuggerStepType::Continue => RequestArguments::continue_(ContinueArguments {
-                single_thread: Some(single_thread_mode),
+                single_thread: Some(false),
                 thread_id,
             }),
         };
@@ -250,99 +253,40 @@ impl DebuggerHandler {
         Ok(())
     }
 
-    /// Pauses the debugger. The behaviour can vary so we detail it here:
-    /// * If we specify the thread and we're in single thread mode we pause the debugger of
-    ///   that thread only and we set that to be the current thread.
-    /// * If we don't specify the thread and we're in single thread mode we either pause the
-    ///   currently active thread if it exists, or if not we pause the first thread we find
-    ///   and set that to be the current thread.
-    /// * If we specify the thread and we're not in single thread mode we pause all threads
-    ///   and set the current thread to be the one specified.
-    /// * If we don't specify the thread and we're not in single thread mode we pause all
-    ///   and leave the current thread as it is.
+    #[tracing::instrument(skip(self))]
     pub(crate) async fn pause(&mut self, thread: Option<i64>) -> Result<()> {
-        tracing::trace!("Pausing thread: {:?}", thread);
-
-        let single_thread_mode = self.get_single_thread_mode().await?;
-
         match thread {
             Some(thread_id) => {
-                if single_thread_mode {
-                    self.request(RequestArguments::pause(PauseArguments { thread_id }), None)
-                        .await?;
-                } else {
-                    self.pause_all_threads().await?;
-                }
+                self.request(RequestArguments::pause(PauseArguments { thread_id }), None)
+                    .await?;
                 self.current_thread_id = thread;
             }
             None => {
-                if single_thread_mode {
-                    let mut thread = self.current_thread_id;
+                let mut thread = self.current_thread_id;
 
-                    // If we still haven't got a current thread yet find one from our thread list.
-                    if thread.is_none() {
-                        self.get_threads().await?;
-                        thread = self
-                            .threads
-                            .iter()
-                            .find(|(_, thread)| thread.is_running)
-                            .map(|(id, _)| *id)
-                            .iter()
-                            .next()
-                            .copied();
+                // If we still haven't got a current thread yet find one from the thread list.
+                if thread.is_none() {
+                    let response_result = self
+                        .request_and_response(RequestArguments::threads(None))
+                        .await?;
+
+                    if let ResponseResult::Success { ref body } = response_result {
+                        if let ResponseBody::threads(threads_body) = body {
+                            thread = threads_body.threads.iter().next().map(|thread| thread.id);
+                        }
                     }
-
-                    let thread_id = thread.ok_or_else(|| {
-                        anyhow!(
-                            "No thread specified, no currently active thread and couldn't find a thread, aborting interrupt"
-                        )
-                    })?;
-
-                    self.request_and_response(RequestArguments::pause(PauseArguments {
-                        thread_id,
-                    }))
-                    .await?;
-                } else {
-                    self.pause_all_threads().await?;
                 }
+
+                let thread_id = thread.ok_or_else(|| {
+                    anyhow!(
+                        "No thread specified, no currently active thread and couldn't find a thread, aborting interrupt"
+                    )
+                })?;
+
+                self.request_and_response(RequestArguments::pause(PauseArguments { thread_id }))
+                    .await?;
             }
         }
-
-        // let thread_id = match thread {
-        //     Some(id) => id,
-        //     None => {
-        //         let mut current_thread = self.current_thread_id;
-
-        //         // If we still haven't got a current thread yet find one from our thread list.
-        //         if current_thread.is_none() {
-        //             self.get_threads().await?;
-        //             current_thread = self
-        //                 .threads
-        //                 .iter()
-        //                 .find(|(_, thread)| thread.is_running)
-        //                 .map(|(id, _)| *id)
-        //                 .iter()
-        //                 .next()
-        //                 .copied();
-        //         }
-
-        //         current_thread.ok_or_else(|| {
-        //             anyhow!(
-        //                 "No thread specified, no currently active thread and couldn't find a thread, aborting interrupt"
-        //             )
-        //         })?
-        //     }
-        // };
-
-        // let response_result = self
-        //     .request_and_response(RequestArguments::pause(PauseArguments { thread_id }))
-        //     .await?;
-
-        // tracing::trace!("Response result: {:?}", response_result);
-
-        // if thread.is_some() && take_ownership {
-        //     self.current_thread_id = thread;
-        // }
 
         Ok(())
     }
@@ -352,15 +296,13 @@ impl DebuggerHandler {
     }
 
     /// Handle a request from Debugger
-    #[tracing::instrument]
+    #[tracing::instrument(skip(self))]
     pub(crate) async fn handle_request(
         &mut self,
         request_id: u32,
         args: RequestArguments,
         // config_done_tx: &mut Option<oneshot::Sender<()>>,
     ) -> Result<()> {
-        tracing::trace!("Handling request: {:?}", args);
-
         // Debugger is requesting something from us, currently only runTerminal should be received
         match args {
             RequestArguments::runInTerminal(args) => {
@@ -433,17 +375,7 @@ impl DebuggerHandler {
                     .await
             }
             EventBody::stopped(stopped_event) => self.handle_event_stopped(stopped_event).await,
-            EventBody::continued(continued_event) => {
-                if let Some(state) = continued_event.all_threads_continued {
-                    if state {
-                        self.threads.iter_mut().for_each(|(_, thread)| {
-                            thread.is_running = true;
-                        });
-                    }
-                }
-                tracing::trace!("Continued set threads: {:?}", self.threads);
-                Ok(())
-            }
+            EventBody::continued(_) => Ok(()),
             EventBody::breakpoint(breakpoint_event) => {
                 self.handle_event_breakpoint(breakpoint_event).await
             }
@@ -501,48 +433,18 @@ impl DebuggerHandler {
             .get_current_line()
             .await?;
 
-        tracing::trace!("Analysing line: {}", current_line);
-
         if current_output_window_type == VadreBufferType::CallStack {
             let mut split = current_line.split(" - ");
 
-            tracing::trace!("Split: {:?}", split);
             if let Some(thread_id) = split.next() {
-                tracing::trace!("Thread id string: {}", thread_id);
                 match thread_id.parse::<i64>() {
                     Ok(thread_id) => {
-                        tracing::trace!("Thread id: {}", thread_id);
-                        tracing::trace!("Threads before: {:#?}", self.threads);
-                        if self
-                            .threads
-                            .entry(thread_id)
-                            .or_insert(DebuggerThread {
-                                // Assume running in absence of other information as this is the safest.
-                                is_running: true,
-                                // Defaults to false for new threads
-                                expanded: false,
-                                name: "".to_string(),
-                            })
-                            .expanded
-                        {
-                            let thread = self.threads.get_mut(&thread_id).ok_or_else(|| {
-                                anyhow!("Should have found thread id {} but didn't", thread_id)
-                            })?;
-                            thread.expanded = false;
+                        self.pause(Some(thread_id)).await?;
+                        if !self.stack_expanded_threads.contains(&thread_id) {
+                            self.stack_expanded_threads.insert(thread_id);
                         } else {
-                            // We need to pause if we're expanding otherwise the debugger will error
-                            // TODO
-                            self.pause(Some(thread_id)).await?;
-                            // NB: Need to take mutable reference here as it can't be held for the
-                            // pause above.
-                            let thread = self.threads.get_mut(&thread_id).ok_or_else(|| {
-                                anyhow!("Should have found thread id {} but didn't", thread_id)
-                            })?;
-                            thread.is_running = false;
-                            thread.expanded = true;
+                            self.stack_expanded_threads.remove(&thread_id);
                         }
-                        tracing::trace!("Threads after: {:#?}", self.threads);
-                        tracing::trace!("Displaying");
                         self.display_output_info().await?;
                     }
                     Err(_) => {}
@@ -570,111 +472,128 @@ impl DebuggerHandler {
             current_output_window_type
         );
 
-        if current_output_window_type == VadreBufferType::CallStack {
-            self.get_threads().await?;
+        if current_output_window_type == VadreBufferType::CallStack
+            || current_output_window_type == VadreBufferType::Variables
+        {
+            let response_result = self
+                .request_and_response(RequestArguments::threads(None))
+                .await?;
 
-            tracing::trace!("Displaying threads: {:#?}", self.threads);
+            if let ResponseResult::Success { body } = response_result {
+                if let ResponseBody::threads(threads_body) = body {
+                    for thread in threads_body.threads {
+                        let thread_id = thread.id;
+                        let thread_name = &thread.name;
 
-            for (thread_id, thread) in self.threads.iter() {
-                let thread_name = &thread.name;
+                        if current_thread_id == Some(thread_id) {
+                            call_stack_buffer_content
+                                .push(format!("{} - `{}` (*)", thread_id, thread_name));
+                        } else {
+                            call_stack_buffer_content
+                                .push(format!("{} - `{}`", thread_id, thread_name));
+                        }
 
-                if current_thread_id == Some(*thread_id) {
-                    call_stack_buffer_content
-                        .push(format!("{} - `{}` (*)", thread_id, thread_name));
-                } else {
-                    call_stack_buffer_content.push(format!("{} - `{}`", thread_id, thread_name));
-                }
+                        if self.stack_expanded_threads.contains(&thread_id) {
+                            let stack_trace_response = self
+                                .request_and_response(RequestArguments::stackTrace(
+                                    StackTraceArguments {
+                                        thread_id,
+                                        format: None,
+                                        levels: None,
+                                        start_frame: None,
+                                    },
+                                ))
+                                .await?;
 
-                if thread.expanded && !thread.is_running {
-                    let stack_trace_response = self
-                        .request_and_response(RequestArguments::stackTrace(StackTraceArguments {
-                            thread_id: *thread_id,
-                            format: None,
-                            levels: None,
-                            start_frame: None,
-                        }))
-                        .await?;
+                            // Sometimes we don't get a body here as we get a message saying invalid thread,
+                            // normally when the thread is doing something in blocking.
+                            if let ResponseResult::Success { body } = stack_trace_response {
+                                if let ResponseBody::stackTrace(stack_trace_body) = body {
+                                    let frames = stack_trace_body.stack_frames;
 
-                    // Sometimes we don't get a body here as we get a message saying invalid thread,
-                    // normally when the thread is doing something in blocking.
-                    if let ResponseResult::Success { body } = stack_trace_response {
-                        if let ResponseBody::stackTrace(stack_trace_body) = body {
-                            let frames = stack_trace_body.stack_frames;
+                                    let top_frame = match frames.get(0) {
+                                        Some(frame) => frame,
+                                        None => {
+                                            call_stack_buffer_content
+                                                .push(format!("  (no frames)"));
+                                            continue;
+                                        }
+                                    };
+                                    let frame_id = top_frame.id;
+                                    self.current_frame_id = Some(frame_id);
 
-                            let top_frame = match frames.get(0) {
-                                Some(frame) => frame,
-                                None => {
-                                    call_stack_buffer_content.push(format!("  (no frames)"));
-                                    continue;
-                                }
-                            };
-                            let frame_id = top_frame.id;
-                            self.current_frame_id = Some(frame_id);
+                                    if current_output_window_type == VadreBufferType::Variables {
+                                        self.process_variables(frame_id).await?;
+                                    }
 
-                            if current_output_window_type == VadreBufferType::Variables {
-                                self.process_variables(frame_id).await?;
-                            }
+                                    if current_output_window_type == VadreBufferType::CallStack {
+                                        for frame in frames {
+                                            call_stack_buffer_content
+                                                .push(format!("+ {}", frame.name));
 
-                            if current_output_window_type == VadreBufferType::CallStack {
-                                for frame in frames {
-                                    call_stack_buffer_content.push(format!("+ {}", frame.name));
-
-                                    let line_number = frame.line;
-                                    let source = frame.source.as_ref().ok_or_else(|| {
-                                        anyhow!(
+                                            let line_number = frame.line;
+                                            let source =
+                                                frame.source.as_ref().ok_or_else(|| {
+                                                    anyhow!(
                                             "Couldn't get source from frame as expected: {:?}",
                                             frame
                                         )
-                                    })?;
-                                    if let Some(source_name) = &source.name {
-                                        if let Some(_) = source.path {
-                                            call_stack_buffer_content.push(format!(
-                                                "  - {}:{}",
-                                                source_name, line_number
-                                            ));
-                                        } else {
-                                            call_stack_buffer_content.push(format!(
-                                                "  - {}:{} (disassembled)",
-                                                source_name, line_number
-                                            ));
+                                                })?;
+                                            if let Some(source_name) = &source.name {
+                                                if let Some(_) = source.path {
+                                                    call_stack_buffer_content.push(format!(
+                                                        "  - {}:{}",
+                                                        source_name, line_number
+                                                    ));
+                                                } else {
+                                                    call_stack_buffer_content.push(format!(
+                                                        "  - {}:{} (disassembled)",
+                                                        source_name, line_number
+                                                    ));
+                                                }
+                                            } else if let Some(source_path) = &source.path {
+                                                call_stack_buffer_content.push(format!(
+                                                    "  - {}:{}",
+                                                    source_path, line_number
+                                                ));
+                                            } else {
+                                                call_stack_buffer_content.push(format!(
+                                                    " - source not understood {:?}",
+                                                    source
+                                                ));
+                                            }
                                         }
-                                    } else if let Some(source_path) = &source.path {
-                                        call_stack_buffer_content
-                                            .push(format!("  - {}:{}", source_path, line_number));
-                                    } else {
-                                        call_stack_buffer_content
-                                            .push(format!(" - source not understood {:?}", source));
                                     }
                                 }
                             }
+                            // } else if current_output_window_type == VadreBufferType::CallStack {
+                            //     let stack_trace_response = self
+                            //         .request_and_response(RequestArguments::stackTrace(
+                            //             StackTraceArguments {
+                            //                 thread_id,
+                            //                 format: None,
+                            //                 levels: None,
+                            //                 start_frame: None,
+                            //             },
+                            //         ))
+                            //         .await?;
+
+                            //     if let ResponseResult::Success { body } = stack_trace_response {
+                            //         if let ResponseBody::stackTrace(stack_trace_body) = body {
+                            //             let frame_name = &stack_trace_body
+                            //                 .stack_frames
+                            //                 .get(0)
+                            //                 .ok_or_else(|| anyhow!("Coudln't find first stack frame as expected from stack trace response: {:?}", stack_trace_body.stack_frames))?
+                            //                 .name;
+
+                            //             call_stack_buffer_content
+                            //                 .push(format!("{} - {}", thread_name, frame_name));
+                            //         } else {
+                            //             call_stack_buffer_content.push(format!("{}", thread_name));
+                            //         }
+                            //     }
                         }
                     }
-                    // } else if current_output_window_type == VadreBufferType::CallStack {
-                    //     let stack_trace_response = self
-                    //         .request_and_response(RequestArguments::stackTrace(
-                    //             StackTraceArguments {
-                    //                 thread_id,
-                    //                 format: None,
-                    //                 levels: None,
-                    //                 start_frame: None,
-                    //             },
-                    //         ))
-                    //         .await?;
-
-                    //     if let ResponseResult::Success { body } = stack_trace_response {
-                    //         if let ResponseBody::stackTrace(stack_trace_body) = body {
-                    //             let frame_name = &stack_trace_body
-                    //                 .stack_frames
-                    //                 .get(0)
-                    //                 .ok_or_else(|| anyhow!("Coudln't find first stack frame as expected from stack trace response: {:?}", stack_trace_body.stack_frames))?
-                    //                 .name;
-
-                    //             call_stack_buffer_content
-                    //                 .push(format!("{} - {}", thread_name, frame_name));
-                    //         } else {
-                    //             call_stack_buffer_content.push(format!("{}", thread_name));
-                    //         }
-                    //     }
                 }
             }
 
@@ -696,8 +615,6 @@ impl DebuggerHandler {
 
     #[tracing::instrument(skip(self))]
     async fn set_breakpoints(&mut self, file_path: String) -> Result<()> {
-        tracing::trace!("Debugger setting breakpoints in file {:?}", file_path);
-
         let line_numbers = self
             .breakpoints
             .get_all_breakpoint_line_numbers_for_file(&file_path)?
@@ -731,11 +648,6 @@ impl DebuggerHandler {
                 source_modified: Some(false),
             }))
             .await?;
-
-        tracing::trace!(
-            "Debugger set breakpoints response_result {:?}",
-            response_result
-        );
 
         if let ResponseResult::Success { body } = response_result {
             if let ResponseBody::setBreakpoints(breakpoints_body) = body {
@@ -784,26 +696,10 @@ impl DebuggerHandler {
 
     #[tracing::instrument]
     async fn handle_event_stopped(&mut self, stopped_event: StoppedEventBody) -> Result<()> {
-        // Hard to think how we wouldn't have a thread id here but just in case...
-        tracing::trace!("Before set threads: {:#?}", self.threads);
+        self.current_thread_id = stopped_event.thread_id;
         if let Some(thread_id) = stopped_event.thread_id {
-            // TODO: Do we want this?
-            self.current_thread_id = stopped_event.thread_id;
-            self.get_threads().await?;
-            let thread = self
-                .threads
-                .get_mut(&thread_id)
-                .ok_or_else(|| anyhow!("Should have found thread id {} but didn't", thread_id))?;
-            thread.is_running = false;
-            thread.expanded = true;
-
-            if stopped_event.all_threads_stopped.unwrap_or(false) {
-                self.threads.iter_mut().for_each(|(_, thread)| {
-                    thread.is_running = false;
-                });
-            }
+            self.stack_expanded_threads.insert(thread_id);
         }
-        tracing::trace!("Set threads: {:#?}", self.threads);
 
         if let Some(listener_tx) = self.stopped_listener_tx.take() {
             // If we're here we're about to do more stepping so no need to do more
@@ -891,10 +787,8 @@ impl DebuggerHandler {
             > 0)
     }
 
-    #[tracing::instrument(skip(thread_id))]
+    #[tracing::instrument]
     async fn process_stopped(&self, thread_id: i64) -> Result<()> {
-        tracing::debug!("Thread id {} stopped", thread_id);
-
         let stack_trace_response = self
             .request_and_response(RequestArguments::stackTrace(StackTraceArguments {
                 thread_id,
@@ -916,8 +810,6 @@ impl DebuggerHandler {
                     .ok_or_else(|| anyhow!("stack should have a source: {:?}", current_frame))?;
                 let line_number = current_frame.line;
 
-                tracing::trace!("Stop at {:?}:{}", source, line_number);
-
                 if let Some(source_file) = &source.path {
                     self.neovim_vadre_window
                         .lock()
@@ -938,8 +830,6 @@ impl DebuggerHandler {
                         .await?;
                     if let ResponseResult::Success { body } = source_reference_response {
                         if let ResponseBody::source(source_reference_body) = body {
-                            tracing::trace!("source reference {:?}", source_reference_body);
-
                             self.neovim_vadre_window
                                 .lock()
                                 .await
@@ -1052,70 +942,6 @@ impl DebuggerHandler {
             .set_breakpoints_buffer(breakpoints_buffer_content)
             .await?;
 
-        Ok(())
-    }
-
-    async fn get_threads(&mut self) -> Result<()> {
-        tracing::debug!("Getting thread information");
-
-        let response_result = self
-            .request_and_response(RequestArguments::threads(None))
-            .await?;
-
-        tracing::trace!("Response result: {:?}", response_result);
-        tracing::trace!("Get threads before set threads: {:?}", self.threads);
-
-        if let ResponseResult::Success { ref body } = response_result {
-            if let ResponseBody::threads(threads_body) = body {
-                threads_body.threads.iter().for_each(|thread| {
-                    self.threads.entry(thread.id).or_insert(DebuggerThread {
-                        is_running: true,
-                        expanded: false,
-                        name: thread.name.clone(),
-                    });
-                });
-            }
-        }
-
-        tracing::trace!("Get threads set threads: {:?}", self.threads);
-
-        Ok(())
-    }
-
-    async fn get_single_thread_mode(&self) -> Result<bool> {
-        tracing::trace!(
-            "Single threaded variable: {:?}",
-            self.neovim_vadre_window
-                .lock()
-                .await
-                .get_var("vadre_single_thread_mode")
-                .await?
-                .as_i64()
-        );
-
-        Ok(self
-            .neovim_vadre_window
-            .lock()
-            .await
-            .get_var("vadre_single_thread_mode")
-            .await?
-            .as_i64()
-            == Some(1))
-    }
-
-    async fn pause_all_threads(&mut self) -> Result<()> {
-        self.get_threads().await?;
-        for (thread_id, thread) in self.threads.iter() {
-            if thread.is_running {
-                self.request(
-                    RequestArguments::pause(PauseArguments {
-                        thread_id: *thread_id,
-                    }),
-                    None,
-                )
-                .await?;
-            }
-        }
         Ok(())
     }
 
