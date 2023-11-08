@@ -16,7 +16,7 @@ use tokio::{
 pub(crate) struct Debugger {
     id: usize,
     pub neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
-    handler: Arc<Mutex<DebuggerHandler>>,
+    pub handler: Arc<Mutex<DebuggerHandler>>,
 }
 
 impl Debugger {
@@ -60,7 +60,7 @@ impl Debugger {
         self.handler
             .lock()
             .await
-            .setup(existing_debugger_port, None, config_done_tx)
+            .init(existing_debugger_port, None, config_done_tx)
             .await?;
 
         self.handle_messages().await?;
@@ -69,7 +69,7 @@ impl Debugger {
             .handler
             .lock()
             .await
-            .init_process(command, command_args, environment_variables)
+            .launch_program(command, command_args, environment_variables)
             .await?;
 
         self.handler
@@ -88,10 +88,14 @@ impl Debugger {
             .configuration_done(config_tx)
             .await?;
 
+        // Check that the launch and config requests were successful
         try_join!(launch_rx, config_rx)?;
 
-        self.log_msg(VadreLogLevel::INFO, "Debugger launched and setup")
-            .await?;
+        self.log_msg(
+            VadreLogLevel::INFO,
+            "Debugger and program launched successfully",
+        )
+        .await?;
 
         Ok(())
     }
@@ -127,35 +131,7 @@ impl Debugger {
         Ok(())
     }
 
-    pub(crate) async fn add_breakpoint(&self, file_path: String, line_number: i64) -> Result<()> {
-        self.handler
-            .lock()
-            .await
-            .add_breakpoint(file_path, line_number)
-            .await?;
-
-        Ok(())
-    }
-
-    pub(crate) async fn remove_breakpoint(
-        &self,
-        file_path: String,
-        line_number: i64,
-    ) -> Result<()> {
-        self.handler
-            .lock()
-            .await
-            .remove_breakpoint(file_path.clone(), line_number)
-            .await?;
-
-        Ok(())
-    }
-
-    #[tracing::instrument(skip(self))]
-    pub(crate) async fn do_step(&self, step_type: DebuggerStepType, count: u64) -> Result<()> {
-        self.handler.lock().await.do_step(step_type, count).await
-    }
-
+    // TODO: Handler or here?
     #[tracing::instrument(skip(self))]
     pub(crate) async fn change_output_window(&self, type_: &str) -> Result<()> {
         self.neovim_vadre_window
@@ -179,10 +155,6 @@ impl Debugger {
         };
 
         Ok(())
-    }
-
-    pub(crate) async fn stop(&self) -> Result<()> {
-        self.handler.lock().await.stop().await
     }
 
     pub(crate) async fn log_msg(&self, level: VadreLogLevel, msg: &str) -> Result<()> {

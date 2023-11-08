@@ -12,6 +12,7 @@ dirs = "*"
 dunce = "*"
 dyn-clone = "*"
 futures = "*"
+indexmap = "2.1.0"
 is_executable = "*"
 lazy_static = "*"
 nvim-rs = { version = "*", features = ["use_tokio"] }

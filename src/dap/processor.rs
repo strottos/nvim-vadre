@@ -27,10 +27,52 @@ use tokio::{
     io::{AsyncBufReadExt, BufReader},
     net::TcpStream,
     process::{Child, Command},
-    sync::{broadcast, mpsc, oneshot, Mutex},
-    time::{sleep, timeout},
+    sync::{broadcast, mpsc, oneshot, Mutex, RwLock},
+    time::{sleep, timeout, Instant},
 };
 use tokio_util::codec::Decoder;
+
+struct RequestTimeout {
+    inner: RwLock<RequestTimeoutInner>,
+    neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
+}
+
+struct RequestTimeoutInner {
+    value: Duration,
+    last_set: Instant,
+}
+
+impl RequestTimeout {
+    fn new(neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>) -> Self {
+        RequestTimeout {
+            inner: RwLock::new(RequestTimeoutInner {
+                value: Duration::new(30, 0),
+                last_set: Instant::now(),
+            }),
+            neovim_vadre_window,
+        }
+    }
+
+    async fn get_or_set(&self) -> Duration {
+        let now = Instant::now();
+        if now - self.inner.read().await.last_set > Duration::from_secs(60) {
+            let value = match self
+                .neovim_vadre_window
+                .lock()
+                .await
+                .get_var("vadre_request_timeout")
+                .await
+            {
+                Ok(duration) => Duration::new(duration.as_u64().unwrap_or(30), 0),
+                Err(_) => Duration::new(30, 0),
+            };
+            let mut writer = self.inner.write().await;
+            writer.value = value;
+            writer.last_set = now;
+        }
+        self.inner.read().await.value.clone()
+    }
+}
 
 /// Responsible for spawning the process and handling the communication with the debugger
 pub(crate) struct DebuggerProcessor {
@@ -49,6 +91,7 @@ pub(crate) struct DebuggerProcessor {
     debugger_receiver_rx: Option<broadcast::Receiver<ProtocolMessage>>,
 
     seq_ids: AtomicU32,
+    request_timeout: RequestTimeout,
 }
 
 impl DebuggerProcessor {
@@ -59,7 +102,7 @@ impl DebuggerProcessor {
         Self {
             debugger_type,
 
-            neovim_vadre_window,
+            neovim_vadre_window: neovim_vadre_window.clone(),
             process: Arc::new(Mutex::new(None)),
 
             debugger_sender_tx: None,
@@ -67,20 +110,7 @@ impl DebuggerProcessor {
             debugger_receiver_rx: None,
 
             seq_ids: AtomicU32::new(1),
-        }
-    }
-
-    async fn get_request_timeout(&self) -> Duration {
-        // TODO: Cache this?
-        match self
-            .neovim_vadre_window
-            .lock()
-            .await
-            .get_var("vadre_request_timeout")
-            .await
-        {
-            Ok(duration) => Duration::new(duration.as_u64().unwrap_or(30), 0),
-            Err(_) => Duration::new(30, 0),
+            request_timeout: RequestTimeout::new(neovim_vadre_window),
         }
     }
 
@@ -102,15 +132,120 @@ impl DebuggerProcessor {
             }
         };
 
-        let request_timeout = self.get_request_timeout().await;
-
-        self.tcp_connect_and_handle(port, request_timeout).await?;
+        self.tcp_connect_and_handle(port).await?;
 
         self.neovim_vadre_window
             .lock()
             .await
             .log_msg(VadreLogLevel::INFO, "Debugger launched")
             .await?;
+
+        Ok(())
+    }
+
+    pub(crate) async fn send_msg(&mut self, message: ProtocolMessage) -> Result<()> {
+        let debugger_sender_tx = self.debugger_sender_tx.as_mut().ok_or_else(|| {
+            anyhow!("Couldn't get debugger_sender_tx, was process initialised correctly")
+        })?;
+        debugger_sender_tx.send(message).await?;
+
+        Ok(())
+    }
+
+    pub(crate) fn subscribe_debugger(&self) -> Result<broadcast::Receiver<ProtocolMessage>> {
+        Ok(self
+            .debugger_receiver_rx
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow!("Couldn't get debugger_receiver_rx, was process initialised correctly")
+            })?
+            .resubscribe())
+    }
+
+    pub(crate) async fn request(
+        &self,
+        request_args: RequestArguments,
+        response_sender: Option<oneshot::Sender<Response>>,
+    ) -> Result<()> {
+        let seq = self.seq_ids.fetch_add(1, Ordering::SeqCst);
+
+        let message = ProtocolMessage {
+            seq: Either::First(seq),
+            type_: ProtocolMessageType::Request(request_args),
+        };
+
+        tracing::trace!("Sending request to send to debugger {:?}", message);
+
+        let request_timeout = self.request_timeout.get_or_set().await;
+
+        let mut debugger_receiver_rx = self
+            .debugger_receiver_tx
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow!("Couldn't get debugger_receiver_tx, was process initialised correctly")
+            })?
+            .subscribe();
+        let debugger_sender_tx = self.debugger_sender_tx.as_ref().ok_or_else(|| {
+            anyhow!("Couldn't get debugger_sender_tx, was process initialised correctly")
+        })?;
+
+        debugger_sender_tx.send(message).await?;
+
+        tokio::spawn(async move {
+            let response = loop {
+                let response = match timeout(request_timeout, debugger_receiver_rx.recv()).await {
+                    Ok(resp) => resp?,
+                    Err(e) => bail!("Timed out waiting for a response: {}", e),
+                };
+
+                tracing::trace!("Checking debugger msg: {:?}", response);
+
+                if let ProtocolMessageType::Response(response) = response.type_ {
+                    if *response.request_seq.first() == seq {
+                        tracing::trace!("Got expected response with seq {}: {:?}", seq, response);
+                        break response;
+                    }
+                }
+            };
+
+            if let Some(response_sender) = response_sender {
+                response_sender.send(response).map_err(|e| {
+                    anyhow!(
+                        "Couldn't send response to response_sender, was it dropped? {:?}",
+                        e
+                    )
+                })?;
+            }
+
+            Ok(())
+        });
+
+        tracing::trace!("Sent request");
+
+        Ok(())
+    }
+
+    pub(crate) async fn stop(&mut self) -> Result<()> {
+        if let Some(child) = self.process.lock().await.as_mut() {
+            let request = RequestArguments::disconnect(DisconnectArguments {
+                restart: Some(false),
+                suspend_debuggee: None,
+                terminate_debuggee: Some(true),
+            });
+
+            let resp = self.request_and_response(request).await?;
+
+            match resp {
+                ResponseResult::Success { .. } => {}
+                ResponseResult::Error {
+                    command: _,
+                    message,
+                    show_user: _,
+                } => bail!("An error occurred stepping {}", message),
+            };
+
+            child.kill().await?;
+        }
 
         Ok(())
     }
@@ -210,7 +345,7 @@ impl DebuggerProcessor {
 
     /// Handle the TCP connection and setup the frame decoding/encoding and handling
     #[tracing::instrument(skip(self))]
-    async fn tcp_connect_and_handle(&mut self, port: u16, request_timeout: Duration) -> Result<()> {
+    async fn tcp_connect_and_handle(&mut self, port: u16) -> Result<()> {
         tracing::trace!("Connecting to port {}", port);
 
         let tcp_stream = self.do_tcp_connect(port).await?;
@@ -333,25 +468,6 @@ impl DebuggerProcessor {
         Ok(())
     }
 
-    pub(crate) async fn send_msg(&mut self, message: ProtocolMessage) -> Result<()> {
-        let debugger_sender_tx = self.debugger_sender_tx.as_mut().ok_or_else(|| {
-            anyhow!("Couldn't get debugger_sender_tx, was process initialised correctly")
-        })?;
-        debugger_sender_tx.send(message).await?;
-
-        Ok(())
-    }
-
-    pub(crate) fn subscribe_debugger(&self) -> Result<broadcast::Receiver<ProtocolMessage>> {
-        Ok(self
-            .debugger_receiver_rx
-            .as_ref()
-            .ok_or_else(|| {
-                anyhow!("Couldn't get debugger_receiver_rx, was process initialised correctly")
-            })?
-            .resubscribe())
-    }
-
     async fn request_and_response(&self, request_args: RequestArguments) -> Result<ResponseResult> {
         let (tx, rx) = oneshot::channel();
 
@@ -364,94 +480,6 @@ impl DebuggerProcessor {
         }
 
         Ok(response.result)
-    }
-
-    pub(crate) async fn request(
-        &self,
-        request_args: RequestArguments,
-        response_sender: Option<oneshot::Sender<Response>>,
-    ) -> Result<()> {
-        let seq = self.seq_ids.fetch_add(1, Ordering::SeqCst);
-
-        let message = ProtocolMessage {
-            seq: Either::First(seq),
-            type_: ProtocolMessageType::Request(request_args),
-        };
-
-        tracing::trace!("Sending request to send to debugger {:?}", message);
-
-        let request_timeout = self.get_request_timeout().await;
-
-        let mut debugger_receiver_rx = self
-            .debugger_receiver_tx
-            .as_ref()
-            .ok_or_else(|| {
-                anyhow!("Couldn't get debugger_receiver_tx, was process initialised correctly")
-            })?
-            .subscribe();
-        let debugger_sender_tx = self.debugger_sender_tx.as_ref().ok_or_else(|| {
-            anyhow!("Couldn't get debugger_sender_tx, was process initialised correctly")
-        })?;
-
-        debugger_sender_tx.send(message).await?;
-
-        tokio::spawn(async move {
-            let response = loop {
-                let response = match timeout(request_timeout, debugger_receiver_rx.recv()).await {
-                    Ok(resp) => resp?,
-                    Err(e) => bail!("Timed out waiting for a response: {}", e),
-                };
-
-                tracing::trace!("Checking debugger msg: {:?}", response);
-
-                if let ProtocolMessageType::Response(response) = response.type_ {
-                    if *response.request_seq.first() == seq {
-                        tracing::trace!("Got expected response with seq {}: {:?}", seq, response);
-                        break response;
-                    }
-                }
-            };
-
-            if let Some(response_sender) = response_sender {
-                response_sender.send(response).map_err(|e| {
-                    anyhow!(
-                        "Couldn't send response to response_sender, was it dropped? {:?}",
-                        e
-                    )
-                })?;
-            }
-
-            Ok(())
-        });
-
-        tracing::trace!("Sent request");
-
-        Ok(())
-    }
-
-    pub(crate) async fn stop(&mut self) -> Result<()> {
-        if let Some(child) = self.process.lock().await.as_mut() {
-            let request = RequestArguments::disconnect(DisconnectArguments {
-                restart: Some(false),
-                suspend_debuggee: None,
-                terminate_debuggee: Some(true),
-            });
-
-            let resp = self.request_and_response(request).await?;
-
-            match resp {
-                ResponseResult::Success { .. } => {}
-                ResponseResult::Error {
-                    command: _,
-                    message,
-                    show_user: _,
-                } => bail!("An error occurred stepping {}", message),
-            };
-
-            child.kill().await?;
-        }
-
-        Ok(())
     }
 }
 

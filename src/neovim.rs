@@ -29,7 +29,7 @@ lazy_static! {
 }
 
 #[derive(Clone, Debug)]
-pub enum VadreLogLevel {
+pub(crate) enum VadreLogLevel {
     CRITICAL,
     ERROR,
     WARN,
@@ -85,7 +85,7 @@ impl VadreWindowType {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub enum VadreBufferType {
+pub(crate) enum VadreBufferType {
     Code,
     Logs,
     Terminal,
@@ -235,7 +235,7 @@ impl VadreBufferType {
 }
 
 #[derive(Debug)]
-pub enum CodeBufferContent<'a> {
+pub(crate) enum CodeBufferContent<'a> {
     File(&'a str),
     Content(String),
 }
@@ -284,7 +284,7 @@ impl Display for VadreOutputBufferSelector {
 }
 
 #[derive(Clone)]
-pub struct NeovimVadreWindow {
+pub(crate) struct NeovimVadreWindow {
     neovim: Neovim<Compat<Stdout>>,
     instance_id: usize,
     current_output: VadreBufferType,
@@ -294,7 +294,7 @@ pub struct NeovimVadreWindow {
 }
 
 impl NeovimVadreWindow {
-    pub fn new(neovim: Neovim<Compat<Stdout>>, instance_id: usize) -> Self {
+    pub(crate) fn new(neovim: Neovim<Compat<Stdout>>, instance_id: usize) -> Self {
         Self {
             neovim,
             instance_id,
@@ -306,7 +306,7 @@ impl NeovimVadreWindow {
     }
 
     #[must_use]
-    pub async fn create_ui(&mut self) -> Result<()> {
+    pub(crate) async fn create_ui(&mut self) -> Result<()> {
         let eventignore_old = self.neovim.get_var("eventignore").await;
         self.neovim.set_var("eventignore", "all".into()).await?;
 
@@ -411,7 +411,7 @@ impl NeovimVadreWindow {
     }
 
     #[must_use]
-    pub async fn log_msg(&self, level: VadreLogLevel, msg: &str) -> Result<()> {
+    pub(crate) async fn log_msg(&self, level: VadreLogLevel, msg: &str) -> Result<()> {
         // TODO: Cache this for a while?
         let set_level = match self.neovim.get_var("vadre_log_level").await {
             Ok(x) => match x {
@@ -464,7 +464,7 @@ impl NeovimVadreWindow {
     }
 
     #[must_use]
-    pub async fn spawn_terminal_command(
+    pub(crate) async fn spawn_terminal_command(
         &mut self,
         command: String,
         debug_program_str: &str,
@@ -542,7 +542,7 @@ impl NeovimVadreWindow {
     }
 
     #[must_use]
-    pub async fn set_code_buffer<'a>(
+    pub(crate) async fn set_code_buffer<'a>(
         &self,
         content: CodeBufferContent<'a>,
         line_number: i64,
@@ -562,6 +562,8 @@ impl NeovimVadreWindow {
         if !old_buffer_name.ends_with(&buffer_name) || force_replace {
             let content = match &content {
                 CodeBufferContent::File(path_name) => {
+                    // TODO: Only change this when the file changes, cache what file we have
+                    // currently displayed maybe?
                     let path = Path::new(&path_name);
 
                     tracing::trace!("Resetting file to {:?}", path);
@@ -633,7 +635,7 @@ impl NeovimVadreWindow {
     }
 
     #[must_use]
-    pub async fn set_file_type(&self, file_type: &str) -> Result<()> {
+    pub(crate) async fn set_file_type(&self, file_type: &str) -> Result<()> {
         self.neovim
             .command(&format!("set filetype={}", file_type))
             .await?;
@@ -642,7 +644,7 @@ impl NeovimVadreWindow {
     }
 
     #[must_use]
-    pub async fn set_call_stack_buffer(&self, content: Vec<String>) -> Result<()> {
+    pub(crate) async fn set_call_stack_buffer(&self, content: Vec<String>) -> Result<()> {
         let buffer = self
             .buffers
             .get(&VadreBufferType::CallStack)
@@ -653,7 +655,7 @@ impl NeovimVadreWindow {
     }
 
     #[must_use]
-    pub async fn set_variables_buffer(&self, content: Vec<String>) -> Result<()> {
+    pub(crate) async fn set_variables_buffer(&self, content: Vec<String>) -> Result<()> {
         let buffer = self
             .buffers
             .get(&VadreBufferType::Variables)
@@ -664,7 +666,7 @@ impl NeovimVadreWindow {
     }
 
     #[must_use]
-    pub async fn set_breakpoints_buffer(&self, content: Vec<String>) -> Result<()> {
+    pub(crate) async fn set_breakpoints_buffer(&self, content: Vec<String>) -> Result<()> {
         let buffer = self
             .buffers
             .get(&VadreBufferType::Breakpoints)
@@ -675,12 +677,12 @@ impl NeovimVadreWindow {
     }
 
     #[must_use]
-    pub async fn get_output_window_type(&self) -> Result<VadreBufferType> {
+    pub(crate) async fn get_output_window_type(&self) -> Result<VadreBufferType> {
         Ok(self.current_output.clone())
     }
 
     #[must_use]
-    pub async fn change_output_window(&mut self, type_: &str) -> Result<()> {
+    pub(crate) async fn change_output_window(&mut self, type_: &str) -> Result<()> {
         let type_ = VadreOutputBufferSelector::get_type(type_)?;
 
         let new_output_type = match type_ {
@@ -803,25 +805,45 @@ impl NeovimVadreWindow {
             ("c", &format!(":VadreContinue {}<CR>", self.instance_id)),
             ("C", &format!(":VadreContinue {}<CR>", self.instance_id)),
             (
+                "<C-c>",
+                &format!(":VadreInterrupt {}<CR>", self.instance_id),
+            ),
+            (
+                "<localleader>tt",
+                &format!("<cmd>lua require('vadre.setup').toggle_single_thread()<CR>",),
+            ),
+            (
                 "<localleader>l",
-                &format!(":VadreOutputWindow {} Logs<CR>", self.instance_id),
+                &format!(
+                    "<cmd>lua require('vadre.setup').output_window({}, 'Logs')<CR>",
+                    self.instance_id
+                ),
             ),
             (
                 "<localleader>s",
-                &format!(":VadreOutputWindow {} CallStack<CR>", self.instance_id),
+                &format!(
+                    "<cmd>lua require('vadre.setup').output_window({}, 'CallStack')<CR>",
+                    self.instance_id
+                ),
             ),
             (
                 "<localleader>v",
-                &format!(":VadreOutputWindow {} Variables<CR>", self.instance_id),
+                &format!(
+                    "<cmd>lua require('vadre.setup').output_window({}, 'Variables')<CR>",
+                    self.instance_id
+                ),
             ),
             (
                 "<localleader>b",
-                &format!(":VadreOutputWindow {} Breakpoints<CR>", self.instance_id),
+                &format!(
+                    "<cmd>lua require('vadre.setup').output_window({}, 'Breakpoints')<CR>",
+                    self.instance_id
+                ),
             ),
             (
                 ">",
                 &format!(
-                    ":VadreOutputWindow {} {}<CR>",
+                    "<cmd>lua require('vadre.setup').output_window({}, '{}')<CR>",
                     self.instance_id,
                     VadreOutputBufferSelector::Next
                 ),
@@ -829,7 +851,7 @@ impl NeovimVadreWindow {
             (
                 "<",
                 &format!(
-                    ":VadreOutputWindow {} {}<CR>",
+                    "<cmd>lua require('vadre.setup').output_window({}, '{}')<CR>",
                     self.instance_id,
                     VadreOutputBufferSelector::Previous
                 ),
@@ -851,20 +873,24 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
-    pub async fn get_var(&self, var_name: &str) -> Result<Value> {
+    pub(crate) async fn get_var(&self, var_name: &str) -> Result<Value> {
         self.neovim.get_var(var_name).await.map_err(|e| anyhow!(e))
     }
 
-    pub async fn err_writeln(&self, log_msg: &str) -> Result<()> {
+    pub(crate) async fn err_writeln(&self, log_msg: &str) -> Result<()> {
         self.neovim
             .err_writeln(log_msg)
             .await
             .map_err(|e| anyhow!(e))
     }
+
+    pub(crate) async fn get_current_line(&self) -> Result<String> {
+        self.neovim.get_current_line().await.map_err(|e| anyhow!(e))
+    }
 }
 
 #[must_use]
-pub async fn setup_signs(neovim: &Neovim<Compat<Stdout>>) -> Result<()> {
+pub(crate) async fn setup_signs(neovim: &Neovim<Compat<Stdout>>) -> Result<()> {
     let sign_background_colour_output = neovim
         .get_hl(0.into(), vec![("name".into(), "SignColumn".into())])
         .await?;
@@ -974,7 +1000,7 @@ pub async fn setup_signs(neovim: &Neovim<Compat<Stdout>>) -> Result<()> {
 }
 
 #[must_use]
-pub async fn toggle_breakpoint_sign(
+pub(crate) async fn toggle_breakpoint_sign(
     neovim: &Neovim<Compat<Stdout>>,
     line_number: i64,
 ) -> Result<bool> {
@@ -1008,7 +1034,7 @@ pub async fn toggle_breakpoint_sign(
 }
 
 #[must_use]
-pub async fn line_is_breakpoint(
+pub(crate) async fn line_is_breakpoint(
     neovim: &Neovim<Compat<Stdout>>,
     buffer_number: &str,
     line_number: i64,

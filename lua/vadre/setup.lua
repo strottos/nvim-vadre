@@ -73,12 +73,38 @@ end, {nargs = 1, count = 1})
 vim.api.nvim_create_user_command("VadreContinue", function(opts)
     print(vim.rpcrequest(jobid, "continue", opts.fargs[1]))
 end, {nargs = 1})
+vim.api.nvim_create_user_command("VadreInterrupt", function(opts)
+    print(vim.rpcrequest(jobid, "interrupt", opts.fargs))
+end, {nargs = 1})
 vim.api.nvim_create_user_command("VadreStopDebugger", function(opts)
     print(vim.rpcrequest(jobid, "stop_debugger", opts.fargs[1]))
 end, {nargs = 1})
-vim.api.nvim_create_user_command("VadreLogMsg", function(opts)
-    print(vim.rpcrequest(jobid, "log_msg", opts.fargs))
-end, {nargs = "*"})
-vim.api.nvim_create_user_command("VadreOutputWindow", function(opts)
-    print(vim.rpcrequest(jobid, "output_window", opts.fargs))
-end, {nargs = "*"})
+
+local function output_window(instance_id, type)
+    print(vim.rpcrequest(jobid, "output_window", instance_id, type))
+end
+
+local function toggle_single_thread()
+    if vim.g.vadre_single_thread_mode == 1 then
+        vim.g.vadre_single_thread_mode = 0
+        print('Turned off single thread mode')
+    else
+        vim.g.vadre_single_thread_mode = 1
+        print('Turned on single thread mode')
+    end
+end
+
+local function handle_output_window_enter(instance_id)
+    print(vim.rpcrequest(jobid, "handle_output_window_enter", instance_id))
+end
+
+local function handle_output_window_space(instance_id)
+    print(vim.rpcrequest(jobid, "handle_output_window_space", instance_id))
+end
+
+return {
+    output_window = output_window,
+    toggle_single_thread = toggle_single_thread,
+    handle_output_window_enter = handle_output_window_enter,
+    handle_output_window_space = handle_output_window_space,
+}

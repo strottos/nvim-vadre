@@ -25,6 +25,8 @@ fn main() -> io::Result<()> {
     a()?;
 
     let thread_1 = thread::spawn(|| {
+        println!("Thread 1");
+
         for i in 0..10 {
             c(i)?;
 
@@ -35,6 +37,8 @@ fn main() -> io::Result<()> {
     });
 
     let thread_2 = thread::spawn(|| {
+        println!("Thread 2");
+
         for i in 50..60 {
             c(i)?;
 

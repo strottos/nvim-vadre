@@ -273,11 +273,17 @@ impl NeovimHandler {
 
             if adding_breakpoint {
                 debugger_lock
+                    .handler
+                    .lock()
+                    .await
                     .add_breakpoint(file_path.clone(), line_number)
                     .await
                     .map_err(|e| format!("Couldn't set breakpoints: {e}"))?;
             } else {
                 debugger_lock
+                    .handler
+                    .lock()
+                    .await
                     .remove_breakpoint(file_path.clone(), line_number)
                     .await
                     .map_err(|e| format!("Couldn't remove breakpoints: {e}"))?;
@@ -307,11 +313,59 @@ impl NeovimHandler {
         debugger
             .lock()
             .await
+            .handler
+            .lock()
+            .await
             .do_step(step_type, count)
             .await
             .map_err(|e| format!("Couldn't do code step: {e}"))?;
 
         Ok("".into())
+    }
+
+    async fn interrupt(&self, instance_id: usize, thread_id: Option<i64>) -> VadreResult {
+        let debuggers = self.debuggers.lock().await;
+
+        let debugger = debuggers.get(&instance_id).ok_or("Debugger didn't exist")?;
+
+        debugger
+            .lock()
+            .await
+            .handler
+            .lock()
+            .await
+            .pause(thread_id)
+            .await
+            .map_err(|e| format!("Couldn't do pause: {e}"))?;
+
+        Ok("interrupted".into())
+    }
+
+    async fn stop_debugger(&self, instance_id: usize) -> VadreResult {
+        let mut debuggers_lock = self.debuggers.lock().await;
+
+        let debugger = debuggers_lock
+            .get(&instance_id)
+            .ok_or("Debugger didn't exist")?;
+
+        let ret;
+
+        if let Err(e) = timeout(
+            Duration::new(5, 0),
+            debugger.lock().await.handler.lock().await.stop(),
+        )
+        .await
+        .map_err(|e| format!("Couldn't stop debugger: {e}"))?
+        {
+            tracing::error!("Timed out stopping debugger: {e}");
+            ret = Err(format!("Debugger instance {} stopped", instance_id).into());
+        } else {
+            ret = Ok(format!("Debugger instance {} failed to stop", instance_id).into());
+        }
+
+        debuggers_lock.remove(&instance_id);
+
+        ret
     }
 
     async fn change_output_window(&self, instance_id: usize, type_: &str) -> VadreResult {
@@ -329,28 +383,40 @@ impl NeovimHandler {
         Ok("".into())
     }
 
-    async fn stop_debugger(&self, instance_id: usize) -> VadreResult {
-        let mut debuggers_lock = self.debuggers.lock().await;
+    async fn handle_output_window_enter(&self, instance_id: usize) -> VadreResult {
+        let debuggers = self.debuggers.lock().await;
 
-        let debugger = debuggers_lock
-            .get(&instance_id)
-            .ok_or("Debugger didn't exist")?;
+        let debugger = debuggers.get(&instance_id).ok_or("Debugger didn't exist")?;
 
-        let ret;
-
-        if let Err(e) = timeout(Duration::new(5, 0), debugger.lock().await.stop())
+        debugger
+            .lock()
             .await
-            .map_err(|e| format!("Couldn't stop debugger: {e}"))?
-        {
-            tracing::error!("Timed out stopping debugger: {e}");
-            ret = Err(format!("Debugger instance {} stopped", instance_id).into());
-        } else {
-            ret = Ok(format!("Debugger instance {} failed to stop", instance_id).into());
-        }
+            .handler
+            .lock()
+            .await
+            .handle_output_window_enter()
+            .await
+            .map_err(|e| format!("Couldn't show output window: {e}"))?;
 
-        debuggers_lock.remove(&instance_id);
+        Ok("".into())
+    }
 
-        ret
+    async fn handle_output_window_space(&self, instance_id: usize) -> VadreResult {
+        let debuggers = self.debuggers.lock().await;
+
+        let debugger = debuggers.get(&instance_id).ok_or("Debugger didn't exist")?;
+
+        debugger
+            .lock()
+            .await
+            .handler
+            .lock()
+            .await
+            .handle_output_window_space()
+            .await
+            .map_err(|e| format!("Couldn't show output window: {e}"))?;
+
+        Ok("".into())
     }
 }
 
@@ -442,12 +508,12 @@ impl Handler for NeovimHandler {
                 self.do_step(DebuggerStepType::Continue, instance_id, 1)
                     .await
             }
-            "output_window" => {
+            "interrupt" => {
                 let args = args
                     .get(0)
-                    .ok_or("Launch args must be supplied")?
+                    .ok_or("Interrupt args must be supplied")?
                     .as_array()
-                    .ok_or("Launch args must be an array")?
+                    .ok_or("Interrupt args must be an array")?
                     .to_vec();
 
                 let instance_id: usize = args
@@ -458,13 +524,9 @@ impl Handler for NeovimHandler {
                     .parse::<usize>()
                     .map_err(|e| format!("Instance id is usize: {e}"))?;
 
-                let type_: &str = args
-                    .get(1)
-                    .ok_or("Type must be supplied")?
-                    .as_str()
-                    .ok_or("Type must be a string")?;
+                let thread_id: Option<i64> = args.get(1).and_then(|x| x.as_i64());
 
-                self.change_output_window(instance_id, type_).await
+                self.interrupt(instance_id, thread_id).await
             }
             "stop_debugger" => {
                 let instance_id: usize = args
@@ -476,6 +538,39 @@ impl Handler for NeovimHandler {
                     .map_err(|e| format!("Instance id is usize: {e}"))?;
 
                 self.stop_debugger(instance_id).await
+            }
+            "output_window" => {
+                let instance_id: usize =
+                    args.get(0)
+                        .ok_or("Instance id must be supplied")?
+                        .as_u64()
+                        .ok_or("Instance id must be a u64")? as usize;
+
+                let type_: &str = args
+                    .get(1)
+                    .ok_or("Type must be supplied")?
+                    .as_str()
+                    .ok_or("Type must be a string")?;
+
+                self.change_output_window(instance_id, type_).await
+            }
+            "handle_output_window_enter" => {
+                let instance_id: usize =
+                    args.get(0)
+                        .ok_or("Instance id must be supplied")?
+                        .as_u64()
+                        .ok_or("Instance id must be a u64")? as usize;
+
+                self.handle_output_window_enter(instance_id).await
+            }
+            "handle_output_window_space" => {
+                let instance_id: usize =
+                    args.get(0)
+                        .ok_or("Instance id must be supplied")?
+                        .as_u64()
+                        .ok_or("Instance id must be a u64")? as usize;
+
+                self.handle_output_window_space(instance_id).await
             }
             _ => Err(format!("Unimplemented {}", name).into()),
         }

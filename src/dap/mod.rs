@@ -28,6 +28,13 @@ pub enum DebuggerStepType {
     Continue,
 }
 
+#[derive(Debug)]
+struct DebuggerThread {
+    is_running: bool,
+    expanded: bool,
+    name: String,
+}
+
 pub(crate) fn new_debugger(
     id: usize,
     debug_program_string: String,
