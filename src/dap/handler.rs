@@ -78,15 +78,16 @@ impl DebuggerHandler {
     #[tracing::instrument(skip(self, config_done_tx))]
     pub(crate) async fn init(
         &mut self,
-        existing_debugger_port: Option<String>,
-        existing_debugger_pid: Option<String>,
+        existing_debugger_port: Option<u16>,
+        dap_command: Option<String>,
         config_done_tx: oneshot::Sender<()>,
     ) -> Result<()> {
         self.config_done_tx = Some(config_done_tx);
 
         self.processor
-            .setup(existing_debugger_port, existing_debugger_pid)
+            .setup(existing_debugger_port, dap_command)
             .await?;
+
         Ok(())
     }
 
@@ -94,8 +95,8 @@ impl DebuggerHandler {
     #[tracing::instrument(skip(self))]
     pub(crate) async fn launch_program(
         &mut self,
-        command: String,
         command_args: Vec<String>,
+        attach_debugger_to_pid: Option<i64>,
         environment_variables: HashMap<String, String>,
     ) -> Result<oneshot::Receiver<Response>> {
         self.request_and_response(RequestArguments::initialize(
@@ -103,13 +104,21 @@ impl DebuggerHandler {
         ))
         .await?;
 
-        let launch_request =
-            self.debugger_type
-                .get_launch_request(command, command_args, environment_variables)?;
-
         let (tx, rx) = oneshot::channel();
 
-        self.processor.request(launch_request, Some(tx)).await?;
+        if let Some(attach_debugger_to_pid) = attach_debugger_to_pid {
+            let attach_request = self
+                .debugger_type
+                .get_attach_request(attach_debugger_to_pid)?;
+
+            self.processor.request(attach_request, Some(tx)).await?;
+        } else {
+            let launch_request = self
+                .debugger_type
+                .get_launch_request(command_args, environment_variables)?;
+
+            self.processor.request(launch_request, Some(tx)).await?;
+        }
 
         Ok(rx)
     }
@@ -154,6 +163,19 @@ impl DebuggerHandler {
 
             self.set_breakpoints(file_path).await?;
         }
+
+        Ok(())
+    }
+
+    pub(crate) async fn force_config_done(&mut self) -> Result<()> {
+        match self.config_done_tx.take() {
+            Some(x) => {
+                if let Err(_) = x.send(()) {
+                    bail!("Couldn't send config_done_tx");
+                }
+            }
+            None => bail!("Couldn't find config_done_tx"),
+        };
 
         Ok(())
     }
@@ -301,7 +323,6 @@ impl DebuggerHandler {
         &mut self,
         request_id: u32,
         args: RequestArguments,
-        // config_done_tx: &mut Option<oneshot::Sender<()>>,
     ) -> Result<()> {
         // Debugger is requesting something from us, currently only runTerminal should be received
         match args {

@@ -72,6 +72,7 @@ pub enum ProtocolMessageType {
 pub enum RequestArguments {
     initialize(InitializeRequestArguments),
     launch(Either<LaunchRequestArguments, serde_json::Value>),
+    attach(serde_json::Value),
     setBreakpoints(SetBreakpointsArguments),
     setFunctionBreakpoints(SetFunctionBreakpointsArguments),
     setExceptionBreakpoints(SetExceptionBreakpointsArguments),
@@ -121,6 +122,7 @@ pub enum ResponseResult {
 pub enum ResponseBody {
     initialize(Capabilities),
     launch(Option<Empty>),
+    attach(Option<Empty>),
     setBreakpoints(SetBreakpointsResponseBody),
     setFunctionBreakpoints(SetBreakpointsResponseBody),
     setExceptionBreakpoints(Option<Empty>),

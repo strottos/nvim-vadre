@@ -35,11 +35,12 @@ local function submit_debugger(item)
     }
 
     local debugger_type = debuggers[item.idx].short
+    local get_last_command_function = loadstring("return vim.g.vadre_last_command_" .. debugger_type)
 
     local input = Input(popup_options, {
         prompt = "> ",
         default_value = vim.g.vadre_debugger_default_command and vim.g.vadre_debugger_default_command[debugger_type]
-            or vim.g.vadre_last_command and vim.g.vadre_last_command[debugger_type] or "",
+            or get_last_command_function() or "",
         on_submit = function(cmd)
             vim.cmd("VadreDebug -t=" .. debugger_type .. " -- " .. cmd)
         end,

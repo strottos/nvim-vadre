@@ -5,6 +5,8 @@ use std::{collections::HashMap, path::PathBuf};
 use super::protocol::RequestArguments;
 use anyhow::Result;
 
+// TODO: Can we meta/macro this file somehow?
+
 #[derive(Debug, Clone)]
 pub(crate) enum DebuggerType {
     CodeLLDB(codelldb::Debugger),
@@ -22,16 +24,27 @@ impl DebuggerType {
         }
     }
 
+    pub(crate) fn get_cmd_args(&self, port: Option<u16>) -> Result<Vec<String>> {
+        match self {
+            DebuggerType::CodeLLDB(debugger) => debugger.get_cmd_args(port),
+        }
+    }
+
     pub(crate) fn get_launch_request(
         &self,
-        command: String,
         command_args: Vec<String>,
         environment_variables: HashMap<String, String>,
     ) -> Result<RequestArguments> {
         match self {
             DebuggerType::CodeLLDB(debugger) => {
-                debugger.get_launch_request(command, command_args, environment_variables)
+                debugger.get_launch_request(command_args, environment_variables)
             }
+        }
+    }
+
+    pub(crate) fn get_attach_request(&self, pid: i64) -> Result<RequestArguments> {
+        match self {
+            DebuggerType::CodeLLDB(debugger) => debugger.get_attach_request(pid),
         }
     }
 

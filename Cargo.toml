@@ -8,6 +8,7 @@ anyhow = "*"
 async-trait = "*"
 bytes = "*"
 chrono = "*"
+clap = { version = "4.4.7", features = ["derive"] }
 dirs = "*"
 dunce = "*"
 dyn-clone = "*"

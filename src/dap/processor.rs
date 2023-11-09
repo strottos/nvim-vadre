@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     fmt::Debug,
     io,
     process::Stdio,
@@ -116,23 +117,37 @@ impl DebuggerProcessor {
 
     pub(crate) async fn setup(
         &mut self,
-        existing_debugger_port: Option<String>,
-        _existing_debugger_pid: Option<String>,
+        existing_debugger_port: Option<u16>,
+        dap_command: Option<String>,
     ) -> Result<()> {
-        let port = match existing_debugger_port {
-            Some(port) => port
-                .parse::<u16>()
-                .map_err(|e| anyhow!("debugger port not understood: {}", e))?,
-            None => {
-                let port = get_unused_localhost_port()?;
+        let port;
 
-                self.launch(port).await?;
+        if let Some(p) = existing_debugger_port {
+            port = Some(p);
+        } else if let Some(cmd) = dap_command {
+            let mut args = cmd
+                .split_whitespace()
+                .map(|x| x.to_string())
+                .collect::<VecDeque<_>>();
 
-                port
-            }
+            let cmd = args
+                .pop_front()
+                .ok_or_else(|| anyhow!("No command provided"))?;
+
+            port = None;
+
+            self.run(cmd, args.into(), false).await?;
+        } else {
+            port = Some(get_unused_localhost_port()?);
+
+            self.launch_vadre_debugger(port).await?;
         };
 
-        self.tcp_connect_and_handle(port).await?;
+        if let Some(port) = port {
+            self.tcp_connect_and_handle(port).await?;
+        } else {
+            self.stdio_connect().await?;
+        }
 
         self.neovim_vadre_window
             .lock()
@@ -243,8 +258,11 @@ impl DebuggerProcessor {
         Ok(())
     }
 
-    async fn launch(&mut self, port: u16) -> Result<()> {
-        let msg = format!("Launching {}", self.debugger_type.get_debugger_type_name());
+    async fn launch_vadre_debugger(&mut self, port: Option<u16>) -> Result<()> {
+        let msg = format!(
+            "Launching Vadre Command for: {}",
+            self.debugger_type.get_debugger_type_name(),
+        );
         self.neovim_vadre_window
             .lock()
             .await
@@ -259,71 +277,81 @@ impl DebuggerProcessor {
             bail!("The binary doesn't exist: {:?}", path);
         }
 
-        let args = vec!["--port".to_string(), port.to_string()];
+        let args = self.debugger_type.get_cmd_args(port)?;
 
-        tracing::debug!("Spawning process: {:?} {:?}", path, args);
-
-        let mut child = Command::new(
+        self.run(
             path.to_str()
-                .ok_or_else(|| anyhow!("Can't convert path to string: {:?}", path))?,
+                .ok_or_else(|| anyhow!("Can't convert path to string: {:?}", path))?
+                .to_string(),
+            args,
+            true,
         )
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| anyhow!("Failed to spawn debugger: {}", e))?;
+        .await
+    }
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("Failed to take stdout from debugger"))?;
+    async fn run(&mut self, cmd: String, args: Vec<String>, take_stdio: bool) -> Result<()> {
+        tracing::debug!("Spawning process: {:?} {:?}", cmd, args);
 
-        let neovim_vadre_window = self.neovim_vadre_window.clone();
+        let mut child = Command::new(cmd)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow!("Failed to spawn debugger: {}", e))?;
 
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(stdout).lines();
-            while let Some(line) = reader
-                .next_line()
-                .await
-                .map_err(|e| anyhow!("Can't read stdout: {}", e))?
-            {
-                tracing::error!("Debugger stdout (could interfere with running): {}", line);
-                neovim_vadre_window
-                    .lock()
+        if take_stdio {
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow!("Failed to take stdout from debugger"))?;
+
+            let neovim_vadre_window = self.neovim_vadre_window.clone();
+
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stdout).lines();
+                while let Some(line) = reader
+                    .next_line()
                     .await
-                    .log_msg(VadreLogLevel::INFO, &format!("Debugger stdout: {}", line))
-                    .await?;
-            }
+                    .map_err(|e| anyhow!("Can't read stdout: {}", e))?
+                {
+                    tracing::error!("Debugger stdout (could interfere with running): {}", line);
+                    neovim_vadre_window
+                        .lock()
+                        .await
+                        .log_msg(VadreLogLevel::INFO, &format!("Debugger stdout: {}", line))
+                        .await?;
+                }
 
-            Ok::<(), anyhow::Error>(())
-        });
+                Ok::<(), anyhow::Error>(())
+            });
 
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow!("Failed to take stderr from debugger"))?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| anyhow!("Failed to take stderr from debugger"))?;
 
-        let neovim_vadre_window = self.neovim_vadre_window.clone();
+            let neovim_vadre_window = self.neovim_vadre_window.clone();
 
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr).lines();
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr).lines();
 
-            while let Some(line) = reader
-                .next_line()
-                .await
-                .map_err(|e| anyhow!("Can't read stderr: {}", e))?
-            {
-                tracing::warn!("Debugger stderr: {}", line);
-                neovim_vadre_window
-                    .lock()
+                while let Some(line) = reader
+                    .next_line()
                     .await
-                    .log_msg(VadreLogLevel::WARN, &format!("Debugger stderr: {}", line))
-                    .await?;
-            }
+                    .map_err(|e| anyhow!("Can't read stderr: {}", e))?
+                {
+                    tracing::warn!("Debugger stderr: {}", line);
+                    neovim_vadre_window
+                        .lock()
+                        .await
+                        .log_msg(VadreLogLevel::WARN, &format!("Debugger stderr: {}", line))
+                        .await?;
+                }
 
-            Ok::<(), anyhow::Error>(())
-        });
+                Ok::<(), anyhow::Error>(())
+            });
+        }
 
         *self.process.lock().await = Some(child);
 
@@ -369,6 +397,25 @@ impl DebuggerProcessor {
             "Couldn't connect to server after {} attempts, bailing",
             number_attempts
         );
+    }
+
+    /// Connect over stdio and setup the frame decoding/encoding and handling
+    #[tracing::instrument(skip(self))]
+    async fn stdio_connect(&mut self) -> Result<()> {
+        tracing::trace!("Connecting to stdio");
+
+        let (stdin, stdout) = {
+            let mut locked_process = self.process.lock().await;
+            let process = locked_process.as_mut().expect("has a process");
+            let stdin = process.stdin.take().expect("should have stdin");
+            let stdout = process.stdout.take().expect("should have stdin");
+            (stdin, stdout)
+        };
+
+        let stream = crate::tokio_join::join(stdout, stdin);
+        let framed_stream = DAPCodec::new().framed(stream);
+
+        self.handle_framed_stream(framed_stream).await
     }
 
     /// Spawn and handle the stream

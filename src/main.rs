@@ -23,6 +23,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use clap::Parser;
 use dap::{Breakpoints, Debugger, DebuggerStepType};
 use nvim_rs::{compat::tokio::Compat, create::tokio as create, Handler, Neovim, Value};
 use tokio::{io::Stdout, sync::Mutex, time::timeout};
@@ -30,6 +31,26 @@ use tokio::{io::Stdout, sync::Mutex, time::timeout};
 static VADRE_NEXT_INSTANCE_NUM: AtomicUsize = AtomicUsize::new(1);
 
 type VadreResult = Result<Value, Value>;
+
+#[derive(Parser, Debug)] // requires `derive` feature
+struct LaunchArgs {
+    #[arg(short = 't', long)]
+    debugger_type: Option<String>,
+
+    #[arg(short = 'p', long)]
+    debugger_port: Option<u16>,
+
+    #[arg(short = 'a', long)]
+    attach: Option<i64>,
+
+    #[arg(short = 'd', long)]
+    dap_command: Option<String>,
+
+    #[arg(short = 'e', long = "env")]
+    environment_variables: Vec<String>,
+
+    command_args: Vec<String>,
+}
 
 #[derive(Clone, Debug)]
 struct NeovimHandler {
@@ -52,17 +73,8 @@ impl NeovimHandler {
         }
     }
 
-    #[tracing::instrument(skip(self, args, neovim))]
-    async fn launch(&self, args: Vec<Value>, neovim: Neovim<Compat<Stdout>>) -> VadreResult {
-        let mut debugger_type = None;
-        let mut debugger_port = None;
-        let mut process_vadre_args = true;
-        let mut get_env_var = false;
-
-        let mut command_args = vec![];
-        let mut command = "".to_string();
-        let mut environment_variables = HashMap::new();
-
+    #[tracing::instrument(skip(self, neovim))]
+    async fn launch(&self, mut args: Vec<String>, neovim: Neovim<Compat<Stdout>>) -> VadreResult {
         if args.len() == 0 {
             tracing::debug!("Launching Vadre create Debugger UI");
 
@@ -85,49 +97,27 @@ impl NeovimHandler {
 
         tracing::debug!("Launching instance {} with args: {:?}", instance_id, args);
 
-        for arg in args {
-            if Some("--") == arg.as_str() {
-                process_vadre_args = false;
-                continue;
+        // Claps `try_parse_from` assumes that the first argument is the program
+        args.insert(0, "nvim_vadre".to_string());
+
+        let args =
+            LaunchArgs::try_parse_from(args).map_err(|x| format!("Couldn't parse args: {x}"))?;
+
+        let debugger_type = args.debugger_type.unwrap_or("codelldb".to_string());
+        let mut environment_variables = HashMap::new();
+
+        for env_var in args.environment_variables {
+            let mut split = env_var.split("=");
+            let key = split
+                .next()
+                .ok_or("Key not found for environment variable")?;
+            let value = split
+                .next()
+                .ok_or("Value not found for environment variable")?;
+            if !split.next().is_none() {
+                return Err("Too many '=' in environment variable".into());
             }
-
-            let arg_string = arg.as_str().ok_or("Argument must be a string")?.to_string();
-            if process_vadre_args && arg_string.starts_with("-t=") && arg_string.len() > 3 {
-                debugger_type = Some(arg_string[3..].to_string());
-            } else if process_vadre_args
-                && arg_string.starts_with("--debugger-port=")
-                && arg_string.len() > 16
-            {
-                debugger_port = Some(arg_string[16..].to_string());
-            } else if process_vadre_args && (arg_string.starts_with("-e") || arg_string == "--env")
-            {
-                get_env_var = true;
-            } else if get_env_var {
-                get_env_var = false;
-                let mut split = arg_string.split("=");
-                let key = split
-                    .next()
-                    .ok_or("Key not found for environment variable")?;
-                let value = split
-                    .next()
-                    .ok_or("Key not found for environment variable")?;
-                environment_variables.insert(key.to_string(), value.to_string());
-            } else {
-                if command == "" {
-                    command = arg_string.clone();
-                } else {
-                    command_args.push(arg_string);
-                }
-            }
-        }
-
-        let debugger_type = debugger_type.unwrap_or_else(|| "codelldb".to_string());
-
-        let command_path = Path::new(&command);
-        if !command_path.exists() {
-            let log_msg = format!("Program not found {}", command);
-            tracing::error!("{}", log_msg);
-            return Err(format!("ERROR: {}", log_msg).into());
+            environment_variables.insert(key.to_string(), value.to_string());
         }
 
         tracing::trace!(
@@ -136,20 +126,13 @@ impl NeovimHandler {
             debugger_type
         );
 
-        let history_command = format!(
-            "let g:vadre_last_command[\"{}\"] = \"{} {}\"",
-            debugger_type,
-            command,
-            command_args.join(" ")
-        );
-
-        let debug_program_string = command.clone() + " " + &command_args.join(" ");
+        let command_args = args.command_args.join(" ");
 
         let debugger = match dap::new_debugger(
             instance_id,
-            debug_program_string,
+            command_args.clone(),
             neovim.clone(),
-            debugger_type,
+            debugger_type.clone(),
         ) {
             Ok(x) => Arc::new(Mutex::new(x)),
             Err(e) => return Err(format!("Can't setup debugger: {}", e).into()),
@@ -169,11 +152,12 @@ impl NeovimHandler {
 
             if let Err(e) = debugger_lock
                 .setup(
-                    command,
-                    command_args,
+                    args.command_args,
                     environment_variables,
                     &pending_breakpoints,
-                    debugger_port,
+                    args.debugger_port,
+                    args.attach,
+                    args.dap_command,
                 )
                 .await
             {
@@ -199,9 +183,15 @@ impl NeovimHandler {
                     });
             }
 
-            neovim.command(&history_command).await.unwrap_or_else(|e| {
-                tracing::error!("Couldn't create vadre last command: {}", e);
-            });
+            neovim
+                .set_var(
+                    &format!(r#"vadre_last_command_{}"#, debugger_type),
+                    command_args.into(),
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::error!("Couldn't create vadre last command: {}", e);
+                });
 
             Ok::<(), anyhow::Error>(())
         });
@@ -435,6 +425,7 @@ impl Handler for NeovimHandler {
         args: Vec<Value>,
         neovim: Neovim<Compat<Stdout>>,
     ) -> VadreResult {
+        tracing::debug!("Handling request: {} {:?}", name, args);
         match name.as_ref() {
             "ping" => Ok("pong".into()),
             "launch" => {
@@ -443,7 +434,11 @@ impl Handler for NeovimHandler {
                         .ok_or("Launch args must be supplied")?
                         .as_array()
                         .ok_or("Launch args must be an array")?
-                        .to_vec(),
+                        .to_vec()
+                        .iter()
+                        // unwrap should be OK here as we always have strings
+                        .map(|x| x.as_str().unwrap().to_string())
+                        .collect(),
                     neovim,
                 )
                 .await

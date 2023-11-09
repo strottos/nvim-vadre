@@ -2,7 +2,7 @@ use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Duration};
 
 use super::{
     breakpoints::Breakpoints, debuggers::DebuggerType, handler::DebuggerHandler,
-    processor::DebuggerProcessor, protocol::ProtocolMessageType, DebuggerStepType,
+    processor::DebuggerProcessor, protocol::ProtocolMessageType,
 };
 use crate::neovim::{NeovimVadreWindow, VadreBufferType, VadreLogLevel};
 
@@ -47,20 +47,23 @@ impl Debugger {
     #[tracing::instrument(skip(self))]
     pub(crate) async fn setup(
         &mut self,
-        command: String,
         command_args: Vec<String>,
         environment_variables: HashMap<String, String>,
         pending_breakpoints: &Breakpoints,
-        existing_debugger_port: Option<String>,
+        existing_debugger_port: Option<u16>,
+        attach_debugger_to_pid: Option<i64>,
+        dap_command: Option<String>,
     ) -> Result<()> {
         self.neovim_vadre_window.lock().await.create_ui().await?;
 
         let (config_done_tx, config_done_rx) = oneshot::channel();
 
+        let have_dap_command = dap_command.is_some();
+
         self.handler
             .lock()
             .await
-            .init(existing_debugger_port, None, config_done_tx)
+            .init(existing_debugger_port, dap_command, config_done_tx)
             .await?;
 
         self.handle_messages().await?;
@@ -69,7 +72,7 @@ impl Debugger {
             .handler
             .lock()
             .await
-            .launch_program(command, command_args, environment_variables)
+            .launch_program(command_args, attach_debugger_to_pid, environment_variables)
             .await?;
 
         self.handler
@@ -77,6 +80,11 @@ impl Debugger {
             .await
             .set_init_breakpoints(pending_breakpoints)
             .await?;
+
+        if attach_debugger_to_pid.is_some() || have_dap_command {
+            // Never going to get the config done message, force it
+            self.handler.lock().await.force_config_done().await?;
+        }
 
         timeout(Duration::new(60, 0), config_done_rx).await??;
 
@@ -125,31 +133,29 @@ impl Debugger {
                     }
                 };
 
-                let status = if let ProtocolMessageType::Request(request_args) = message.type_ {
-                    debugger_handler
-                        .lock()
-                        .await
-                        .handle_request(*message.seq.first(), request_args)
-                        .await
-                } else if let ProtocolMessageType::Event(event) = message.type_ {
-                    debugger_handler.lock().await.handle_event(event).await
-                } else {
-                    Err(anyhow::anyhow!("Unknown message type"))
-                };
-
-                match status {
-                    Ok(x) => tracing::trace!("All good: {:?}", x),
-                    Err(err) => {
-                        let msg = format!("Error handling message: {:?}", err);
-                        tracing::error!("{}", msg);
-                        neovim_vadre_window
+                let status = match message.type_ {
+                    ProtocolMessageType::Request(request_args) => {
+                        debugger_handler
                             .lock()
                             .await
-                            .log_msg(VadreLogLevel::ERROR, &msg)
+                            .handle_request(*message.seq.first(), request_args)
                             .await
-                            .unwrap();
-                        continue;
                     }
+                    ProtocolMessageType::Response(_) => Ok(()),
+                    ProtocolMessageType::Event(event) => {
+                        debugger_handler.lock().await.handle_event(event).await
+                    }
+                };
+
+                if let Err(err) = status {
+                    let msg = format!("Error handling message: {:?}", err);
+                    tracing::error!("{}", msg);
+                    neovim_vadre_window
+                        .lock()
+                        .await
+                        .log_msg(VadreLogLevel::ERROR, &msg)
+                        .await
+                        .unwrap();
                 }
             }
         });

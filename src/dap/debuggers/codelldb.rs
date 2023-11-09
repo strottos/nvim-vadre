@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use reqwest::Url;
 use tokio::sync::Mutex;
 
@@ -56,12 +56,24 @@ impl Debugger {
         Ok(())
     }
 
+    pub(crate) fn get_cmd_args(&self, port: Option<u16>) -> Result<Vec<String>> {
+        match port {
+            Some(port) => Ok(vec!["--port".to_string(), port.to_string()]),
+            None => bail!("Need to specify a port for CodeLLDB"),
+        }
+    }
+
     pub(crate) fn get_launch_request(
         &self,
-        command: String,
-        command_args: Vec<String>,
+        mut command_args: Vec<String>,
         environment_variables: HashMap<String, String>,
     ) -> Result<RequestArguments> {
+        if command_args.is_empty() {
+            bail!("No command to run");
+        }
+
+        let command = command_args.remove(0);
+
         let program = dunce::canonicalize(command)?;
 
         Ok(RequestArguments::launch(Either::Second(
@@ -77,6 +89,12 @@ impl Debugger {
                 "program": program,
             }),
         )))
+    }
+
+    pub(crate) fn get_attach_request(&self, pid: i64) -> Result<RequestArguments> {
+        Ok(RequestArguments::attach(serde_json::json!({
+            "pid": pid,
+        })))
     }
 
     pub(crate) fn get_binary_name(&self) -> Result<String> {
