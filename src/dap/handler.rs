@@ -669,17 +669,14 @@ impl DebuggerHandler {
 
                     let breakpoint_is_enabled = self.breakpoint_is_enabled(&breakpoint_response)?;
 
-                    self.breakpoints.set_breakpoint_resolved(
-                        file_path.clone(),
-                        source_line_number,
-                        breakpoint_response.line.ok_or_else(|| {
-                            anyhow!(
-                                "Line wasn't set in breakpoint setting response as expected: {:?}",
-                                breakpoint_response
-                            )
-                        })?,
-                        breakpoint_id.to_string(),
-                    )?;
+                    if let Some(actual_line_number) = breakpoint_response.line {
+                        self.breakpoints.set_breakpoint_resolved(
+                            file_path.clone(),
+                            source_line_number,
+                            actual_line_number,
+                            breakpoint_id.to_string(),
+                        )?;
+                    }
 
                     if breakpoint_is_enabled {
                         self.breakpoints
@@ -697,12 +694,15 @@ impl DebuggerHandler {
     #[tracing::instrument]
     async fn handle_event_stopped(&mut self, stopped_event: StoppedEventBody) -> Result<()> {
         self.current_thread_id = stopped_event.thread_id;
+        tracing::trace!("HERE1");
         if let Some(thread_id) = stopped_event.thread_id {
             self.stack_expanded_threads.insert(thread_id);
         }
 
+        tracing::trace!("HERE2");
         if let Some(listener_tx) = self.stopped_listener_tx.take() {
             // If we're here we're about to do more stepping so no need to do more
+            tracing::trace!("HERE3");
             if let Err(_) = listener_tx.send(()) {
                 tracing::error!("Couldn't send stopped_listener_tx");
                 self.neovim_vadre_window
@@ -714,10 +714,14 @@ impl DebuggerHandler {
             return Ok(());
         }
 
+        tracing::trace!("HERE4");
         self.display_output_info().await?;
 
+        tracing::trace!("HERE5");
         if let Some(thread_id) = stopped_event.thread_id {
+            tracing::trace!("HERE6");
             if let Err(e) = self.process_stopped(thread_id).await {
+                tracing::trace!("HERE7");
                 self.neovim_vadre_window
                     .lock()
                     .await
@@ -741,31 +745,40 @@ impl DebuggerHandler {
             .breakpoint
             .id
             .ok_or_else(|| anyhow!("Couldn't find ID from event: {:?}", breakpoint_event))?;
+        tracing::trace!("HELLO1");
 
         let breakpoint_is_enabled = self.breakpoint_is_enabled(&breakpoint_event.breakpoint)?;
+        tracing::trace!("HELLO2");
 
         // Do we need to poll/sleep here to wait for the breakpoint to be resolved?
         let (file_path, source_line_number) = self
             .breakpoints
             .get_breakpoint_for_id(&breakpoint_id)
             .ok_or_else(|| anyhow!("Can't find breakpoint for id {}", breakpoint_id))?;
+        tracing::trace!("HELLO3");
 
-        self.breakpoints.set_breakpoint_resolved(
-            file_path.clone(),
-            source_line_number,
-            breakpoint_event
-                .breakpoint
-                .line
-                .ok_or_else(|| anyhow!("Couldn't find line from event: {:?}", breakpoint_event))?,
-            breakpoint_id.to_string(),
-        )?;
-
-        if breakpoint_is_enabled {
-            self.breakpoints
-                .set_breakpoint_enabled(file_path.clone(), source_line_number)?;
+        if let Some(actual_line_number) = breakpoint_event.breakpoint.line {
+            tracing::trace!("HELLO4");
+            self.breakpoints.set_breakpoint_resolved(
+                file_path.clone(),
+                source_line_number,
+                actual_line_number,
+                breakpoint_id.to_string(),
+            )?;
+            tracing::trace!("HELLO5");
         }
 
+        tracing::trace!("HELLO6");
+        if breakpoint_is_enabled {
+            tracing::trace!("HELLO7");
+            self.breakpoints
+                .set_breakpoint_enabled(file_path.clone(), source_line_number)?;
+            tracing::trace!("HELLO8");
+        }
+        tracing::trace!("HELLO9");
+
         self.process_breakpoints_output().await?;
+        tracing::trace!("HELLO10");
 
         Ok(())
     }

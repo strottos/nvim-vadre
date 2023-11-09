@@ -104,26 +104,54 @@ impl Debugger {
         let debugger_rx = self.handler.lock().await.subscribe_debugger()?;
 
         let debugger_handler = self.handler.clone();
+        let neovim_vadre_window = self.neovim_vadre_window.clone();
 
         tokio::spawn(async move {
             let mut debugger_rx = debugger_rx;
 
             loop {
-                let message = debugger_rx.recv().await?;
+                let message = match debugger_rx.recv().await {
+                    Ok(message) => message,
+                    Err(err) => {
+                        let msg = format!("Error receiving message: {:?}", err);
+                        tracing::error!("{}", msg);
+                        neovim_vadre_window
+                            .lock()
+                            .await
+                            .log_msg(VadreLogLevel::ERROR, &msg)
+                            .await
+                            .unwrap();
+                        continue;
+                    }
+                };
 
-                if let ProtocolMessageType::Request(request_args) = message.type_ {
+                let status = if let ProtocolMessageType::Request(request_args) = message.type_ {
                     debugger_handler
                         .lock()
                         .await
                         .handle_request(*message.seq.first(), request_args)
-                        .await?;
+                        .await
                 } else if let ProtocolMessageType::Event(event) = message.type_ {
-                    debugger_handler.lock().await.handle_event(event).await?;
+                    debugger_handler.lock().await.handle_event(event).await
+                } else {
+                    Err(anyhow::anyhow!("Unknown message type"))
+                };
+
+                match status {
+                    Ok(x) => tracing::trace!("All good: {:?}", x),
+                    Err(err) => {
+                        let msg = format!("Error handling message: {:?}", err);
+                        tracing::error!("{}", msg);
+                        neovim_vadre_window
+                            .lock()
+                            .await
+                            .log_msg(VadreLogLevel::ERROR, &msg)
+                            .await
+                            .unwrap();
+                        continue;
+                    }
                 }
             }
-
-            #[allow(unreachable_code)]
-            Ok::<(), anyhow::Error>(())
         });
 
         Ok(())
