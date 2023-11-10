@@ -9,7 +9,7 @@ use crate::neovim::{NeovimVadreWindow, VadreBufferType, VadreLogLevel};
 use anyhow::Result;
 use tokio::{
     sync::{oneshot, Mutex},
-    time::timeout,
+    time::{sleep, timeout},
     try_join,
 };
 
@@ -56,14 +56,12 @@ impl Debugger {
     ) -> Result<()> {
         self.neovim_vadre_window.lock().await.create_ui().await?;
 
-        let (config_done_tx, config_done_rx) = oneshot::channel();
-
-        let have_dap_command = dap_command.is_some();
+        let (terminal_spawned_tx, terminal_spawned_rx) = oneshot::channel();
 
         self.handler
             .lock()
             .await
-            .init(existing_debugger_port, dap_command, config_done_tx)
+            .init(existing_debugger_port, dap_command, terminal_spawned_tx)
             .await?;
 
         self.handle_messages().await?;
@@ -75,29 +73,26 @@ impl Debugger {
             .launch_program(command_args, attach_debugger_to_pid, environment_variables)
             .await?;
 
+        if !attach_debugger_to_pid.is_some() {
+            timeout(Duration::new(60, 0), terminal_spawned_rx).await??;
+        }
+
         self.handler
             .lock()
             .await
             .set_init_breakpoints(pending_breakpoints)
             .await?;
 
-        if attach_debugger_to_pid.is_some() || have_dap_command {
-            // Never going to get the config done message, force it
-            self.handler.lock().await.force_config_done().await?;
-        }
-
-        timeout(Duration::new(60, 0), config_done_rx).await??;
-
-        let (config_tx, config_rx) = oneshot::channel();
+        let (config_done_tx, config_done_rx) = oneshot::channel();
 
         self.handler
             .lock()
             .await
-            .configuration_done(config_tx)
+            .configuration_done(config_done_tx)
             .await?;
 
         // Check that the launch and config requests were successful
-        try_join!(launch_rx, config_rx)?;
+        try_join!(launch_rx, config_done_rx)?;
 
         self.log_msg(
             VadreLogLevel::INFO,

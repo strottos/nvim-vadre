@@ -40,12 +40,9 @@ pub(crate) fn new_debugger(
             neovim_vadre_window.clone(),
         )),
 
-        // "python" | "debugpy" => Ok(Box::new(debugpy::Debugger::new(
-        //     id,
-        //     command,
-        //     command_args,
-        //     neovim,
-        // ))),
+        "python" | "debugpy" => DebuggerType::DebugPy(debuggers::debugpy::Debugger::new(
+            neovim_vadre_window.clone(),
+        )),
 
         // "go" | "delve" => Ok(Box::new(go_delve::Debugger::new(
         //     id,

@@ -44,7 +44,7 @@ pub(crate) struct DebuggerHandler {
 
     debug_program_string: String,
 
-    config_done_tx: Option<oneshot::Sender<()>>,
+    terminal_spawned_tx: Option<oneshot::Sender<()>>,
     stopped_listener_tx: Option<oneshot::Sender<()>>,
 }
 
@@ -70,19 +70,19 @@ impl DebuggerHandler {
 
             debug_program_string,
 
-            config_done_tx: None,
+            terminal_spawned_tx: None,
             stopped_listener_tx: None,
         }
     }
 
-    #[tracing::instrument(skip(self, config_done_tx))]
+    #[tracing::instrument(skip(self, terminal_spawned_tx))]
     pub(crate) async fn init(
         &mut self,
         existing_debugger_port: Option<u16>,
         dap_command: Option<String>,
-        config_done_tx: oneshot::Sender<()>,
+        terminal_spawned_tx: oneshot::Sender<()>,
     ) -> Result<()> {
-        self.config_done_tx = Some(config_done_tx);
+        self.terminal_spawned_tx = Some(terminal_spawned_tx);
 
         self.processor
             .setup(existing_debugger_port, dap_command)
@@ -109,13 +109,15 @@ impl DebuggerHandler {
         if let Some(attach_debugger_to_pid) = attach_debugger_to_pid {
             let attach_request = self
                 .debugger_type
-                .get_attach_request(attach_debugger_to_pid)?;
+                .get_attach_request(attach_debugger_to_pid)
+                .await?;
 
             self.processor.request(attach_request, Some(tx)).await?;
         } else {
             let launch_request = self
                 .debugger_type
-                .get_launch_request(command_args, environment_variables)?;
+                .get_launch_request(command_args, environment_variables)
+                .await?;
 
             self.processor.request(launch_request, Some(tx)).await?;
         }
@@ -128,29 +130,26 @@ impl DebuggerHandler {
         &mut self,
         pending_breakpoints: &Breakpoints,
     ) -> Result<()> {
-        let (tx1, rx1) = oneshot::channel();
-        let (tx2, rx2) = oneshot::channel();
+        // let (tx1, rx1) = oneshot::channel();
+        // let (tx2, rx2) = oneshot::channel();
 
-        self.processor
-            .request(
-                RequestArguments::setFunctionBreakpoints(SetFunctionBreakpointsArguments {
-                    breakpoints: vec![],
-                }),
-                Some(tx1),
-            )
-            .await?;
-        self.processor
-            .request(
-                RequestArguments::setExceptionBreakpoints(SetExceptionBreakpointsArguments {
-                    filters: vec![],
-                    exception_options: None,
-                    filter_options: None,
-                }),
-                Some(tx2),
-            )
-            .await?;
-
-        try_join!(rx1, rx2)?;
+        // self.processor
+        //     .request_and_response(
+        //         RequestArguments::setFunctionBreakpoints(SetFunctionBreakpointsArguments {
+        //             breakpoints: vec![],
+        //         }),
+        //     )
+        //     .await?;
+        // self.processor
+        //     .request_and_response(
+        //         RequestArguments::setExceptionBreakpoints(SetExceptionBreakpointsArguments {
+        //             filters: vec![],
+        //             exception_options: None,
+        //             filter_options: None,
+        //         }),
+        //         Some(tx2),
+        //     )
+        //     .await?;
 
         for file_path in pending_breakpoints.get_all_files() {
             for line_number in pending_breakpoints
@@ -163,19 +162,6 @@ impl DebuggerHandler {
 
             self.set_breakpoints(file_path).await?;
         }
-
-        Ok(())
-    }
-
-    pub(crate) async fn force_config_done(&mut self) -> Result<()> {
-        match self.config_done_tx.take() {
-            Some(x) => {
-                if let Err(_) = x.send(()) {
-                    bail!("Couldn't send config_done_tx");
-                }
-            }
-            None => bail!("Couldn't find config_done_tx"),
-        };
 
         Ok(())
     }
@@ -365,10 +351,10 @@ impl DebuggerHandler {
 
                 self.processor.send_msg(response).await?;
 
-                match self.config_done_tx.take() {
+                match self.terminal_spawned_tx.take() {
                     Some(x) => {
                         if let Err(_) = x.send(()) {
-                            bail!("Couldn't send config_done_tx");
+                            bail!("Couldn't send terminal_spawned_tx");
                         }
                     }
                     None => {}
@@ -670,6 +656,7 @@ impl DebuggerHandler {
             }))
             .await?;
 
+        tracing::trace!("Got response result: {:?}", response_result);
         if let ResponseResult::Success { body } = response_result {
             if let ResponseBody::setBreakpoints(breakpoints_body) = body {
                 for (i, breakpoint_response) in breakpoints_body.breakpoints.into_iter().enumerate()
@@ -766,45 +753,40 @@ impl DebuggerHandler {
             .breakpoint
             .id
             .ok_or_else(|| anyhow!("Couldn't find ID from event: {:?}", breakpoint_event))?;
-        tracing::trace!("HELLO1");
 
         let breakpoint_is_enabled = self.breakpoint_is_enabled(&breakpoint_event.breakpoint)?;
-        tracing::trace!("HELLO2");
 
         // Do we need to poll/sleep here to wait for the breakpoint to be resolved?
         let (file_path, source_line_number) = self
             .breakpoints
             .get_breakpoint_for_id(&breakpoint_id)
             .ok_or_else(|| anyhow!("Can't find breakpoint for id {}", breakpoint_id))?;
-        tracing::trace!("HELLO3");
 
         if let Some(actual_line_number) = breakpoint_event.breakpoint.line {
-            tracing::trace!("HELLO4");
             self.breakpoints.set_breakpoint_resolved(
                 file_path.clone(),
                 source_line_number,
                 actual_line_number,
                 breakpoint_id.to_string(),
             )?;
-            tracing::trace!("HELLO5");
         }
 
-        tracing::trace!("HELLO6");
         if breakpoint_is_enabled {
-            tracing::trace!("HELLO7");
             self.breakpoints
                 .set_breakpoint_enabled(file_path.clone(), source_line_number)?;
-            tracing::trace!("HELLO8");
         }
-        tracing::trace!("HELLO9");
 
         self.process_breakpoints_output().await?;
-        tracing::trace!("HELLO10");
 
         Ok(())
     }
 
     fn breakpoint_is_enabled(&self, breakpoint: &Breakpoint) -> Result<bool> {
+        if breakpoint.verified {
+            return Ok(true);
+        }
+
+        // OK CodeLLDB, over to your awfulness.
         let message = breakpoint
             .message
             .as_ref()

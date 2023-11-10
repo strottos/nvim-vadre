@@ -144,7 +144,6 @@ impl VadreBufferType {
         }
     }
 
-    #[must_use]
     fn get_output_buffer(
         current_buf_name: &str,
         type_: VadreOutputBufferSelector,
@@ -251,7 +250,6 @@ enum VadreOutputBufferSelector {
 }
 
 impl VadreOutputBufferSelector {
-    #[must_use]
     fn get_type(type_: &str) -> Result<Self> {
         match type_
             .to_lowercase()
@@ -305,7 +303,6 @@ impl NeovimVadreWindow {
         }
     }
 
-    #[must_use]
     pub(crate) async fn create_ui(&mut self) -> Result<()> {
         let eventignore_old = self.neovim.get_var("eventignore").await;
         self.neovim.set_var("eventignore", "all".into()).await?;
@@ -410,7 +407,6 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
-    #[must_use]
     pub(crate) async fn log_msg(&self, level: VadreLogLevel, msg: &str) -> Result<()> {
         // TODO: Cache this for a while?
         let set_level = match self.neovim.get_var("vadre_log_level").await {
@@ -463,7 +459,6 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
-    #[must_use]
     pub(crate) async fn spawn_terminal_command(
         &mut self,
         command: String,
@@ -541,7 +536,6 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
-    #[must_use]
     pub(crate) async fn set_code_buffer<'a>(
         &self,
         content: CodeBufferContent<'a>,
@@ -634,7 +628,6 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
-    #[must_use]
     pub(crate) async fn set_file_type(&self, file_type: &str) -> Result<()> {
         self.neovim
             .command(&format!("set filetype={}", file_type))
@@ -643,7 +636,6 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
-    #[must_use]
     pub(crate) async fn set_call_stack_buffer(&self, content: Vec<String>) -> Result<()> {
         let buffer = self
             .buffers
@@ -654,7 +646,6 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
-    #[must_use]
     pub(crate) async fn set_variables_buffer(&self, content: Vec<String>) -> Result<()> {
         let buffer = self
             .buffers
@@ -665,7 +656,6 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
-    #[must_use]
     pub(crate) async fn set_breakpoints_buffer(&self, content: Vec<String>) -> Result<()> {
         let buffer = self
             .buffers
@@ -676,12 +666,10 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
-    #[must_use]
     pub(crate) async fn get_output_window_type(&self) -> Result<VadreBufferType> {
         Ok(self.current_output.clone())
     }
 
-    #[must_use]
     pub(crate) async fn change_output_window(&mut self, type_: &str) -> Result<()> {
         let type_ = VadreOutputBufferSelector::get_type(type_)?;
 
@@ -711,7 +699,6 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
-    #[must_use]
     async fn write_to_buffer(
         &self,
         buffer: &Buffer<Compat<Stdout>>,
@@ -741,7 +728,6 @@ impl NeovimVadreWindow {
         Ok(())
     }
 
-    #[must_use]
     async fn set_vadre_buffer_options(
         &self,
         buffer: &Buffer<Compat<Stdout>>,
@@ -777,7 +763,6 @@ impl NeovimVadreWindow {
         }
     }
 
-    #[must_use]
     async fn set_vadre_debugger_keys_for_buffer(
         &self,
         buffer: &Buffer<Compat<Stdout>>,
@@ -889,7 +874,6 @@ impl NeovimVadreWindow {
     }
 }
 
-#[must_use]
 pub(crate) async fn setup_signs(neovim: &Neovim<Compat<Stdout>>) -> Result<()> {
     let sign_background_colour_output = neovim
         .get_hl(0.into(), vec![("name".into(), "SignColumn".into())])
@@ -999,7 +983,6 @@ pub(crate) async fn setup_signs(neovim: &Neovim<Compat<Stdout>>) -> Result<()> {
     Ok(())
 }
 
-#[must_use]
 pub(crate) async fn toggle_breakpoint_sign(
     neovim: &Neovim<Compat<Stdout>>,
     line_number: i64,
@@ -1033,7 +1016,6 @@ pub(crate) async fn toggle_breakpoint_sign(
     }
 }
 
-#[must_use]
 pub(crate) async fn line_is_breakpoint(
     neovim: &Neovim<Compat<Stdout>>,
     buffer_number: &str,

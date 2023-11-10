@@ -271,28 +271,18 @@ impl DebuggerProcessor {
 
         self.debugger_type.download_plugin().await?;
 
-        let path = self.debugger_type.get_debugger_path()?;
+        let child = self
+            .debugger_type
+            .spawn_child(port, vec!["./test_files/test_progs/test.py".to_string()])
+            .await?;
 
-        if !path.exists() {
-            bail!("The binary doesn't exist: {:?}", path);
-        }
-
-        let args = self.debugger_type.get_cmd_args(port)?;
-
-        self.run(
-            path.to_str()
-                .ok_or_else(|| anyhow!("Can't convert path to string: {:?}", path))?
-                .to_string(),
-            args,
-            true,
-        )
-        .await
+        self.setup_stdio(child, true).await
     }
 
     async fn run(&mut self, cmd: String, args: Vec<String>, take_stdio: bool) -> Result<()> {
         tracing::debug!("Spawning process: {:?} {:?}", cmd, args);
 
-        let mut child = Command::new(cmd)
+        let child = Command::new(cmd)
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -300,6 +290,10 @@ impl DebuggerProcessor {
             .spawn()
             .map_err(|e| anyhow!("Failed to spawn debugger: {}", e))?;
 
+        self.setup_stdio(child, take_stdio).await
+    }
+
+    async fn setup_stdio(&mut self, mut child: Child, take_stdio: bool) -> Result<()> {
         if take_stdio {
             let stdout = child
                 .stdout

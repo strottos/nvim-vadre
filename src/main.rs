@@ -32,8 +32,11 @@ static VADRE_NEXT_INSTANCE_NUM: AtomicUsize = AtomicUsize::new(1);
 
 type VadreResult = Result<Value, Value>;
 
-#[derive(Parser, Debug)] // requires `derive` feature
+#[derive(Parser, Debug)]
 struct LaunchArgs {
+    #[arg(short = 'l', long, default_value_t = 3)]
+    launch_timeout: u64,
+
     #[arg(short = 't', long)]
     debugger_type: Option<String>,
 
@@ -150,16 +153,18 @@ impl NeovimHandler {
 
             let mut debugger_lock = debugger.lock().await;
 
-            if let Err(e) = debugger_lock
-                .setup(
+            if let Err(e) = timeout(
+                Duration::new(args.launch_timeout, 0),
+                debugger_lock.setup(
                     args.command_args,
                     environment_variables,
                     &pending_breakpoints,
                     args.debugger_port,
                     args.attach,
                     args.dap_command,
-                )
-                .await
+                ),
+            )
+            .await
             {
                 let log_msg = format!("Critical error setting up debugger: {}", e);
                 tracing::error!("{}", e);

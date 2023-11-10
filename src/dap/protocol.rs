@@ -222,7 +222,13 @@ impl codec::Decoder for DAPCodec {
                         self.state = State::ReadingHeaders;
                         self.content_len = 0;
 
-                        debug!("<-- {}", str::from_utf8(&message_bytes).unwrap());
+                        debug!(
+                            "<-- {}",
+                            str::from_utf8(&message_bytes).map_err(|e| io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("{:?}", e)
+                            ))?
+                        );
                         match serde_json::from_slice(&message_bytes) {
                             Ok(message) => return Ok(Some(Ok(message))),
                             Err(error) => {
@@ -249,11 +255,16 @@ impl codec::Encoder<ProtocolMessage> for DAPCodec {
         buffer: &mut BytesMut,
     ) -> Result<(), Self::Error> {
         tracing::trace!("encoding {:?} {:?}", message, buffer);
-        let message_bytes = serde_json::to_vec(&message).unwrap();
-        debug!("--> {}", str::from_utf8(&message_bytes).unwrap());
+        let message_bytes = serde_json::to_vec(&message)?;
+        debug!(
+            "--> {}",
+            str::from_utf8(&message_bytes)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{:?}", e)))?
+        );
 
         buffer.reserve(32 + message_bytes.len());
-        write!(buffer, "Content-Length: {}\r\n\r\n", message_bytes.len()).unwrap();
+        write!(buffer, "Content-Length: {}\r\n\r\n", message_bytes.len())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{:?}", e)))?;
         buffer.extend_from_slice(&message_bytes);
 
         Ok(())
