@@ -148,7 +148,7 @@ impl Breakpoints {
         Ok(())
     }
 
-    pub(crate) fn get_all_breakpoint_line_numbers_for_file(
+    pub(crate) fn get_all_breakpoints_for_file(
         &self,
         file_path: &str,
     ) -> Result<&HashMap<i64, DebuggerBreakpoint>> {

@@ -25,7 +25,9 @@ impl Debugger {
         debug_program_string: String,
         debugger_type: DebuggerType,
         neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
+        breakpoints: Breakpoints,
     ) -> Self {
+        // TODO: assert all breakpoints in pending state
         let debugger_processor =
             DebuggerProcessor::new(debugger_type.clone(), neovim_vadre_window.clone());
 
@@ -34,6 +36,7 @@ impl Debugger {
             debugger_processor,
             neovim_vadre_window.clone(),
             debug_program_string,
+            breakpoints,
         )));
 
         Self {
@@ -49,7 +52,6 @@ impl Debugger {
         &mut self,
         command_args: Vec<String>,
         environment_variables: HashMap<String, String>,
-        pending_breakpoints: &Breakpoints,
         existing_debugger_port: Option<u16>,
         attach_debugger_to_pid: Option<i64>,
         dap_command: Option<String>,
@@ -77,11 +79,7 @@ impl Debugger {
             timeout(Duration::new(60, 0), terminal_spawned_rx).await??;
         }
 
-        self.handler
-            .lock()
-            .await
-            .set_init_breakpoints(pending_breakpoints)
-            .await?;
+        self.handler.lock().await.init_breakpoints().await?;
 
         let (config_done_tx, config_done_rx) = oneshot::channel();
 

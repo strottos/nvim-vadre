@@ -33,6 +33,7 @@ pub(crate) fn new_debugger(
     debug_program_string: String,
     neovim: Neovim<Compat<Stdout>>,
     debugger_type: String,
+    breakpoints: Breakpoints,
 ) -> Result<Box<Debugger>> {
     let neovim_vadre_window = Arc::new(Mutex::new(NeovimVadreWindow::new(neovim, id)));
     let debugger_type = match debugger_type.as_ref() {
@@ -72,5 +73,6 @@ pub(crate) fn new_debugger(
         debug_program_string,
         debugger_type,
         neovim_vadre_window,
+        breakpoints,
     )))
 }

@@ -1,6 +1,6 @@
 use std::{collections::HashMap, env, fmt::Debug, path::PathBuf, sync::Arc};
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use tokio::{process::Child, sync::Mutex};
 
 use crate::{
@@ -67,7 +67,16 @@ impl Debugger {
         })))
     }
 
-    pub(crate) async fn get_debugger_path(&self) -> Result<PathBuf> {
+    pub(crate) fn check_breakpoint_enabled(&self, msg: &str) -> Result<bool> {
+        Ok(msg
+            .rsplit_once("Resolved locations: ")
+            .ok_or_else(|| anyhow!("Couldn't find Resolved locations message in: {}", msg))?
+            .1
+            .parse::<i64>()?
+            > 0)
+    }
+
+    async fn get_debugger_path(&self) -> Result<PathBuf> {
         bail!("Need to specify the command to run generic debugger");
     }
 }

@@ -53,6 +53,12 @@ macro_rules! impl_debugger_type {
                 }
             }
 
+            pub(crate) fn check_breakpoint_enabled(&self, msg: &str) -> Result<bool> {
+                match self {
+                    $(DebuggerType::$debugger_type(debugger) => debugger.check_breakpoint_enabled(msg),)*
+                }
+            }
+
             pub(crate) fn get_debugger_type_name(&self) -> String {
                 match self {
                     $(DebuggerType::$debugger_type(_) => format!("{}", stringify!($debugger_type)),)*

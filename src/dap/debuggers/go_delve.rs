@@ -197,6 +197,15 @@ impl Debugger {
         Ok(path)
     }
 
+    pub(crate) fn check_breakpoint_enabled(&self, msg: &str) -> Result<bool> {
+        Ok(msg
+            .rsplit_once("Resolved locations: ")
+            .ok_or_else(|| anyhow!("Couldn't find Resolved locations message in: {}", msg))?
+            .1
+            .parse::<i64>()?
+            > 0)
+    }
+
     async fn get_debugger_binary_path(&self) -> Result<PathBuf> {
         let binary_name = format!("dlv{}", EXE_SUFFIX);
         let mut path = self.get_debugger_path().await?;

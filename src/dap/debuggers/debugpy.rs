@@ -176,6 +176,15 @@ impl Debugger {
         })))
     }
 
+    pub(crate) fn check_breakpoint_enabled(&self, msg: &str) -> Result<bool> {
+        Ok(msg
+            .rsplit_once("Resolved locations: ")
+            .ok_or_else(|| anyhow!("Couldn't find Resolved locations message in: {}", msg))?
+            .1
+            .parse::<i64>()?
+            > 0)
+    }
+
     async fn get_python_path(&self) -> Result<PathBuf> {
         let path = match self
             .neovim_vadre_window

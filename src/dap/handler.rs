@@ -54,6 +54,7 @@ impl DebuggerHandler {
         processor: DebuggerProcessor,
         neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
         debug_program_string: String,
+        breakpoints: Breakpoints,
     ) -> Self {
         DebuggerHandler {
             debugger_type,
@@ -64,7 +65,7 @@ impl DebuggerHandler {
 
             current_thread_id: None,
             current_frame_id: None,
-            breakpoints: Breakpoints::new(),
+            breakpoints,
 
             stack_expanded_threads: HashSet::new(),
 
@@ -126,10 +127,7 @@ impl DebuggerHandler {
     }
 
     #[tracing::instrument]
-    pub(crate) async fn set_init_breakpoints(
-        &mut self,
-        pending_breakpoints: &Breakpoints,
-    ) -> Result<()> {
+    pub(crate) async fn init_breakpoints(&mut self) -> Result<()> {
         // let (tx1, rx1) = oneshot::channel();
         // let (tx2, rx2) = oneshot::channel();
 
@@ -151,15 +149,7 @@ impl DebuggerHandler {
         //     )
         //     .await?;
 
-        for file_path in pending_breakpoints.get_all_files() {
-            for line_number in pending_breakpoints
-                .get_all_breakpoint_line_numbers_for_file(&file_path)?
-                .keys()
-            {
-                self.breakpoints
-                    .add_pending_breakpoint(file_path.clone(), *line_number)?;
-            }
-
+        for file_path in self.breakpoints.get_all_files() {
             self.set_breakpoints(file_path).await?;
         }
 
@@ -622,9 +612,11 @@ impl DebuggerHandler {
 
     #[tracing::instrument(skip(self))]
     async fn set_breakpoints(&mut self, file_path: String) -> Result<()> {
+        tracing::trace!("Setting breakpoints for file: {:?}", file_path);
+
         let line_numbers = self
             .breakpoints
-            .get_all_breakpoint_line_numbers_for_file(&file_path)?
+            .get_all_breakpoints_for_file(&file_path)?
             .keys()
             .map(|x| *x)
             .into_iter()
@@ -633,13 +625,12 @@ impl DebuggerHandler {
         let file_name = Path::new(&file_path)
             .file_name()
             .ok_or_else(|| anyhow!("Can't find filename for file path: {:?}", file_path))?;
-
         let file_name = file_name
             .to_str()
             .ok_or_else(|| anyhow!("Can't covert filename to string: {:?}", file_name))?
             .to_string();
 
-        let breakpoints: Vec<SourceBreakpoint> = line_numbers
+        let source_breakpoints: Vec<SourceBreakpoint> = line_numbers
             .clone()
             .into_iter()
             .map(|x| SourceBreakpoint::new(x))
@@ -649,14 +640,13 @@ impl DebuggerHandler {
 
         let response_result = self
             .request_and_response(RequestArguments::setBreakpoints(SetBreakpointsArguments {
-                breakpoints: Some(breakpoints),
-                lines: None,
+                breakpoints: Some(source_breakpoints),
+                lines: None, // As deprecated
                 source,
-                source_modified: Some(false),
+                source_modified: None,
             }))
             .await?;
 
-        tracing::trace!("Got response result: {:?}", response_result);
         if let ResponseResult::Success { body } = response_result {
             if let ResponseBody::setBreakpoints(breakpoints_body) = body {
                 for (i, breakpoint_response) in breakpoints_body.breakpoints.into_iter().enumerate()
@@ -668,6 +658,7 @@ impl DebuggerHandler {
                         })?
                         .clone();
 
+                    // TODO: This is optional, what to do if it's not set, it is for CodeLLDB.
                     let breakpoint_id = breakpoint_response.id.ok_or_else(|| {
                         anyhow!(
                             "Id wasn't set in breakpoint setting response as expected: {:?}",
@@ -756,7 +747,7 @@ impl DebuggerHandler {
 
         let breakpoint_is_enabled = self.breakpoint_is_enabled(&breakpoint_event.breakpoint)?;
 
-        // Do we need to poll/sleep here to wait for the breakpoint to be resolved?
+        // What if ID not used?
         let (file_path, source_line_number) = self
             .breakpoints
             .get_breakpoint_for_id(&breakpoint_id)
@@ -782,25 +773,14 @@ impl DebuggerHandler {
     }
 
     fn breakpoint_is_enabled(&self, breakpoint: &Breakpoint) -> Result<bool> {
-        if breakpoint.verified {
-            return Ok(true);
-        }
-
-        // OK CodeLLDB, over to your awfulness.
         let message = breakpoint
             .message
             .as_ref()
             .ok_or_else(|| anyhow!("Can't find breakpoint message: {:?}", breakpoint))?;
 
-        // This is awful but I can't see any other way of knowing if a breakpoint
-        // was resolved other than checking the message for "Resolved locations: "
-        // and ending in either 0 or greater.
-        Ok(message
-            .rsplit_once("Resolved locations: ")
-            .ok_or_else(|| anyhow!("Couldn't find Resolved locations message in: {}", message))?
-            .1
-            .parse::<i64>()?
-            > 0)
+        // Blame DAP for this one, the verified property can't be trusted and this is
+        // the only thing we have to check if enabled.
+        self.debugger_type.check_breakpoint_enabled(message)
     }
 
     #[tracing::instrument]
@@ -927,26 +907,21 @@ impl DebuggerHandler {
         for file in self.breakpoints.get_all_files() {
             breakpoints_buffer_content.push(format!("{}:", file));
 
-            for (source_line_number, breakpoint) in self
-                .breakpoints
-                .get_all_breakpoint_line_numbers_for_file(&file)?
+            for (source_line_number, breakpoint) in
+                self.breakpoints.get_all_breakpoints_for_file(&file)?
             {
                 let breakpoint_is_enabled = breakpoint.enabled;
 
                 for (breakpoint_id, resolved_line_number) in &breakpoint.resolved {
                     breakpoints_buffer_content.push(format!(
                         "  {}  {}{}",
-                        if breakpoint_is_enabled { "○" } else { "⬤" },
+                        if breakpoint_is_enabled { "⬤" } else { "○" },
                         if source_line_number != resolved_line_number {
                             format!("{} -> {}", source_line_number, resolved_line_number)
                         } else {
                             format!("{}", source_line_number)
                         },
-                        if breakpoint_is_enabled {
-                            format!(" ({})", breakpoint_id)
-                        } else {
-                            "".to_string()
-                        }
+                        format!(" ({})", breakpoint_id)
                     ));
                 }
             }

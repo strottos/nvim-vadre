@@ -2,10 +2,14 @@ use std::{
     env, io,
     net::TcpListener,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::Result;
 use reqwest::Url;
+use tokio::sync::{Mutex, MutexGuard};
+
+use crate::dap::Debugger;
 
 fn get_root_dir() -> Result<PathBuf> {
     let mut path = env::current_exe()?;

@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use reqwest::Url;
 use tokio::{process::Child, sync::Mutex};
 
@@ -121,6 +121,15 @@ impl Debugger {
         let path = dunce::canonicalize(path)?;
 
         Ok(path)
+    }
+
+    pub(crate) fn check_breakpoint_enabled(&self, msg: &str) -> Result<bool> {
+        Ok(msg
+            .rsplit_once("Resolved locations: ")
+            .ok_or_else(|| anyhow!("Couldn't find Resolved locations message in: {}", msg))?
+            .1
+            .parse::<i64>()?
+            > 0)
     }
 
     async fn get_binary_name(&self) -> Result<String> {
