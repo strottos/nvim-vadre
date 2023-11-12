@@ -14,9 +14,8 @@ use super::{
         Breakpoint, BreakpointEventBody, ContinueArguments, Either, EventBody,
         InitializeRequestArguments, NextArguments, PauseArguments, ProtocolMessage,
         ProtocolMessageType, RequestArguments, Response, ResponseBody, ResponseResult,
-        RunInTerminalResponseBody, ScopesArguments, SetBreakpointsArguments,
-        SetExceptionBreakpointsArguments, SetFunctionBreakpointsArguments, Source, SourceArguments,
-        SourceBreakpoint, StackTraceArguments, StepInArguments, StoppedEventBody,
+        RunInTerminalResponseBody, ScopesArguments, SetBreakpointsArguments, Source,
+        SourceArguments, SourceBreakpoint, StackTraceArguments, StepInArguments, StoppedEventBody,
         VariablesArguments,
     },
     DebuggerStepType,
@@ -27,7 +26,6 @@ use anyhow::{anyhow, bail, Result};
 use tokio::{
     sync::{broadcast, oneshot, Mutex},
     time::timeout,
-    try_join,
 };
 
 pub(crate) struct DebuggerHandler {
@@ -128,27 +126,6 @@ impl DebuggerHandler {
 
     #[tracing::instrument]
     pub(crate) async fn init_breakpoints(&mut self) -> Result<()> {
-        // let (tx1, rx1) = oneshot::channel();
-        // let (tx2, rx2) = oneshot::channel();
-
-        // self.processor
-        //     .request_and_response(
-        //         RequestArguments::setFunctionBreakpoints(SetFunctionBreakpointsArguments {
-        //             breakpoints: vec![],
-        //         }),
-        //     )
-        //     .await?;
-        // self.processor
-        //     .request_and_response(
-        //         RequestArguments::setExceptionBreakpoints(SetExceptionBreakpointsArguments {
-        //             filters: vec![],
-        //             exception_options: None,
-        //             filter_options: None,
-        //         }),
-        //         Some(tx2),
-        //     )
-        //     .await?;
-
         for file_path in self.breakpoints.get_all_files() {
             self.set_breakpoints(file_path).await?;
         }

@@ -6,15 +6,15 @@ use super::{
 };
 use crate::neovim::{NeovimVadreWindow, VadreBufferType, VadreLogLevel};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use tokio::{
     sync::{oneshot, Mutex},
-    time::{sleep, timeout},
-    try_join,
+    time::timeout,
 };
 
 pub(crate) struct Debugger {
     id: usize,
+    pub setup_complete: bool,
     pub neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
     pub handler: Arc<Mutex<DebuggerHandler>>,
 }
@@ -41,6 +41,8 @@ impl Debugger {
 
         Self {
             id,
+            setup_complete: false,
+
             neovim_vadre_window,
 
             handler: debugger_handler,
@@ -75,8 +77,53 @@ impl Debugger {
             .launch_program(command_args, attach_debugger_to_pid, environment_variables)
             .await?;
 
+        // Turn launch into a broadcast channel
+        let (launch_watch_tx, mut launch_watch_rx) = tokio::sync::broadcast::channel(1);
+
+        tokio::spawn(async move {
+            let launch_rx = launch_rx;
+            let watch_tx = launch_watch_tx;
+
+            let recv = launch_rx.await;
+            watch_tx.send(recv)?;
+
+            Ok::<(), anyhow::Error>(())
+        });
+
+        // Turn terminal spawn into a broadcast channel
+        let (terminal_watch_tx, mut terminal_watch_rx) = tokio::sync::broadcast::channel(1);
+
+        tokio::spawn(async move {
+            let terminal_spawned_rx = terminal_spawned_rx;
+            let terminal_watch_tx = terminal_watch_tx;
+
+            let recv = terminal_spawned_rx.await;
+            terminal_watch_tx.send(recv)?;
+
+            Ok::<(), anyhow::Error>(())
+        });
+
         if !attach_debugger_to_pid.is_some() {
-            timeout(Duration::new(60, 0), terminal_spawned_rx).await??;
+            loop {
+                tokio::select!(
+                    launch_ret = launch_watch_rx.recv() => {
+                        match launch_ret {
+                            Ok(_) => {
+                                // Great, but we still need the other branch to complete
+                                continue;
+                            }
+                            Err(err) => {
+                                tracing::trace!("LAUNCH ERROR: {:?}", err);
+                                bail!("Error launching program: {:?}", err);
+                            }
+                        }
+                    },
+                    output = timeout(Duration::new(60, 0), terminal_watch_rx.recv()) => {
+                        tracing::trace!("OUTPUT TO HANDLE? {:?}", output);
+                        break;
+                    }
+                );
+            }
         }
 
         self.handler.lock().await.init_breakpoints().await?;
@@ -90,13 +137,15 @@ impl Debugger {
             .await?;
 
         // Check that the launch and config requests were successful
-        try_join!(launch_rx, config_done_rx)?;
+        launch_watch_rx.recv().await??;
+        config_done_rx.await?;
 
         self.log_msg(
             VadreLogLevel::INFO,
             "Debugger and program launched successfully",
         )
         .await?;
+        self.setup_complete = true;
 
         Ok(())
     }

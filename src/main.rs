@@ -26,7 +26,11 @@ use async_trait::async_trait;
 use clap::Parser;
 use dap::{Breakpoints, Debugger, DebuggerStepType};
 use nvim_rs::{compat::tokio::Compat, create::tokio as create, Handler, Neovim, Value};
-use tokio::{io::Stdout, sync::Mutex, time::timeout};
+use tokio::{
+    io::Stdout,
+    sync::{Mutex, MutexGuard},
+    time::timeout,
+};
 
 static VADRE_NEXT_INSTANCE_NUM: AtomicUsize = AtomicUsize::new(1);
 
@@ -154,7 +158,26 @@ impl NeovimHandler {
 
             let mut debugger_lock = debugger.lock().await;
 
-            if let Err(e) = timeout(
+            async fn report_error(
+                msg: &str,
+                debugger: MutexGuard<'_, Box<Debugger>>,
+                neovim: Neovim<Compat<Stdout>>,
+            ) -> anyhow::Result<()> {
+                tracing::error!("{}", msg);
+                if let Err(log_err) = debugger.log_msg(VadreLogLevel::CRITICAL, &msg).await {
+                    tracing::error!("Couldn't write to neovim logs: {}", log_err);
+                    neovim.err_writeln(&msg).await.unwrap_or_else(|vim_err| {
+                        tracing::error!("Couldn't write to neovim: {}", vim_err);
+                    });
+                };
+                neovim.err_writeln(&msg).await.unwrap_or_else(|vim_err| {
+                    tracing::error!("Couldn't write to neovim: {}", vim_err);
+                });
+
+                Ok(())
+            }
+
+            match timeout(
                 Duration::new(args.launch_timeout, 0),
                 debugger_lock.setup(
                     args.command_args,
@@ -166,26 +189,24 @@ impl NeovimHandler {
             )
             .await
             {
-                let log_msg = format!("Critical error setting up debugger: {}", e);
-                tracing::error!("{}", e);
-                if let Err(log_err) = debugger_lock
-                    .log_msg(VadreLogLevel::CRITICAL, &log_msg)
-                    .await
-                {
-                    tracing::error!("Couldn't write to neovim logs: {}", log_err);
-                    neovim
-                        .err_writeln(&log_msg)
-                        .await
-                        .unwrap_or_else(|vim_err| {
-                            tracing::error!("Couldn't write to neovim: {}", vim_err);
-                        });
-                };
-                neovim
-                    .err_writeln(&log_msg)
-                    .await
-                    .unwrap_or_else(|vim_err| {
-                        tracing::error!("Couldn't write to neovim: {}", vim_err);
-                    });
+                Ok(x) => {
+                    if let Err(ref e) = x {
+                        report_error(
+                            &format!("Critical error setting up debugger: {}", e),
+                            debugger_lock,
+                            neovim.clone(),
+                        )
+                        .await?;
+                    }
+                }
+                Err(e) => {
+                    report_error(
+                        &format!("Critical error, timed out setting up debugger: {}", e),
+                        debugger_lock,
+                        neovim.clone(),
+                    )
+                    .await?;
+                }
             }
 
             neovim
@@ -270,6 +291,10 @@ impl NeovimHandler {
             for debugger in debuggers.values() {
                 let debugger_lock = debugger.lock().await;
 
+                if !debugger_lock.setup_complete {
+                    continue;
+                }
+
                 let breakpoint_result = if adding_breakpoint {
                     debugger_lock
                         .handler
@@ -332,9 +357,19 @@ impl NeovimHandler {
 
         let debugger = debuggers.get(&instance_id).ok_or("Debugger didn't exist")?;
 
+        let debugger = match debugger.try_lock() {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::error!("Couldn't get debugger lock: {e}");
+                return Ok("Vadre busy, please retry shortly".into());
+            }
+        };
+
+        if !debugger.setup_complete {
+            return Err("Can't do step, debugger not setup".into());
+        }
+
         debugger
-            .lock()
-            .await
             .handler
             .lock()
             .await
@@ -356,9 +391,19 @@ impl NeovimHandler {
 
         let debugger = debuggers.get(&instance_id).ok_or("Debugger didn't exist")?;
 
+        let debugger = match debugger.try_lock() {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::error!("Couldn't get debugger lock: {e}");
+                return Ok("Vadre busy, please retry shortly".into());
+            }
+        };
+
+        if !debugger.setup_complete {
+            return Err("Can't do interrupt, debugger not setup correctly".into());
+        }
+
         debugger
-            .lock()
-            .await
             .handler
             .lock()
             .await
@@ -382,14 +427,19 @@ impl NeovimHandler {
             .get(&instance_id)
             .ok_or("Debugger didn't exist")?;
 
+        let debugger = match debugger.try_lock() {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::error!("Couldn't get debugger lock: {e}");
+                return Ok("Vadre busy, please retry shortly".into());
+            }
+        };
+
         let ret;
 
-        if let Err(e) = timeout(
-            Duration::new(5, 0),
-            debugger.lock().await.handler.lock().await.stop(),
-        )
-        .await
-        .map_err(|e| format!("Couldn't stop debugger: {e}"))?
+        if let Err(e) = timeout(Duration::new(5, 0), debugger.handler.lock().await.stop())
+            .await
+            .map_err(|e| format!("Couldn't stop debugger: {e}"))?
         {
             tracing::error!("Timed out stopping debugger: {e}");
             ret = Err(format!("Debugger instance {} stopped", instance_id).into());
@@ -397,12 +447,14 @@ impl NeovimHandler {
             ret = Ok(format!("Debugger instance {} failed to stop", instance_id).into());
         }
 
+        drop(debugger);
+
         debuggers_lock.remove(&instance_id);
 
         ret
     }
 
-    async fn change_output_window(&self, instance_id: usize, type_: &str) -> VadreResult {
+    async fn change_output_window(&self, instance_id: usize, mut type_: &str) -> VadreResult {
         let debuggers = match self.debuggers.try_lock() {
             Ok(x) => x,
             Err(e) => {
@@ -413,9 +465,20 @@ impl NeovimHandler {
 
         let debugger = debuggers.get(&instance_id).ok_or("Debugger didn't exist")?;
 
+        let debugger = match debugger.try_lock() {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::error!("Couldn't get debugger lock: {e}");
+                return Ok("Vadre busy, please retry shortly".into());
+            }
+        };
+
+        if !debugger.setup_complete {
+            // Force us to show logs if debugger not complete, only thing we can be interested in
+            type_ = "Logs";
+        }
+
         debugger
-            .lock()
-            .await
             .change_output_window(type_)
             .await
             .map_err(|e| format!("Couldn't show output window: {e}"))?;
@@ -434,9 +497,15 @@ impl NeovimHandler {
 
         let debugger = debuggers.get(&instance_id).ok_or("Debugger didn't exist")?;
 
+        let debugger = match debugger.try_lock() {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::error!("Couldn't get debugger lock: {e}");
+                return Ok("Vadre busy, please retry shortly".into());
+            }
+        };
+
         debugger
-            .lock()
-            .await
             .handler
             .lock()
             .await
