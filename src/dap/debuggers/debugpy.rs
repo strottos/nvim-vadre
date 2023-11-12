@@ -155,19 +155,17 @@ impl Debugger {
 
         let program = dunce::canonicalize(command)?;
 
-        Ok(RequestArguments::launch(Either::Second(
-            serde_json::json!({
-                "args": command_args,
-                "cwd": env::current_dir()?,
-                "env": environment_variables,
-                "name": "debugpy",
-                "console": "integratedTerminal",
-                "type": "debugpy",
-                "request": "launch",
-                "program": program,
-                "stopOnEntry": true,
-            }),
-        )))
+        Ok(RequestArguments::launch(serde_json::json!({
+            "args": command_args,
+            "cwd": env::current_dir()?,
+            "env": environment_variables,
+            "name": "debugpy",
+            "console": "integratedTerminal",
+            "type": "debugpy",
+            "request": "launch",
+            "program": program,
+            "stopOnEntry": true,
+        })))
     }
 
     pub(crate) async fn get_attach_request(&self, pid: i64) -> Result<RequestArguments> {

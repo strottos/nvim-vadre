@@ -78,7 +78,7 @@ impl Debugger {
 
             let go_path = dunce::canonicalize(&go_path)?;
 
-            let working_dir = self.get_debugger_path().await?;
+            let working_dir = self.get_debugger_path()?;
 
             debug!(
                 "Running delve installation: {:?} {:?}",
@@ -121,15 +121,34 @@ impl Debugger {
         port: Option<u16>,
         _program: Vec<String>,
     ) -> Result<Child> {
-        match port {
-            Some(port) => vec![
-                "dap".to_string(),
-                "--listen".to_string(),
-                format!("127.0.0.1:{}", port),
-            ],
+        let debugger_path = self.get_debugger_binary_path()?;
+
+        if !debugger_path.exists() {
+            bail!("The Go Delve debugger doesn't exist: {:?}", debugger_path);
+        }
+
+        let cmd_args = match port {
+            Some(port) => {
+                let mut ret = vec![
+                    "dap".to_string(),
+                    "--listen".to_string(),
+                    format!("127.0.0.1:{}", port),
+                ];
+                if let Ok(_) = env::var("VADRE_LOG_FILE") {
+                    ret.push("--log".to_string());
+                }
+                ret
+            }
             None => bail!("Need to specify a port for Go Delve debugger"),
         };
-        todo!();
+
+        Command::new(debugger_path)
+            .args(cmd_args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow!("Failed to spawn Go Delve: {:?}", e))
     }
 
     pub(crate) async fn get_launch_request(
@@ -162,22 +181,21 @@ impl Debugger {
         merge_json(&mut env, serde_json::json!(environment_variables));
         tracing::debug!("Go environment: {:?}", env);
 
-        let args = serde_json::json!({
+        Ok(RequestArguments::launch(serde_json::json!({
             "args": command_args,
             "cwd": env::current_dir()?,
             "debugAdapter": "dlv-dap",
             "dlvFlags": [],
-            "dlvToolPath": self.get_debugger_binary_path().await?,
+            "dlvToolPath": self.get_debugger_binary_path()?,
             "env": env,
             "mode": mode,
-            "name": "Launch Package",
+            "name": "delve",
             "program": program,
             "request": "launch",
             "stopOnEntry": true,
+            "terminal": "integrated",
             "type": "go",
-        });
-
-        Ok(RequestArguments::launch(Either::Second(args)))
+        })))
     }
 
     pub(crate) async fn get_attach_request(&self, pid: i64) -> Result<RequestArguments> {
@@ -186,7 +204,7 @@ impl Debugger {
         })))
     }
 
-    pub(crate) async fn get_debugger_path(&self) -> Result<PathBuf> {
+    fn get_debugger_path(&self) -> Result<PathBuf> {
         let mut path = get_debuggers_dir()?;
         path.push("delve");
         path.push(&format!("v{}", VERSION));
@@ -206,9 +224,9 @@ impl Debugger {
             > 0)
     }
 
-    async fn get_debugger_binary_path(&self) -> Result<PathBuf> {
+    fn get_debugger_binary_path(&self) -> Result<PathBuf> {
         let binary_name = format!("dlv{}", EXE_SUFFIX);
-        let mut path = self.get_debugger_path().await?;
+        let mut path = self.get_debugger_path()?;
         path.push(&binary_name);
         Ok(path)
     }

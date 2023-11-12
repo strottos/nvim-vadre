@@ -47,18 +47,16 @@ impl Debugger {
 
         let program = dunce::canonicalize(command)?;
 
-        Ok(RequestArguments::launch(Either::Second(
-            serde_json::json!({
-                "args": command_args,
-                "cwd": env::current_dir()?,
-                "env": environment_variables,
-                "name": "dap",
-                "terminal": "integrated",
-                "type": "dap",
-                "request": "launch",
-                "program": program,
-            }),
-        )))
+        Ok(RequestArguments::launch(serde_json::json!({
+            "args": command_args,
+            "cwd": env::current_dir()?,
+            "env": environment_variables,
+            "name": "dap",
+            "terminal": "integrated",
+            "type": "dap",
+            "request": "launch",
+            "program": program,
+        })))
     }
 
     pub(crate) async fn get_attach_request(&self, pid: i64) -> Result<RequestArguments> {

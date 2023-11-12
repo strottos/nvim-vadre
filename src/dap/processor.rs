@@ -309,7 +309,7 @@ impl DebuggerProcessor {
                     .await
                     .map_err(|e| anyhow!("Can't read stdout: {}", e))?
                 {
-                    tracing::error!("Debugger stdout (could interfere with running): {}", line);
+                    tracing::info!("Debugger stdout: {}", line);
                     neovim_vadre_window
                         .lock()
                         .await

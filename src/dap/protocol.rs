@@ -6,9 +6,9 @@ pub use super::schema::{
     Breakpoint, BreakpointEventBody, CancelArguments, Capabilities, CapabilitiesEventBody,
     ContinueArguments, ContinueResponseBody, ContinuedEventBody, DisconnectArguments,
     ExitedEventBody, InitializeRequest, InitializeRequestArguments, InitializeResponse,
-    InvalidatedEventBody, LaunchRequestArguments, ModuleEventBody, NextArguments, OutputEventBody,
-    PauseArguments, ProcessEventBody, RunInTerminalRequestArguments, RunInTerminalResponseBody,
-    ScopesArguments, ScopesResponseBody, SetBreakpointsArguments, SetBreakpointsResponseBody,
+    InvalidatedEventBody, ModuleEventBody, NextArguments, OutputEventBody, PauseArguments,
+    ProcessEventBody, RunInTerminalRequestArguments, RunInTerminalResponseBody, ScopesArguments,
+    ScopesResponseBody, SetBreakpointsArguments, SetBreakpointsResponseBody,
     SetExceptionBreakpointsArguments, SetFunctionBreakpointsArguments, Source, SourceArguments,
     SourceBreakpoint, SourceResponseBody, StackTraceArguments, StackTraceResponseBody,
     StepInArguments, StoppedEventBody, TerminatedEventBody, ThreadEventBody, ThreadsResponseBody,
@@ -71,7 +71,7 @@ pub enum ProtocolMessageType {
 #[serde(tag = "command", content = "arguments")]
 pub enum RequestArguments {
     initialize(InitializeRequestArguments),
-    launch(Either<LaunchRequestArguments, serde_json::Value>),
+    launch(serde_json::Value),
     attach(serde_json::Value),
     setBreakpoints(SetBreakpointsArguments),
     setFunctionBreakpoints(SetFunctionBreakpointsArguments),

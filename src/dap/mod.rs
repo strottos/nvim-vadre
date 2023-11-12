@@ -45,19 +45,13 @@ pub(crate) fn new_debugger(
             neovim_vadre_window.clone(),
         )),
 
-        // "go" | "delve" => Ok(Box::new(go_delve::Debugger::new(
-        //     id,
-        //     command,
-        //     command_args,
-        //     neovim,
-        // ))),
+        "go" | "delve" => DebuggerType::GoDelve(debuggers::go_delve::Debugger::new(
+            neovim_vadre_window.clone(),
+        )),
 
-        // "dotnet" | ".net" | "net" => Ok(Box::new(dotnet::Debugger::new(
-        //     id,
-        //     command,
-        //     command_args,
-        //     neovim,
-        // ))),
+        "dotnet" | ".net" | "net" => DebuggerType::DotNet(debuggers::dotnet::Debugger::new(
+            neovim_vadre_window.clone(),
+        )),
 
         // "node" | "nodejs" | "js" => Ok(Box::new(node::Debugger::new(
         //     id,

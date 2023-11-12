@@ -70,7 +70,7 @@ impl Debugger {
 
         self.handle_messages().await?;
 
-        let launch_rx = self
+        let (launch_rx, is_integrated_terminal) = self
             .handler
             .lock()
             .await
@@ -79,41 +79,54 @@ impl Debugger {
 
         // Turn launch into a broadcast channel
         let (launch_watch_tx, mut launch_watch_rx) = tokio::sync::broadcast::channel(1);
+        let launch_watch_tx_clone = launch_watch_tx.clone();
 
         tokio::spawn(async move {
             let launch_rx = launch_rx;
-            let watch_tx = launch_watch_tx;
+            let launch_watch_tx = launch_watch_tx_clone;
 
             let recv = launch_rx.await;
-            watch_tx.send(recv)?;
+            launch_watch_tx.send(recv)?;
 
             Ok::<(), anyhow::Error>(())
         });
 
         // Turn terminal spawn into a broadcast channel
-        let (terminal_watch_tx, mut terminal_watch_rx) = tokio::sync::broadcast::channel(1);
+        if is_integrated_terminal {
+            let (terminal_watch_tx, mut terminal_watch_rx) = tokio::sync::broadcast::channel(1);
 
-        tokio::spawn(async move {
-            let terminal_spawned_rx = terminal_spawned_rx;
-            let terminal_watch_tx = terminal_watch_tx;
+            tokio::spawn(async move {
+                let terminal_spawned_rx = terminal_spawned_rx;
+                let terminal_watch_tx = terminal_watch_tx;
 
-            let recv = terminal_spawned_rx.await;
-            terminal_watch_tx.send(recv)?;
+                let recv = terminal_spawned_rx.await;
+                terminal_watch_tx.send(recv)?;
 
-            Ok::<(), anyhow::Error>(())
-        });
+                Ok::<(), anyhow::Error>(())
+            });
 
-        if !attach_debugger_to_pid.is_some() {
             loop {
                 tokio::select!(
                     launch_ret = launch_watch_rx.recv() => {
                         match launch_ret {
-                            Ok(_) => {
-                                // Great, but we still need the other branch to complete
-                                continue;
+                            Ok(ret) => {
+                                match ret {
+                                    Ok(res) => {
+                                        if res.success {
+                                            continue;
+                                        } else {
+                                            tracing::error!("Error launching program: {:?}", res);
+                                            bail!("Error launching program: {:?}", res);
+                                        }
+                                    },
+                                    Err(e) => {
+                                        tracing::error!("Error launching program: {:?}", e);
+                                        bail!("Error launching program: {:?}", e);
+                                    }
+                                }
                             }
                             Err(err) => {
-                                tracing::trace!("LAUNCH ERROR: {:?}", err);
+                                tracing::trace!("Error launching program: {:?}", err);
                                 bail!("Error launching program: {:?}", err);
                             }
                         }

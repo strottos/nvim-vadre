@@ -97,13 +97,14 @@ impl DebuggerHandler {
         command_args: Vec<String>,
         attach_debugger_to_pid: Option<i64>,
         environment_variables: HashMap<String, String>,
-    ) -> Result<oneshot::Receiver<Response>> {
+    ) -> Result<(oneshot::Receiver<Response>, bool)> {
         self.request_and_response(RequestArguments::initialize(
             InitializeRequestArguments::new(self.debugger_type.get_debugger_type_name()),
         ))
         .await?;
 
         let (tx, rx) = oneshot::channel();
+        let mut is_integrated_terminal = false;
 
         if let Some(attach_debugger_to_pid) = attach_debugger_to_pid {
             let attach_request = self
@@ -117,11 +118,15 @@ impl DebuggerHandler {
                 .debugger_type
                 .get_launch_request(command_args, environment_variables)
                 .await?;
+            if let RequestArguments::launch(launch_body) = &launch_request {
+                is_integrated_terminal =
+                    launch_body.get("terminal") == Some(&serde_json::json!("integrated"));
+            }
 
             self.processor.request(launch_request, Some(tx)).await?;
         }
 
-        Ok(rx)
+        Ok((rx, is_integrated_terminal))
     }
 
     #[tracing::instrument]
@@ -742,15 +747,12 @@ impl DebuggerHandler {
     #[tracing::instrument]
     async fn handle_event_stopped(&mut self, stopped_event: StoppedEventBody) -> Result<()> {
         self.current_thread_id = stopped_event.thread_id;
-        tracing::trace!("HERE1");
         if let Some(thread_id) = stopped_event.thread_id {
             self.stack_expanded_threads.insert(thread_id);
         }
 
-        tracing::trace!("HERE2");
         if let Some(listener_tx) = self.stopped_listener_tx.take() {
             // If we're here we're about to do more stepping so no need to do more
-            tracing::trace!("HERE3");
             if let Err(_) = listener_tx.send(()) {
                 tracing::error!("Couldn't send stopped_listener_tx");
                 self.neovim_vadre_window
@@ -762,14 +764,10 @@ impl DebuggerHandler {
             return Ok(());
         }
 
-        tracing::trace!("HERE4");
         self.display_output_info().await?;
 
-        tracing::trace!("HERE5");
         if let Some(thread_id) = stopped_event.thread_id {
-            tracing::trace!("HERE6");
             if let Err(e) = self.process_stopped(thread_id).await {
-                tracing::trace!("HERE7");
                 self.neovim_vadre_window
                     .lock()
                     .await
@@ -822,14 +820,17 @@ impl DebuggerHandler {
     }
 
     fn breakpoint_is_enabled(&self, breakpoint: &Breakpoint) -> Result<bool> {
-        let message = breakpoint
-            .message
-            .as_ref()
-            .ok_or_else(|| anyhow!("Can't find breakpoint message: {:?}", breakpoint))?;
-
-        // Blame DAP for this one, the verified property can't be trusted and this is
-        // the only thing we have to check if enabled.
-        self.debugger_type.check_breakpoint_enabled(message)
+        match breakpoint.message.as_ref() {
+            Some(message) => {
+                // Blame DAP for this one, the verified property can't be trusted and this is
+                // the only thing we have to check if enabled.
+                self.debugger_type.check_breakpoint_enabled(message)
+            }
+            None => {
+                // If no message then we have to trust verified, otherwise we're lost
+                Ok(breakpoint.verified)
+            }
+        }
     }
 
     #[tracing::instrument]
