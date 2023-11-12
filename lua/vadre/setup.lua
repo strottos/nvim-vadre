@@ -84,16 +84,11 @@ local function output_window(instance_id, type)
     print(vim.rpcrequest(jobid, "output_window", instance_id, type))
 end
 
-local function handle_output_window_enter(instance_id)
-    print(vim.rpcrequest(jobid, "handle_output_window_enter", instance_id))
-end
-
-local function handle_output_window_space(instance_id)
-    print(vim.rpcrequest(jobid, "handle_output_window_space", instance_id))
+local function handle_output_window_key(instance_id, key)
+    print(vim.rpcrequest(jobid, "handle_output_window_key", instance_id, key))
 end
 
 return {
     output_window = output_window,
-    handle_output_window_enter = handle_output_window_enter,
-    handle_output_window_space = handle_output_window_space,
+    handle_output_window_key = handle_output_window_key,
 }

@@ -144,61 +144,6 @@ impl VadreBufferType {
         }
     }
 
-    fn get_output_buffer(
-        current_buf_name: &str,
-        type_: VadreOutputBufferSelector,
-    ) -> Result<VadreBufferType> {
-        let mut split = current_buf_name.rsplit(" - ");
-        let output_buffer_type = split
-            .next()
-            .ok_or_else(|| anyhow!("Can't retrieve output buffer type"))?;
-        let output_buffer_type = VadreBufferType::get_buffer_type_from_str(&output_buffer_type);
-
-        let buffer_order = vec![
-            VadreBufferType::Logs,
-            VadreBufferType::CallStack,
-            VadreBufferType::Variables,
-            VadreBufferType::Breakpoints,
-        ];
-
-        let mut index = buffer_order
-            .iter()
-            .position(|r| *r == output_buffer_type)
-            .ok_or_else(|| anyhow!("Can't find buffer for {output_buffer_type:?}"))?;
-
-        match type_ {
-            VadreOutputBufferSelector::Next => index += 1,
-            VadreOutputBufferSelector::Previous => {
-                if index == 0 {
-                    index = buffer_order.len();
-                }
-                index -= 1;
-            }
-            VadreOutputBufferSelector::Logs => index = 0,
-            VadreOutputBufferSelector::CallStack => index = 1,
-            VadreOutputBufferSelector::Variables => index = 2,
-            VadreOutputBufferSelector::Breakpoints => index = 3,
-        };
-        let index: usize = index % buffer_order.len();
-
-        Ok(buffer_order
-            .get(index)
-            .ok_or_else(|| anyhow!("Can't find next buffer for {output_buffer_type:?}"))?
-            .clone())
-    }
-
-    fn get_buffer_type_from_str(s: &str) -> VadreBufferType {
-        match s {
-            "Code" => VadreBufferType::Code,
-            "Logs" => VadreBufferType::Logs,
-            "Terminal" => VadreBufferType::Terminal,
-            "CallStack" => VadreBufferType::CallStack,
-            "Variables" => VadreBufferType::Variables,
-            "Breakpoints" => VadreBufferType::Breakpoints,
-            _ => panic!("Can't understand string {}", s),
-        }
-    }
-
     fn next_output_type(&self) -> VadreBufferType {
         match self {
             VadreBufferType::Code => unreachable!(),
@@ -869,6 +814,37 @@ impl NeovimVadreWindow {
             .map_err(|e| anyhow!(e))
     }
 
+    /// Get the current buffer lines
+    ///
+    /// Both start and end are optional and if not specified we assume current line inclusive for
+    /// each.
+    pub(crate) async fn get_current_buffer_lines(
+        &self,
+        start: Option<i64>,
+        end: Option<i64>,
+    ) -> Result<Vec<String>> {
+        let window = self
+            .neovim
+            .get_current_win()
+            .await
+            .map_err(|e| anyhow!(e))?;
+        let buffer = self
+            .neovim
+            .get_current_buf()
+            .await
+            .map_err(|e| anyhow!(e))?;
+
+        let current_line = window.get_cursor().await?.0;
+
+        let start = start.unwrap_or(current_line - 1);
+        let end = end.unwrap_or(current_line);
+
+        buffer
+            .get_lines(start, end, false)
+            .await
+            .map_err(|e| anyhow!(e))
+    }
+
     pub(crate) async fn get_current_line(&self) -> Result<String> {
         self.neovim.get_current_line().await.map_err(|e| anyhow!(e))
     }
@@ -949,20 +925,8 @@ pub(crate) async fn setup_signs(neovim: &Neovim<Compat<Stdout>>) -> Result<()> {
             vec![
                 "VadreSourceBreakpoint".into(),
                 Value::Map(vec![
-                    ("text".into(), "○".into()),
-                    ("texthl".into(), "VadreSourceBreakpointHighlight".into()),
-                ]),
-            ],
-        )
-        .await?;
-    neovim
-        .call_function(
-            "sign_define",
-            vec![
-                "VadreEnabledBreakpoint".into(),
-                Value::Map(vec![
                     ("text".into(), "⬤".into()),
-                    ("texthl".into(), "VadreEnabledBreakpointHighlight".into()),
+                    ("texthl".into(), "VadreSourceBreakpointHighlight".into()),
                 ]),
             ],
         )

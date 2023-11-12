@@ -6,16 +6,15 @@ use anyhow::{anyhow, bail, Result};
 pub struct DebuggerBreakpoint {
     pub enabled: bool,
 
-    // Collection of placed breakpoints, can be multiple breakpoints placed for one in the source.
-    // Here we store the breakpoint id as the key and the line number it was placed on as the
-    // value.
+    // Collection of placed breakpoints, can be multiple breakpoints placed for one in the source
+    // as we delete and reapply when they're enabled and disabled.
     pub resolved: HashMap<String, i64>,
 }
 
 impl DebuggerBreakpoint {
     fn new() -> Self {
         DebuggerBreakpoint {
-            enabled: false,
+            enabled: true,
             resolved: HashMap::new(),
         }
     }
@@ -126,7 +125,7 @@ impl Breakpoints {
         Ok(())
     }
 
-    fn set_breakpoint_disabled(
+    pub(crate) fn set_breakpoint_disabled(
         &mut self,
         file_path: String,
         source_line_number: i64,

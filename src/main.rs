@@ -423,7 +423,7 @@ impl NeovimHandler {
         Ok("".into())
     }
 
-    async fn handle_output_window_enter(&self, instance_id: usize) -> VadreResult {
+    async fn handle_output_window_key(&self, instance_id: usize, key: &str) -> VadreResult {
         let debuggers = match self.debuggers.try_lock() {
             Ok(x) => x,
             Err(e) => {
@@ -440,31 +440,7 @@ impl NeovimHandler {
             .handler
             .lock()
             .await
-            .handle_output_window_enter()
-            .await
-            .map_err(|e| format!("Couldn't show output window: {e}"))?;
-
-        Ok("".into())
-    }
-
-    async fn handle_output_window_space(&self, instance_id: usize) -> VadreResult {
-        let debuggers = match self.debuggers.try_lock() {
-            Ok(x) => x,
-            Err(e) => {
-                tracing::error!("Couldn't get debuggers lock: {e}");
-                return Ok("Vadre busy, please retry shortly".into());
-            }
-        };
-
-        let debugger = debuggers.get(&instance_id).ok_or("Debugger didn't exist")?;
-
-        debugger
-            .lock()
-            .await
-            .handler
-            .lock()
-            .await
-            .handle_output_window_space()
+            .handle_output_window_key(key)
             .await
             .map_err(|e| format!("Couldn't show output window: {e}"))?;
 
@@ -611,23 +587,20 @@ impl Handler for NeovimHandler {
 
                 self.change_output_window(instance_id, type_).await
             }
-            "handle_output_window_enter" => {
+            "handle_output_window_key" => {
                 let instance_id: usize =
                     args.get(0)
                         .ok_or("Instance id must be supplied")?
                         .as_u64()
                         .ok_or("Instance id must be a u64")? as usize;
 
-                self.handle_output_window_enter(instance_id).await
-            }
-            "handle_output_window_space" => {
-                let instance_id: usize =
-                    args.get(0)
-                        .ok_or("Instance id must be supplied")?
-                        .as_u64()
-                        .ok_or("Instance id must be a u64")? as usize;
+                let key: &str = args
+                    .get(1)
+                    .ok_or("Key must be supplied")?
+                    .as_str()
+                    .ok_or("Key must be a string")?;
 
-                self.handle_output_window_space(instance_id).await
+                self.handle_output_window_key(instance_id, key).await
             }
             _ => Err(format!("Unimplemented {}", name).into()),
         }

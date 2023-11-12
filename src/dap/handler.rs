@@ -289,6 +289,147 @@ impl DebuggerHandler {
         Ok(())
     }
 
+    pub(crate) async fn handle_output_window_key(&mut self, key: &str) -> Result<()> {
+        let current_output_window_type = self
+            .neovim_vadre_window
+            .lock()
+            .await
+            .get_output_window_type()
+            .await?;
+
+        if current_output_window_type == VadreBufferType::CallStack {
+            self.handle_callstack_output_window_key(key).await?;
+        } else if current_output_window_type == VadreBufferType::Variables {
+            self.handle_variables_output_window_key(key).await?;
+        } else if current_output_window_type == VadreBufferType::Breakpoints {
+            self.handle_breakpoints_output_window_key(key).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn handle_callstack_output_window_key(&mut self, key: &str) -> Result<()> {
+        let current_line = self
+            .neovim_vadre_window
+            .lock()
+            .await
+            .get_current_line()
+            .await?;
+
+        if key == "space" {
+            let mut split = current_line.split(" - ");
+
+            if let Some(thread_id) = split.next() {
+                match thread_id.parse::<i64>() {
+                    Ok(thread_id) => {
+                        self.pause(Some(thread_id)).await?;
+                        if !self.stack_expanded_threads.contains(&thread_id) {
+                            self.stack_expanded_threads.insert(thread_id);
+                        } else {
+                            self.stack_expanded_threads.remove(&thread_id);
+                        }
+                        self.display_output_info().await?;
+                    }
+                    Err(_) => {}
+                }
+            }
+        } else if key == "enter" {
+            let mut split = current_line.split(" - ");
+
+            if let Some(thread_id) = split.next() {
+                match thread_id.parse::<i64>() {
+                    Ok(thread_id) => {
+                        self.current_thread_id = Some(thread_id);
+                        self.display_output_info().await?;
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_variables_output_window_key(&mut self, _key: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn handle_breakpoints_output_window_key(&mut self, key: &str) -> Result<()> {
+        let lines = self
+            .neovim_vadre_window
+            .lock()
+            .await
+            .get_current_buffer_lines(Some(0), None)
+            .await?;
+
+        let mut file = None;
+
+        for line in lines.iter().rev() {
+            let first_char = line
+                .chars()
+                .next()
+                .ok_or_else(|| anyhow!("Can't get first char of line: {:?}", line))?;
+
+            // Surely never get a file with full path beginning with a space.
+            if first_char != ' ' {
+                let found_file = line[0..line.len() - 1].to_string();
+                if &found_file == "" {
+                    bail!("Can't find file in line: {:?}", file);
+                }
+
+                file = Some(found_file);
+
+                break;
+            }
+        }
+
+        let file =
+            file.ok_or_else(|| anyhow!("Can't find file for breakpoint in lines: {:?}", lines))?;
+
+        let source_line = lines.iter().rev().next().ok_or_else(|| {
+            anyhow!(
+                "Can't find source line for breakpoint in lines: {:?}",
+                lines
+            )
+        })?;
+
+        let mut breakpoint_enabled = false;
+        let mut num = "".to_string();
+
+        for ch in source_line.chars() {
+            if ch == '⬤' {
+                breakpoint_enabled = true;
+            }
+
+            if ch.is_numeric() {
+                num.push(ch);
+            }
+
+            if &num != "" && ch == ' ' {
+                break;
+            }
+        }
+
+        let num = num
+            .parse::<i64>()
+            .map_err(|_| anyhow!("can't parse source line from `{}`: {:?}", num, source_line))?;
+
+        if breakpoint_enabled {
+            tracing::debug!("Disabling breakpoint: {}, {}", file, num);
+
+            self.breakpoints
+                .set_breakpoint_disabled(file.clone(), num)?;
+        } else {
+            tracing::debug!("Enabling breakpoint: {}, {}", file, num);
+
+            self.breakpoints.set_breakpoint_enabled(file.clone(), num)?;
+        }
+
+        self.set_breakpoints(file).await?;
+
+        Ok(())
+    }
+
     pub(crate) fn subscribe_debugger(&self) -> Result<broadcast::Receiver<ProtocolMessage>> {
         self.processor.subscribe_debugger()
     }
@@ -381,75 +522,6 @@ impl DebuggerHandler {
                 Ok(())
             }
         }
-    }
-
-    pub(crate) async fn handle_output_window_enter(&mut self) -> Result<()> {
-        let current_output_window_type = self
-            .neovim_vadre_window
-            .lock()
-            .await
-            .get_output_window_type()
-            .await?;
-
-        let current_line = self
-            .neovim_vadre_window
-            .lock()
-            .await
-            .get_current_line()
-            .await?;
-
-        if current_output_window_type == VadreBufferType::CallStack {
-            let mut split = current_line.split(" - ");
-
-            if let Some(thread_id) = split.next() {
-                match thread_id.parse::<i64>() {
-                    Ok(thread_id) => {
-                        self.current_thread_id = Some(thread_id);
-                        self.display_output_info().await?;
-                    }
-                    Err(_) => {}
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    pub(crate) async fn handle_output_window_space(&mut self) -> Result<()> {
-        let current_output_window_type = self
-            .neovim_vadre_window
-            .lock()
-            .await
-            .get_output_window_type()
-            .await?;
-
-        let current_line = self
-            .neovim_vadre_window
-            .lock()
-            .await
-            .get_current_line()
-            .await?;
-
-        if current_output_window_type == VadreBufferType::CallStack {
-            let mut split = current_line.split(" - ");
-
-            if let Some(thread_id) = split.next() {
-                match thread_id.parse::<i64>() {
-                    Ok(thread_id) => {
-                        self.pause(Some(thread_id)).await?;
-                        if !self.stack_expanded_threads.contains(&thread_id) {
-                            self.stack_expanded_threads.insert(thread_id);
-                        } else {
-                            self.stack_expanded_threads.remove(&thread_id);
-                        }
-                        self.display_output_info().await?;
-                    }
-                    Err(_) => {}
-                }
-            }
-        }
-
-        Ok(())
     }
 
     #[tracing::instrument]
@@ -612,14 +684,14 @@ impl DebuggerHandler {
 
     #[tracing::instrument(skip(self))]
     async fn set_breakpoints(&mut self, file_path: String) -> Result<()> {
-        tracing::trace!("Setting breakpoints for file: {:?}", file_path);
+        tracing::debug!("Setting breakpoints for file: {:?}", file_path);
 
         let line_numbers = self
             .breakpoints
             .get_all_breakpoints_for_file(&file_path)?
-            .keys()
-            .map(|x| *x)
-            .into_iter()
+            .iter()
+            .filter(|(_, v)| v.enabled)
+            .map(|(k, _)| *k)
             .collect::<Vec<i64>>();
 
         let file_name = Path::new(&file_path)
@@ -912,16 +984,15 @@ impl DebuggerHandler {
             {
                 let breakpoint_is_enabled = breakpoint.enabled;
 
-                for (breakpoint_id, resolved_line_number) in &breakpoint.resolved {
+                for resolved_line_number in breakpoint.resolved.values().collect::<HashSet<_>>() {
                     breakpoints_buffer_content.push(format!(
-                        "  {}  {}{}",
+                        "  {}  {}",
                         if breakpoint_is_enabled { "⬤" } else { "○" },
                         if source_line_number != resolved_line_number {
                             format!("{} -> {}", source_line_number, resolved_line_number)
                         } else {
                             format!("{}", source_line_number)
                         },
-                        format!(" ({})", breakpoint_id)
                     ));
                 }
             }

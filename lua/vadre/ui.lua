@@ -153,8 +153,8 @@ local function set_popup(instance_id, type, bufnr)
     new_popup:map("n", "b", "<cmd>lua require('vadre.setup').output_window(" .. instance_id .. ", 'Breakpoints')<CR>")
     new_popup:map("n", "<", "<cmd>lua require('vadre.setup').output_window(" .. instance_id .. ", 'previous')<CR>")
     new_popup:map("n", ">", "<cmd>lua require('vadre.setup').output_window(" .. instance_id .. ", 'next')<CR>")
-    new_popup:map("n", "<CR>", "<cmd>lua require('vadre.setup').handle_output_window_enter(" .. instance_id .. ")<CR>")
-    new_popup:map("n", " ", "<cmd>lua require('vadre.setup').handle_output_window_space(" .. instance_id .. ")<CR>")
+    new_popup:map("n", "<CR>", "<cmd>lua require('vadre.setup').handle_output_window_key(" .. instance_id .. ", 'enter')<CR>")
+    new_popup:map("n", " ",    "<cmd>lua require('vadre.setup').handle_output_window_key(" .. instance_id .. ", 'space')<CR>")
 
     if type == "logs" then
         logs_window_popup[instance_id] = new_popup
