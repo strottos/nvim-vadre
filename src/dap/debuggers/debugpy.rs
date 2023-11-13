@@ -9,7 +9,7 @@ use tokio::{
 use which::which;
 
 use crate::{
-    dap::protocol::{Either, RequestArguments},
+    dap::protocol::RequestArguments,
     neovim::{NeovimVadreWindow, VadreLogLevel},
     util::{download_extract_zip, get_debuggers_dir, get_os_and_cpu_architecture},
 };

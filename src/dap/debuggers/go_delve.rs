@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    dap::protocol::{Either, RequestArguments},
+    dap::protocol::RequestArguments,
     neovim::{NeovimVadreWindow, VadreLogLevel},
     util::{download_extract_zip, get_debuggers_dir, get_os_and_cpu_architecture, merge_json},
 };
@@ -192,8 +192,6 @@ impl Debugger {
             "name": "delve",
             "program": program,
             "request": "launch",
-            "stopOnEntry": true,
-            "terminal": "integrated",
             "type": "go",
         })))
     }
@@ -216,12 +214,9 @@ impl Debugger {
     }
 
     pub(crate) fn check_breakpoint_enabled(&self, msg: &str) -> Result<bool> {
-        Ok(msg
-            .rsplit_once("Resolved locations: ")
-            .ok_or_else(|| anyhow!("Couldn't find Resolved locations message in: {}", msg))?
-            .1
-            .parse::<i64>()?
-            > 0)
+        // Successful breakpoints in delve are indicated by verified = true and no message, if
+        // we're here then it's false
+        Ok(false)
     }
 
     fn get_debugger_binary_path(&self) -> Result<PathBuf> {

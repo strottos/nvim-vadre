@@ -132,7 +132,7 @@ impl Debugger {
                         }
                     },
                     output = timeout(Duration::new(60, 0), terminal_watch_rx.recv()) => {
-                        tracing::trace!("OUTPUT TO HANDLE? {:?}", output);
+                        output???;
                         break;
                     }
                 );

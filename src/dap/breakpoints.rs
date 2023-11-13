@@ -6,16 +6,19 @@ use anyhow::{anyhow, bail, Result};
 pub struct DebuggerBreakpoint {
     pub enabled: bool,
 
+    pub resolved: bool,
+
     // Collection of placed breakpoints, can be multiple breakpoints placed for one in the source
     // as we delete and reapply when they're enabled and disabled.
-    pub resolved: HashMap<String, i64>,
+    pub locations: HashMap<String, i64>,
 }
 
 impl DebuggerBreakpoint {
     fn new() -> Self {
         DebuggerBreakpoint {
             enabled: true,
-            resolved: HashMap::new(),
+            resolved: false,
+            locations: HashMap::new(),
         }
     }
 }
@@ -71,7 +74,7 @@ impl Breakpoints {
     pub(crate) fn get_breakpoint_for_id(&self, id: &i64) -> Option<(String, i64)> {
         for (source_file_path, line_map) in self.0.iter() {
             for (source_line_number, breakpoint) in line_map.iter() {
-                if breakpoint.resolved.contains_key(&id.to_string()) {
+                if breakpoint.locations.contains_key(&id.to_string()) {
                     return Some((source_file_path.clone(), *source_line_number));
                 }
             }
@@ -80,6 +83,28 @@ impl Breakpoints {
     }
 
     pub(crate) fn set_breakpoint_resolved(
+        &mut self,
+        file_path: String,
+        source_line_number: i64,
+    ) -> Result<()> {
+        let breakpoint = self
+            .0
+            .get_mut(&file_path)
+            .ok_or_else(|| anyhow!("Can't find existing breakpoints for file {}", file_path))?
+            .get_mut(&source_line_number)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Can't find existing breakpoints for file {} and line {}",
+                    file_path,
+                    source_line_number
+                )
+            })?;
+        breakpoint.resolved = true;
+
+        Ok(())
+    }
+
+    pub(crate) fn set_breakpoint_location(
         &mut self,
         file_path: String,
         source_line_number: i64,
@@ -98,7 +123,7 @@ impl Breakpoints {
                     source_line_number
                 )
             })?;
-        breakpoint.resolved.insert(id, actual_line_number);
+        breakpoint.locations.insert(id, actual_line_number);
 
         Ok(())
     }

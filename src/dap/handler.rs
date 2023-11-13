@@ -28,6 +28,8 @@ use tokio::{
     time::timeout,
 };
 
+struct Capabilities {}
+
 pub(crate) struct DebuggerHandler {
     pub neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
 
@@ -712,28 +714,23 @@ impl DebuggerHandler {
                         })?
                         .clone();
 
-                    // TODO: This is optional, what to do if it's not set, it is for CodeLLDB.
-                    let breakpoint_id = breakpoint_response.id.ok_or_else(|| {
-                        anyhow!(
-                            "Id wasn't set in breakpoint setting response as expected: {:?}",
-                            breakpoint_response
-                        )
-                    })?;
+                    let breakpoint_is_resolved =
+                        self.breakpoint_is_resolved(&breakpoint_response)?;
 
-                    let breakpoint_is_enabled = self.breakpoint_is_enabled(&breakpoint_response)?;
-
-                    if let Some(actual_line_number) = breakpoint_response.line {
-                        self.breakpoints.set_breakpoint_resolved(
-                            file_path.clone(),
-                            source_line_number,
-                            actual_line_number,
-                            breakpoint_id.to_string(),
-                        )?;
+                    if breakpoint_is_resolved {
+                        self.breakpoints
+                            .set_breakpoint_resolved(file_path.clone(), source_line_number)?;
                     }
 
-                    if breakpoint_is_enabled {
-                        self.breakpoints
-                            .set_breakpoint_enabled(file_path.clone(), source_line_number)?;
+                    if let Some(actual_line) = breakpoint_response.line {
+                        if let Some(breakpoint_id) = breakpoint_response.id {
+                            self.breakpoints.set_breakpoint_location(
+                                file_path.clone(),
+                                source_line_number,
+                                actual_line,
+                                breakpoint_id.to_string(),
+                            )?;
+                        }
                     }
                 }
 
@@ -787,31 +784,28 @@ impl DebuggerHandler {
         &mut self,
         breakpoint_event: BreakpointEventBody,
     ) -> Result<()> {
-        let breakpoint_id = breakpoint_event
-            .breakpoint
-            .id
-            .ok_or_else(|| anyhow!("Couldn't find ID from event: {:?}", breakpoint_event))?;
+        if let Some(breakpoint_id) = breakpoint_event.breakpoint.id {
+            let breakpoint_is_resolved =
+                self.breakpoint_is_resolved(&breakpoint_event.breakpoint)?;
 
-        let breakpoint_is_enabled = self.breakpoint_is_enabled(&breakpoint_event.breakpoint)?;
+            let (file_path, source_line_number) = self
+                .breakpoints
+                .get_breakpoint_for_id(&breakpoint_id)
+                .ok_or_else(|| anyhow!("Can't find breakpoint for id {}", breakpoint_id))?;
 
-        // What if ID not used?
-        let (file_path, source_line_number) = self
-            .breakpoints
-            .get_breakpoint_for_id(&breakpoint_id)
-            .ok_or_else(|| anyhow!("Can't find breakpoint for id {}", breakpoint_id))?;
+            if breakpoint_is_resolved {
+                self.breakpoints
+                    .set_breakpoint_resolved(file_path.clone(), source_line_number)?;
+            }
 
-        if let Some(actual_line_number) = breakpoint_event.breakpoint.line {
-            self.breakpoints.set_breakpoint_resolved(
-                file_path.clone(),
-                source_line_number,
-                actual_line_number,
-                breakpoint_id.to_string(),
-            )?;
-        }
-
-        if breakpoint_is_enabled {
-            self.breakpoints
-                .set_breakpoint_enabled(file_path.clone(), source_line_number)?;
+            if let Some(actual_line) = breakpoint_event.breakpoint.line {
+                self.breakpoints.set_breakpoint_location(
+                    file_path.clone(),
+                    source_line_number,
+                    actual_line,
+                    breakpoint_id.to_string(),
+                )?;
+            }
         }
 
         self.process_breakpoints_output().await?;
@@ -819,7 +813,7 @@ impl DebuggerHandler {
         Ok(())
     }
 
-    fn breakpoint_is_enabled(&self, breakpoint: &Breakpoint) -> Result<bool> {
+    fn breakpoint_is_resolved(&self, breakpoint: &Breakpoint) -> Result<bool> {
         match breakpoint.message.as_ref() {
             Some(message) => {
                 // Blame DAP for this one, the verified property can't be trusted and this is
@@ -962,16 +956,30 @@ impl DebuggerHandler {
             {
                 let breakpoint_is_enabled = breakpoint.enabled;
 
-                for resolved_line_number in breakpoint.resolved.values().collect::<HashSet<_>>() {
-                    breakpoints_buffer_content.push(format!(
-                        "  {}  {}",
-                        if breakpoint_is_enabled { "⬤" } else { "○" },
-                        if source_line_number != resolved_line_number {
-                            format!("{} -> {}", source_line_number, resolved_line_number)
-                        } else {
-                            format!("{}", source_line_number)
-                        },
-                    ));
+                if breakpoint.resolved {
+                    if breakpoint.locations.is_empty() {
+                        breakpoints_buffer_content.push(format!(
+                            "  {} (resolved to unknown location)",
+                            source_line_number
+                        ));
+                    } else {
+                        for resolved_line_number in
+                            breakpoint.locations.values().collect::<HashSet<_>>()
+                        {
+                            breakpoints_buffer_content.push(format!(
+                                "  {}  {}",
+                                if breakpoint_is_enabled { "⬤" } else { "○" },
+                                if source_line_number != resolved_line_number {
+                                    format!("{} -> {}", source_line_number, resolved_line_number)
+                                } else {
+                                    format!("{}", source_line_number)
+                                },
+                            ));
+                        }
+                    }
+                } else {
+                    breakpoints_buffer_content
+                        .push(format!("  {} (unresolved)", source_line_number));
                 }
             }
         }

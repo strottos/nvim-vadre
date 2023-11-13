@@ -1,25 +1,16 @@
-use std::{collections::HashMap, env, fmt::Debug, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, env, fmt::Debug, sync::Arc};
 
 use anyhow::{anyhow, bail, Result};
 use tokio::{process::Child, sync::Mutex};
 
-use crate::{
-    dap::protocol::{Either, RequestArguments},
-    neovim::NeovimVadreWindow,
-};
-
-const VERSION: &str = "1.10.0";
+use crate::{dap::protocol::RequestArguments, neovim::NeovimVadreWindow};
 
 #[derive(Clone)]
-pub(crate) struct Debugger {
-    pub neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
-}
+pub(crate) struct Debugger {}
 
 impl Debugger {
-    pub(crate) fn new(neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>) -> Self {
-        Self {
-            neovim_vadre_window,
-        }
+    pub(crate) fn new(_neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>) -> Self {
+        Self {}
     }
 
     pub(crate) async fn download_plugin(&self) -> Result<()> {
@@ -72,10 +63,6 @@ impl Debugger {
             .1
             .parse::<i64>()?
             > 0)
-    }
-
-    async fn get_debugger_path(&self) -> Result<PathBuf> {
-        bail!("Need to specify the command to run generic debugger");
     }
 }
 
