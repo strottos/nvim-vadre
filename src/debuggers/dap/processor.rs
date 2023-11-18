@@ -11,13 +11,14 @@ use std::{
 };
 
 use super::{
-    debuggers::DebuggerType,
+    debuggers::DapDebuggerType,
     protocol::{
         DAPCodec, DecoderResult, DisconnectArguments, Either, ProtocolMessage, ProtocolMessageType,
         RequestArguments, Response, ResponseResult,
     },
 };
 use crate::{
+    debuggers::RequestTimeout,
     neovim::{NeovimVadreWindow, VadreLogLevel},
     util::get_unused_localhost_port,
 };
@@ -28,56 +29,14 @@ use tokio::{
     io::{AsyncBufReadExt, BufReader},
     net::TcpStream,
     process::{Child, Command},
-    sync::{broadcast, mpsc, oneshot, Mutex, RwLock},
-    time::{sleep, timeout, Instant},
+    sync::{broadcast, mpsc, oneshot, Mutex},
+    time::{sleep, timeout},
 };
 use tokio_util::codec::Decoder;
 
-struct RequestTimeout {
-    inner: RwLock<RequestTimeoutInner>,
-    neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
-}
-
-struct RequestTimeoutInner {
-    value: Duration,
-    last_set: Instant,
-}
-
-impl RequestTimeout {
-    fn new(neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>) -> Self {
-        RequestTimeout {
-            inner: RwLock::new(RequestTimeoutInner {
-                value: Duration::new(30, 0),
-                last_set: Instant::now(),
-            }),
-            neovim_vadre_window,
-        }
-    }
-
-    async fn get_or_set(&self) -> Duration {
-        let now = Instant::now();
-        if now - self.inner.read().await.last_set > Duration::from_secs(60) {
-            let value = match self
-                .neovim_vadre_window
-                .lock()
-                .await
-                .get_var("vadre_request_timeout")
-                .await
-            {
-                Ok(duration) => Duration::new(duration.as_u64().unwrap_or(30), 0),
-                Err(_) => Duration::new(30, 0),
-            };
-            let mut writer = self.inner.write().await;
-            writer.value = value;
-            writer.last_set = now;
-        }
-        self.inner.read().await.value.clone()
-    }
-}
-
 /// Responsible for spawning the process and handling the communication with the debugger
 pub(crate) struct DebuggerProcessor {
-    debugger_type: DebuggerType,
+    debugger_type: DapDebuggerType,
 
     neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
     process: Arc<Mutex<Option<Child>>>,
@@ -89,15 +48,13 @@ pub(crate) struct DebuggerProcessor {
     debugger_receiver_tx: Option<broadcast::Sender<ProtocolMessage>>,
 
     /// Allows us to receive from the debugger
-    debugger_receiver_rx: Option<broadcast::Receiver<ProtocolMessage>>,
-
     seq_ids: AtomicU32,
     request_timeout: RequestTimeout,
 }
 
 impl DebuggerProcessor {
     pub(crate) fn new(
-        debugger_type: DebuggerType,
+        debugger_type: DapDebuggerType,
         neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
     ) -> Self {
         Self {
@@ -108,7 +65,6 @@ impl DebuggerProcessor {
 
             debugger_sender_tx: None,
             debugger_receiver_tx: None,
-            debugger_receiver_rx: None,
 
             seq_ids: AtomicU32::new(1),
             request_timeout: RequestTimeout::new(neovim_vadre_window),
@@ -169,12 +125,12 @@ impl DebuggerProcessor {
 
     pub(crate) fn subscribe_debugger(&self) -> Result<broadcast::Receiver<ProtocolMessage>> {
         Ok(self
-            .debugger_receiver_rx
+            .debugger_receiver_tx
             .as_ref()
             .ok_or_else(|| {
-                anyhow!("Couldn't get debugger_receiver_rx, was process initialised correctly")
+                anyhow!("Couldn't get debugger_receiver_tx, was process initialised correctly")
             })?
-            .resubscribe())
+            .subscribe())
     }
 
     pub(crate) async fn request(
@@ -425,11 +381,10 @@ impl DebuggerProcessor {
     {
         let (debugger_sender_tx, debugger_sender_rx) = mpsc::channel(1);
         // Can theoretically get a lot of messages from the debugger.
-        let (debugger_receiver_tx, debugger_receiver_rx) = broadcast::channel(20);
+        let (debugger_receiver_tx, _debugger_receiver_rx) = broadcast::channel(20);
 
         self.debugger_sender_tx = Some(debugger_sender_tx);
         self.debugger_receiver_tx = Some(debugger_receiver_tx.clone());
-        self.debugger_receiver_rx = Some(debugger_receiver_rx);
 
         let neovim_vadre_window = self.neovim_vadre_window.clone();
 

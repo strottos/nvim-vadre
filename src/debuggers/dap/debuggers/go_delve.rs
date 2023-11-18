@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    dap::protocol::RequestArguments,
+    debuggers::dap::protocol::RequestArguments,
     neovim::{NeovimVadreWindow, VadreLogLevel},
     util::{download_extract_zip, get_debuggers_dir, get_os_and_cpu_architecture, merge_json},
 };
@@ -213,7 +213,7 @@ impl Debugger {
         Ok(path)
     }
 
-    pub(crate) fn check_breakpoint_enabled(&self, msg: &str) -> Result<bool> {
+    pub(crate) fn check_breakpoint_enabled(&self, _msg: &str) -> Result<bool> {
         // Successful breakpoints in delve are indicated by verified = true and no message, if
         // we're here then it's false
         Ok(false)

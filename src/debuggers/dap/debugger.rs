@@ -1,10 +1,13 @@
 use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Duration};
 
 use super::{
-    breakpoints::Breakpoints, debuggers::DebuggerType, handler::DebuggerHandler,
-    processor::DebuggerProcessor, protocol::ProtocolMessageType,
+    debuggers::DapDebuggerType, handler::DebuggerHandler, processor::DebuggerProcessor,
+    protocol::ProtocolMessageType,
 };
-use crate::neovim::{NeovimVadreWindow, VadreBufferType, VadreLogLevel};
+use crate::{
+    debuggers::Breakpoints,
+    neovim::{NeovimVadreWindow, VadreLogLevel},
+};
 
 use anyhow::{bail, Result};
 use tokio::{
@@ -12,18 +15,18 @@ use tokio::{
     time::timeout,
 };
 
-pub(crate) struct Debugger {
+pub(crate) struct DapDebugger {
     id: usize,
     pub setup_complete: bool,
     pub neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
     pub handler: Arc<Mutex<DebuggerHandler>>,
 }
 
-impl Debugger {
+impl DapDebugger {
     pub(crate) fn new(
         id: usize,
         debug_program_string: String,
-        debugger_type: DebuggerType,
+        debugger_type: DapDebuggerType,
         neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
         breakpoints: Breakpoints,
     ) -> Self {
@@ -49,7 +52,6 @@ impl Debugger {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     pub(crate) async fn setup(
         &mut self,
         command_args: Vec<String>,
@@ -155,12 +157,20 @@ impl Debugger {
 
         self.log_msg(
             VadreLogLevel::INFO,
-            "Debugger and program launched successfully",
+            "DAP Debugger and program launched successfully",
         )
         .await?;
         self.setup_complete = true;
 
         Ok(())
+    }
+
+    pub(crate) async fn log_msg(&self, level: VadreLogLevel, msg: &str) -> Result<()> {
+        self.neovim_vadre_window
+            .lock()
+            .await
+            .log_msg(level, msg)
+            .await
     }
 
     async fn handle_messages(&mut self) -> Result<()> {
@@ -217,44 +227,10 @@ impl Debugger {
 
         Ok(())
     }
-
-    // TODO: Handler or here?
-    #[tracing::instrument(skip(self))]
-    pub(crate) async fn change_output_window(&self, type_: &str) -> Result<()> {
-        self.neovim_vadre_window
-            .lock()
-            .await
-            .change_output_window(type_)
-            .await?;
-
-        let current_output_window_type = self
-            .neovim_vadre_window
-            .lock()
-            .await
-            .get_output_window_type()
-            .await?;
-
-        match current_output_window_type {
-            VadreBufferType::CallStack | VadreBufferType::Variables => {
-                self.handler.lock().await.display_output_info().await?;
-            }
-            _ => {}
-        };
-
-        Ok(())
-    }
-
-    pub(crate) async fn log_msg(&self, level: VadreLogLevel, msg: &str) -> Result<()> {
-        self.neovim_vadre_window
-            .lock()
-            .await
-            .log_msg(level, msg)
-            .await
-    }
 }
 
-impl Debug for Debugger {
+impl Debug for DapDebugger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Debugger").field("id", &self.id).finish()
+        f.debug_struct("DapDebugger").field("id", &self.id).finish()
     }
 }

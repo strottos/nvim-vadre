@@ -1,13 +1,14 @@
 #[macro_use]
 extern crate lazy_static;
 
-mod dap;
+mod debuggers;
 mod logger;
 mod neovim;
 mod tokio_join;
 mod util;
 
 use crate::neovim::VadreLogLevel;
+use debuggers::{Breakpoints, Debugger, DebuggerStepType};
 
 use std::{
     collections::HashMap,
@@ -24,7 +25,6 @@ use std::{
 
 use async_trait::async_trait;
 use clap::Parser;
-use dap::{Breakpoints, Debugger, DebuggerStepType};
 use nvim_rs::{compat::tokio::Compat, create::tokio as create, Handler, Neovim, Value};
 use tokio::{
     io::Stdout,
@@ -137,7 +137,7 @@ impl NeovimHandler {
 
         let pending_breakpoints = self.pending_breakpoints.lock().await.clone();
 
-        let debugger = match dap::new_debugger(
+        let debugger = match debuggers::new_debugger(
             instance_id,
             command_args.clone(),
             neovim.clone(),
@@ -289,24 +289,18 @@ impl NeovimHandler {
             let debuggers = debuggers.lock().await;
 
             for debugger in debuggers.values() {
-                let debugger_lock = debugger.lock().await;
+                let mut debugger_lock = debugger.lock().await;
 
-                if !debugger_lock.setup_complete {
+                if !debugger_lock.is_setup_complete() {
                     continue;
                 }
 
                 let breakpoint_result = if adding_breakpoint {
                     debugger_lock
-                        .handler
-                        .lock()
-                        .await
                         .add_breakpoint(spawn_file_path.clone(), line_number)
                         .await
                 } else {
                     debugger_lock
-                        .handler
-                        .lock()
-                        .await
                         .remove_breakpoint(spawn_file_path.clone(), line_number)
                         .await
                 };
@@ -357,7 +351,7 @@ impl NeovimHandler {
 
         let debugger = debuggers.get(&instance_id).ok_or("Debugger didn't exist")?;
 
-        let debugger = match debugger.try_lock() {
+        let mut debugger = match debugger.try_lock() {
             Ok(x) => x,
             Err(e) => {
                 tracing::error!("Couldn't get debugger lock: {e}");
@@ -365,14 +359,11 @@ impl NeovimHandler {
             }
         };
 
-        if !debugger.setup_complete {
+        if !debugger.is_setup_complete() {
             return Err("Can't do step, debugger not setup".into());
         }
 
         debugger
-            .handler
-            .lock()
-            .await
             .do_step(step_type, count)
             .await
             .map_err(|e| format!("Couldn't do code step: {e}"))?;
@@ -391,7 +382,7 @@ impl NeovimHandler {
 
         let debugger = debuggers.get(&instance_id).ok_or("Debugger didn't exist")?;
 
-        let debugger = match debugger.try_lock() {
+        let mut debugger = match debugger.try_lock() {
             Ok(x) => x,
             Err(e) => {
                 tracing::error!("Couldn't get debugger lock: {e}");
@@ -399,14 +390,11 @@ impl NeovimHandler {
             }
         };
 
-        if !debugger.setup_complete {
+        if !debugger.is_setup_complete() {
             return Err("Can't do interrupt, debugger not setup correctly".into());
         }
 
         debugger
-            .handler
-            .lock()
-            .await
             .pause(thread_id)
             .await
             .map_err(|e| format!("Couldn't do pause: {e}"))?;
@@ -427,7 +415,7 @@ impl NeovimHandler {
             .get(&instance_id)
             .ok_or("Debugger didn't exist")?;
 
-        let debugger = match debugger.try_lock() {
+        let mut debugger = match debugger.try_lock() {
             Ok(x) => x,
             Err(e) => {
                 tracing::error!("Couldn't get debugger lock: {e}");
@@ -437,7 +425,7 @@ impl NeovimHandler {
 
         let ret;
 
-        if let Err(e) = timeout(Duration::new(5, 0), debugger.handler.lock().await.stop())
+        if let Err(e) = timeout(Duration::new(5, 0), debugger.stop())
             .await
             .map_err(|e| format!("Couldn't stop debugger: {e}"))?
         {
@@ -465,7 +453,7 @@ impl NeovimHandler {
 
         let debugger = debuggers.get(&instance_id).ok_or("Debugger didn't exist")?;
 
-        let debugger = match debugger.try_lock() {
+        let mut debugger = match debugger.try_lock() {
             Ok(x) => x,
             Err(e) => {
                 tracing::error!("Couldn't get debugger lock: {e}");
@@ -473,7 +461,7 @@ impl NeovimHandler {
             }
         };
 
-        if !debugger.setup_complete {
+        if !debugger.is_setup_complete() {
             // Force us to show logs if debugger not complete, only thing we can be interested in
             type_ = "Logs";
         }
@@ -497,7 +485,7 @@ impl NeovimHandler {
 
         let debugger = debuggers.get(&instance_id).ok_or("Debugger didn't exist")?;
 
-        let debugger = match debugger.try_lock() {
+        let mut debugger = match debugger.try_lock() {
             Ok(x) => x,
             Err(e) => {
                 tracing::error!("Couldn't get debugger lock: {e}");
@@ -506,9 +494,6 @@ impl NeovimHandler {
         };
 
         debugger
-            .handler
-            .lock()
-            .await
             .handle_output_window_key(key)
             .await
             .map_err(|e| format!("Couldn't show output window: {e}"))?;

@@ -132,18 +132,6 @@ impl VadreBufferType {
         }
     }
 
-    fn buffer_should_wrap(&self) -> bool {
-        // TODO: Take into account default
-        match &self {
-            VadreBufferType::Code => true,
-            VadreBufferType::Logs => true,
-            VadreBufferType::Terminal => true,
-            VadreBufferType::CallStack => false,
-            VadreBufferType::Variables => false,
-            VadreBufferType::Breakpoints => true,
-        }
-    }
-
     fn next_output_type(&self) -> VadreBufferType {
         match self {
             VadreBufferType::Code => unreachable!(),

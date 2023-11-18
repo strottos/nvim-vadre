@@ -7,8 +7,7 @@ use std::{
 };
 
 use super::{
-    breakpoints::Breakpoints,
-    debuggers::DebuggerType,
+    debuggers::DapDebuggerType,
     processor::DebuggerProcessor,
     protocol::{
         Breakpoint, BreakpointEventBody, ContinueArguments, Either, EventBody,
@@ -18,9 +17,12 @@ use super::{
         SourceArguments, SourceBreakpoint, StackTraceArguments, StepInArguments, StoppedEventBody,
         VariablesArguments,
     },
+};
+use crate::{
+    debuggers::Breakpoints,
+    neovim::{CodeBufferContent, NeovimVadreWindow, VadreBufferType, VadreLogLevel},
     DebuggerStepType,
 };
-use crate::neovim::{CodeBufferContent, NeovimVadreWindow, VadreBufferType, VadreLogLevel};
 
 use anyhow::{anyhow, bail, Result};
 use tokio::{
@@ -28,12 +30,10 @@ use tokio::{
     time::timeout,
 };
 
-struct Capabilities {}
-
 pub(crate) struct DebuggerHandler {
     pub neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
 
-    debugger_type: DebuggerType,
+    debugger_type: DapDebuggerType,
     processor: DebuggerProcessor,
 
     current_thread_id: Option<i64>,
@@ -50,7 +50,7 @@ pub(crate) struct DebuggerHandler {
 
 impl DebuggerHandler {
     pub(crate) fn new(
-        debugger_type: DebuggerType,
+        debugger_type: DapDebuggerType,
         processor: DebuggerProcessor,
         neovim_vadre_window: Arc<Mutex<NeovimVadreWindow>>,
         debug_program_string: String,
@@ -273,6 +273,36 @@ impl DebuggerHandler {
         Ok(())
     }
 
+    pub(crate) async fn stop(&mut self) -> Result<()> {
+        self.processor.stop().await?;
+
+        Ok(())
+    }
+
+    pub(crate) async fn change_output_window(&mut self, type_: &str) -> Result<()> {
+        self.neovim_vadre_window
+            .lock()
+            .await
+            .change_output_window(type_)
+            .await?;
+
+        let current_output_window_type = self
+            .neovim_vadre_window
+            .lock()
+            .await
+            .get_output_window_type()
+            .await?;
+
+        match current_output_window_type {
+            VadreBufferType::CallStack | VadreBufferType::Variables => {
+                self.display_output_info().await?;
+            }
+            _ => {}
+        };
+
+        Ok(())
+    }
+
     pub(crate) async fn handle_output_window_key(&mut self, key: &str) -> Result<()> {
         let current_output_window_type = self
             .neovim_vadre_window
@@ -288,128 +318,6 @@ impl DebuggerHandler {
         } else if current_output_window_type == VadreBufferType::Breakpoints {
             self.handle_breakpoints_output_window_key(key).await?;
         }
-
-        Ok(())
-    }
-
-    async fn handle_callstack_output_window_key(&mut self, key: &str) -> Result<()> {
-        let current_line = self
-            .neovim_vadre_window
-            .lock()
-            .await
-            .get_current_line()
-            .await?;
-
-        if key == "space" {
-            let mut split = current_line.split(" - ");
-
-            if let Some(thread_id) = split.next() {
-                match thread_id.parse::<i64>() {
-                    Ok(thread_id) => {
-                        self.pause(Some(thread_id)).await?;
-                        if !self.stack_expanded_threads.contains(&thread_id) {
-                            self.stack_expanded_threads.insert(thread_id);
-                        } else {
-                            self.stack_expanded_threads.remove(&thread_id);
-                        }
-                        self.display_output_info().await?;
-                    }
-                    Err(_) => {}
-                }
-            }
-        } else if key == "enter" {
-            let mut split = current_line.split(" - ");
-
-            if let Some(thread_id) = split.next() {
-                match thread_id.parse::<i64>() {
-                    Ok(thread_id) => {
-                        self.current_thread_id = Some(thread_id);
-                        self.display_output_info().await?;
-                    }
-                    Err(_) => {}
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn handle_variables_output_window_key(&mut self, _key: &str) -> Result<()> {
-        Ok(())
-    }
-
-    async fn handle_breakpoints_output_window_key(&mut self, key: &str) -> Result<()> {
-        let lines = self
-            .neovim_vadre_window
-            .lock()
-            .await
-            .get_current_buffer_lines(Some(0), None)
-            .await?;
-
-        let mut file = None;
-
-        for line in lines.iter().rev() {
-            let first_char = line
-                .chars()
-                .next()
-                .ok_or_else(|| anyhow!("Can't get first char of line: {:?}", line))?;
-
-            // Surely never get a file with full path beginning with a space.
-            if first_char != ' ' {
-                let found_file = line[0..line.len() - 1].to_string();
-                if &found_file == "" {
-                    bail!("Can't find file in line: {:?}", file);
-                }
-
-                file = Some(found_file);
-
-                break;
-            }
-        }
-
-        let file =
-            file.ok_or_else(|| anyhow!("Can't find file for breakpoint in lines: {:?}", lines))?;
-
-        let source_line = lines.iter().rev().next().ok_or_else(|| {
-            anyhow!(
-                "Can't find source line for breakpoint in lines: {:?}",
-                lines
-            )
-        })?;
-
-        let mut breakpoint_enabled = false;
-        let mut num = "".to_string();
-
-        for ch in source_line.chars() {
-            if ch == '⬤' {
-                breakpoint_enabled = true;
-            }
-
-            if ch.is_numeric() {
-                num.push(ch);
-            }
-
-            if &num != "" && ch == ' ' {
-                break;
-            }
-        }
-
-        let num = num
-            .parse::<i64>()
-            .map_err(|_| anyhow!("can't parse source line from `{}`: {:?}", num, source_line))?;
-
-        if breakpoint_enabled {
-            tracing::debug!("Disabling breakpoint: {}, {}", file, num);
-
-            self.breakpoints
-                .set_breakpoint_disabled(file.clone(), num)?;
-        } else {
-            tracing::debug!("Enabling breakpoint: {}, {}", file, num);
-
-            self.breakpoints.set_breakpoint_enabled(file.clone(), num)?;
-        }
-
-        self.set_breakpoints(file).await?;
 
         Ok(())
     }
@@ -508,8 +416,130 @@ impl DebuggerHandler {
         }
     }
 
+    async fn handle_callstack_output_window_key(&mut self, key: &str) -> Result<()> {
+        let current_line = self
+            .neovim_vadre_window
+            .lock()
+            .await
+            .get_current_line()
+            .await?;
+
+        if key == "space" {
+            let mut split = current_line.split(" - ");
+
+            if let Some(thread_id) = split.next() {
+                match thread_id.parse::<i64>() {
+                    Ok(thread_id) => {
+                        self.pause(Some(thread_id)).await?;
+                        if !self.stack_expanded_threads.contains(&thread_id) {
+                            self.stack_expanded_threads.insert(thread_id);
+                        } else {
+                            self.stack_expanded_threads.remove(&thread_id);
+                        }
+                        self.display_output_info().await?;
+                    }
+                    Err(_) => {}
+                }
+            }
+        } else if key == "enter" {
+            let mut split = current_line.split(" - ");
+
+            if let Some(thread_id) = split.next() {
+                match thread_id.parse::<i64>() {
+                    Ok(thread_id) => {
+                        self.current_thread_id = Some(thread_id);
+                        self.display_output_info().await?;
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_variables_output_window_key(&mut self, _key: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn handle_breakpoints_output_window_key(&mut self, _key: &str) -> Result<()> {
+        let lines = self
+            .neovim_vadre_window
+            .lock()
+            .await
+            .get_current_buffer_lines(Some(0), None)
+            .await?;
+
+        let mut file = None;
+
+        for line in lines.iter().rev() {
+            let first_char = line
+                .chars()
+                .next()
+                .ok_or_else(|| anyhow!("Can't get first char of line: {:?}", line))?;
+
+            // Surely never get a file with full path beginning with a space.
+            if first_char != ' ' {
+                let found_file = line[0..line.len() - 1].to_string();
+                if &found_file == "" {
+                    bail!("Can't find file in line: {:?}", file);
+                }
+
+                file = Some(found_file);
+
+                break;
+            }
+        }
+
+        let file =
+            file.ok_or_else(|| anyhow!("Can't find file for breakpoint in lines: {:?}", lines))?;
+
+        let source_line = lines.iter().rev().next().ok_or_else(|| {
+            anyhow!(
+                "Can't find source line for breakpoint in lines: {:?}",
+                lines
+            )
+        })?;
+
+        let mut breakpoint_enabled = false;
+        let mut num = "".to_string();
+
+        for ch in source_line.chars() {
+            if ch == '⬤' {
+                breakpoint_enabled = true;
+            }
+
+            if ch.is_numeric() {
+                num.push(ch);
+            }
+
+            if &num != "" && ch == ' ' {
+                break;
+            }
+        }
+
+        let num = num
+            .parse::<i64>()
+            .map_err(|_| anyhow!("can't parse source line from `{}`: {:?}", num, source_line))?;
+
+        if breakpoint_enabled {
+            tracing::debug!("Disabling breakpoint: {}, {}", file, num);
+
+            self.breakpoints
+                .set_breakpoint_disabled(file.clone(), num)?;
+        } else {
+            tracing::debug!("Enabling breakpoint: {}, {}", file, num);
+
+            self.breakpoints.set_breakpoint_enabled(file.clone(), num)?;
+        }
+
+        self.set_breakpoints(file).await?;
+
+        Ok(())
+    }
+
     #[tracing::instrument]
-    pub(crate) async fn display_output_info(&mut self) -> Result<()> {
+    async fn display_output_info(&mut self) -> Result<()> {
         let mut call_stack_buffer_content = Vec::new();
         let current_thread_id = self.current_thread_id;
 
@@ -619,32 +649,6 @@ impl DebuggerHandler {
                                     }
                                 }
                             }
-                            // } else if current_output_window_type == VadreBufferType::CallStack {
-                            //     let stack_trace_response = self
-                            //         .request_and_response(RequestArguments::stackTrace(
-                            //             StackTraceArguments {
-                            //                 thread_id,
-                            //                 format: None,
-                            //                 levels: None,
-                            //                 start_frame: None,
-                            //             },
-                            //         ))
-                            //         .await?;
-
-                            //     if let ResponseResult::Success { body } = stack_trace_response {
-                            //         if let ResponseBody::stackTrace(stack_trace_body) = body {
-                            //             let frame_name = &stack_trace_body
-                            //                 .stack_frames
-                            //                 .get(0)
-                            //                 .ok_or_else(|| anyhow!("Coudln't find first stack frame as expected from stack trace response: {:?}", stack_trace_body.stack_frames))?
-                            //                 .name;
-
-                            //             call_stack_buffer_content
-                            //                 .push(format!("{} - {}", thread_name, frame_name));
-                            //         } else {
-                            //             call_stack_buffer_content.push(format!("{}", thread_name));
-                            //         }
-                            //     }
                         }
                     }
                 }
@@ -656,12 +660,6 @@ impl DebuggerHandler {
                 .set_call_stack_buffer(call_stack_buffer_content)
                 .await?;
         }
-
-        Ok(())
-    }
-
-    pub(crate) async fn stop(&mut self) -> Result<()> {
-        self.processor.stop().await?;
 
         Ok(())
     }
@@ -761,7 +759,19 @@ impl DebuggerHandler {
             return Ok(());
         }
 
-        self.display_output_info().await?;
+        let current_output_window_type = self
+            .neovim_vadre_window
+            .lock()
+            .await
+            .get_output_window_type()
+            .await?;
+
+        match current_output_window_type {
+            VadreBufferType::CallStack | VadreBufferType::Variables => {
+                self.display_output_info().await?;
+            }
+            _ => {}
+        }
 
         if let Some(thread_id) = stopped_event.thread_id {
             if let Err(e) = self.process_stopped(thread_id).await {

@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-schemafy::schemafy!("./src/dap/schema.json");
+schemafy::schemafy!("./src/debuggers/dap/schema.json");
 
 impl InitializeRequestArguments {
     pub fn new(adapter_id: String) -> Self {

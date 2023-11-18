@@ -15,7 +15,7 @@ use tokio::{
 };
 
 use crate::{
-    dap::protocol::RequestArguments,
+    debuggers::dap::protocol::RequestArguments,
     neovim::{NeovimVadreWindow, VadreLogLevel},
     util::{download_extract_zip, get_debuggers_dir, get_os_and_cpu_architecture},
 };

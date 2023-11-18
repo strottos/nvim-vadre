@@ -531,7 +531,7 @@ impl Debugger {
                             .expect("Can log to vim");
                     }
                     "Debugger.scriptParsed" => {
-                        Debugger::analyse_script_parsed(
+                        Debugger::analyze_script_parsed(
                             event,
                             pending_breakpoints,
                             debugger_sender_tx,
@@ -550,7 +550,7 @@ impl Debugger {
                                 data,
                             )
                             .await
-                            .expect("Can analyse pausing debugger");
+                            .expect("Can analyze pausing debugger");
                         });
                     }
                     "Debugger.resumed" => {}
@@ -579,7 +579,7 @@ impl Debugger {
         neovim_vadre_window,
         data
     ))]
-    async fn analyse_script_parsed(
+    async fn analyze_script_parsed(
         event: serde_json::Value,
         pending_breakpoints: Arc<Mutex<HashMap<String, HashSet<i64>>>>,
         debugger_sender_tx: mpsc::Sender<(
