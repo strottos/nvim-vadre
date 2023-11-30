@@ -296,7 +296,7 @@ impl DebuggerHandler {
             .lock()
             .await
             .set_code_buffer(
-                CodeBufferContent::Content(contents),
+                CodeBufferContent::Content(&contents),
                 line_number,
                 script.get_file(),
                 false,

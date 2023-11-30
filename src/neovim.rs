@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     fmt::Display,
+    hash::{DefaultHasher, Hash, Hasher},
     path::Path,
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -53,10 +54,7 @@ impl VadreLogLevel {
             "CRITICAL" => 1,
             "INFO" => 4,
             "DEBUG" => 5,
-            _ => match level.parse::<u8>() {
-                Ok(x) => x,
-                Err(_) => 5,
-            },
+            _ => level.parse::<u8>().unwrap_or(5),
         };
 
         self.log_level() <= level
@@ -166,10 +164,10 @@ impl VadreBufferType {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Hash)]
 pub(crate) enum CodeBufferContent<'a> {
     File(&'a str),
-    Content(String),
+    Content(&'a str),
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -222,6 +220,7 @@ pub(crate) struct NeovimVadreWindow {
     windows: HashMap<VadreWindowType, Window<Compat<Stdout>>>,
     buffers: HashMap<VadreBufferType, Buffer<Compat<Stdout>>>,
     pointer_sign_id: usize,
+    previous_buffer_hash: Option<u64>,
 }
 
 impl NeovimVadreWindow {
@@ -233,6 +232,7 @@ impl NeovimVadreWindow {
             buffers: HashMap::new(),
             windows: HashMap::new(),
             pointer_sign_id: VADRE_NEXT_SIGN_ID.fetch_add(1, Ordering::SeqCst),
+            previous_buffer_hash: None,
         }
     }
 
@@ -269,7 +269,7 @@ impl NeovimVadreWindow {
         // Extra output buffers
         self.neovim.set_current_win(&output_window).await?;
 
-        for buffer_type in vec![
+        for buffer_type in [
             VadreBufferType::Logs,
             VadreBufferType::CallStack,
             VadreBufferType::Variables,
@@ -347,7 +347,6 @@ impl NeovimVadreWindow {
                 Value::Integer(x) => x.to_string(),
                 Value::String(x) => x
                     .as_str()
-                    .clone()
                     .ok_or_else(|| anyhow!("Can't convert variable g:vadre_log_level to string"))?
                     .to_string(),
                 _ => "INFO".to_string(),
@@ -368,7 +367,7 @@ impl NeovimVadreWindow {
         let now = chrono::offset::Local::now();
 
         let msgs = msg
-            .split("\n")
+            .split('\n')
             .map(move |msg| format!("{} [{}] {}", now.format("%a %H:%M:%S%.6f"), level, msg))
             .collect();
 
@@ -381,7 +380,7 @@ impl NeovimVadreWindow {
                 cursor_at_end = false;
             }
         }
-        self.write_to_buffer(&buffer, -1, -1, msgs).await?;
+        self.write_to_buffer(buffer, -1, -1, msgs).await?;
 
         if let Some(window) = window {
             if cursor_at_end && line_count > 1 {
@@ -403,7 +402,7 @@ impl NeovimVadreWindow {
             .windows
             .get(&VadreWindowType::Output)
             .ok_or_else(|| anyhow!("Can't find terminal window"))?;
-        self.neovim.set_current_win(&terminal_window).await?;
+        self.neovim.set_current_win(terminal_window).await?;
 
         tracing::debug!("Running terminal command {}", command);
 
@@ -470,13 +469,15 @@ impl NeovimVadreWindow {
     }
 
     pub(crate) async fn set_code_buffer<'a>(
-        &self,
+        &mut self,
         content: CodeBufferContent<'a>,
         line_number: i64,
         buffer_name: &str,
         force_replace: bool,
     ) -> Result<()> {
-        tracing::trace!("Opening in code buffer: {:?}", content);
+        let mut hasher = DefaultHasher::new();
+        content.hash(&mut hasher);
+        let content_hash = hasher.finish();
 
         let code_buffer = self
             .buffers
@@ -486,11 +487,14 @@ impl NeovimVadreWindow {
         let old_buffer_name = code_buffer.get_name().await?;
         let buffer_name = self.get_buffer_name(&VadreBufferType::Code, Some(buffer_name));
 
-        if !old_buffer_name.ends_with(&buffer_name) || force_replace {
+        if self.previous_buffer_hash != Some(content_hash)
+            || old_buffer_name.ends_with(&buffer_name)
+            || force_replace
+        {
+            tracing::trace!("Opening in code buffer: {:?}", content);
+
             let content = match &content {
                 CodeBufferContent::File(path_name) => {
-                    // TODO: Only change this when the file changes, cache what file we have
-                    // currently displayed maybe?
                     let path = Path::new(&path_name);
 
                     tracing::trace!("Resetting file to {:?}", path);
@@ -503,17 +507,14 @@ impl NeovimVadreWindow {
                         let file_type = file_type.to_str().ok_or_else(|| {
                             anyhow!("Can't convert file type to string from {:?}", file_type)
                         })?;
-                        match VIM_FILE_TYPES.get(&file_type) {
-                            Some(file_type) => {
-                                self.set_file_type(file_type).await?;
-                            }
-                            None => {}
-                        };
+                        if let Some(file_type) = VIM_FILE_TYPES.get(&file_type) {
+                            self.set_file_type(file_type).await?;
+                        }
                     }
 
                     tokio::fs::read_to_string(path)
                         .await?
-                        .split("\n")
+                        .split('\n')
                         .map(|x| x.trim_end().to_string())
                         .collect()
                 }
@@ -530,9 +531,11 @@ impl NeovimVadreWindow {
                 }
             };
 
-            self.write_to_buffer(&code_buffer, 0, 0, content).await?;
+            self.write_to_buffer(code_buffer, 0, 0, content).await?;
 
             code_buffer.set_name(&buffer_name).await?;
+
+            self.previous_buffer_hash = Some(content_hash);
         };
 
         let pointer_sign_id = self.pointer_sign_id;
@@ -648,9 +651,9 @@ impl NeovimVadreWindow {
             && buffer
                 .get_lines(0, 1, true)
                 .await?
-                .get(0)
+                .first()
                 .ok_or_else(|| anyhow!("Couldn't get first line"))?
-                == ""
+                .is_empty()
         {
             buffer.set_lines(0, 1, false, msgs).await?;
         } else {
@@ -666,7 +669,7 @@ impl NeovimVadreWindow {
         buffer: &Buffer<Compat<Stdout>>,
         buffer_type: &VadreBufferType,
     ) -> Result<()> {
-        let buffer_name = self.get_buffer_name(&buffer_type, None);
+        let buffer_name = self.get_buffer_name(buffer_type, None);
         let file_type = buffer_type.type_name();
         buffer.set_name(&buffer_name).await?;
         buffer.set_option("swapfile", false.into()).await?;
@@ -728,7 +731,7 @@ impl NeovimVadreWindow {
             ),
             (
                 "<localleader>tt",
-                &format!("<cmd>lua require('vadre.setup').toggle_single_thread()<CR>",),
+                &"<cmd>lua require('vadre.setup').toggle_single_thread()<CR>".to_string(),
             ),
             (
                 "<localleader>l",
@@ -939,7 +942,7 @@ pub(crate) async fn toggle_breakpoint_sign(
     neovim: &Neovim<Compat<Stdout>>,
     line_number: i64,
 ) -> Result<bool> {
-    let buffer_number_output = neovim.exec(&format!("echo bufnr()"), true).await?;
+    let buffer_number_output = neovim.exec("echo bufnr()", true).await?;
     let buffer_number = buffer_number_output.trim();
 
     if let Some(breakpoint_id) = line_is_breakpoint(neovim, buffer_number, line_number).await? {
@@ -978,8 +981,7 @@ pub(crate) async fn line_is_breakpoint(
         .await?;
 
     let signs_in_file_on_line = signs_in_file
-        .split("\n")
-        .into_iter()
+        .split('\n')
         .filter(|line| {
             line.contains("name=VadreSourceBreakpoint")
                 && line.contains(&format!("line={}", line_number))
@@ -988,9 +990,9 @@ pub(crate) async fn line_is_breakpoint(
 
     assert!(signs_in_file_on_line.len() <= 1);
 
-    if let Some(signs_in_file_on_line) = signs_in_file_on_line.get(0) {
+    if let Some(signs_in_file_on_line) = signs_in_file_on_line.first() {
         let mut breakpoint_id = 0;
-        for snippet in signs_in_file_on_line.split(" ") {
+        for snippet in signs_in_file_on_line.split(' ') {
             if snippet.len() >= 3 && &snippet[0..3] == "id=" {
                 breakpoint_id = snippet[3..]
                     .parse::<u64>()

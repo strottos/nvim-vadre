@@ -21,8 +21,8 @@ function setup_environment {
     }
 
     if (-not (Test-Path $plugins_dir/nui.nvim)) {
-        Write-Output "Installing nui.nvim to ${plugins_dir}/plenary.nvim"
-        git clone https://github.com/nvim-lua/nui.nvim "${plugins_dir}/plenary.nvim"
+        Write-Output "Installing nui.nvim to ${plugins_dir}/nui.nvim"
+        git clone https://github.com/MunifTanjim/nui.nvim "${plugins_dir}/nui.nvim"
         Write-Output "Installed nui.nvim"
     } else {
         Write-Output "nui.nvim already installed, updating"
@@ -36,7 +36,7 @@ function setup_environment {
     # If logging enabled spit the neovim logs out
     $env:NVIM_LOG_FILE="$(Get-Location)/nvim_log"
     $env:VADRE_LOG="trace"
-    $env:VADRE_LOG_FILE="$(Get-Location)/vadre_log"
+    $env:VADRE_LOG_FILE="$(Get-Location)/" + 'vadre_log.${datetime}'
 
     Write-Output "Done setup"
 }

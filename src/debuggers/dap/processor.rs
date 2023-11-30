@@ -137,11 +137,11 @@ impl DebuggerProcessor {
         &self,
         request_args: RequestArguments,
         response_sender: Option<oneshot::Sender<Response>>,
-    ) -> Result<()> {
-        let seq = self.seq_ids.fetch_add(1, Ordering::SeqCst);
+    ) -> Result<u32> {
+        let seq_id = self.seq_ids.fetch_add(1, Ordering::SeqCst);
 
         let message = ProtocolMessage {
-            seq: Either::First(seq),
+            seq: Either::First(seq_id),
             type_: ProtocolMessageType::Request(request_args),
         };
 
@@ -168,7 +168,7 @@ impl DebuggerProcessor {
                 };
 
                 if let ProtocolMessageType::Response(response) = response.type_ {
-                    if *response.request_seq.first() == seq {
+                    if *response.request_seq.first() == seq_id {
                         break response;
                     }
                 }
@@ -186,7 +186,7 @@ impl DebuggerProcessor {
             Ok(())
         });
 
-        Ok(())
+        Ok(seq_id)
     }
 
     pub(crate) async fn stop(&mut self) -> Result<()> {
@@ -379,9 +379,9 @@ impl DebuggerProcessor {
             + Unpin
             + 'static,
     {
-        let (debugger_sender_tx, debugger_sender_rx) = mpsc::channel(1);
+        let (debugger_sender_tx, debugger_sender_rx) = mpsc::channel(256);
         // Can theoretically get a lot of messages from the debugger.
-        let (debugger_receiver_tx, _debugger_receiver_rx) = broadcast::channel(20);
+        let (debugger_receiver_tx, _debugger_receiver_rx) = broadcast::channel(512);
 
         self.debugger_sender_tx = Some(debugger_sender_tx);
         self.debugger_receiver_tx = Some(debugger_receiver_tx.clone());

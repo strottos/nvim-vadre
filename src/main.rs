@@ -363,6 +363,8 @@ impl NeovimHandler {
             return Err("Can't do step, debugger not setup".into());
         }
 
+        tracing::trace!("Doing step, got lock");
+
         debugger
             .do_step(step_type, count)
             .await

@@ -10,7 +10,7 @@ use super::{
     debuggers::DapDebuggerType,
     processor::DebuggerProcessor,
     protocol::{
-        Breakpoint, BreakpointEventBody, ContinueArguments, Either, EventBody,
+        Breakpoint, BreakpointEventBody, CancelArguments, ContinueArguments, Either, EventBody,
         InitializeRequestArguments, NextArguments, PauseArguments, ProtocolMessage,
         ProtocolMessageType, RequestArguments, Response, ResponseBody, ResponseResult,
         RunInTerminalResponseBody, ScopesArguments, SetBreakpointsArguments, Source,
@@ -46,6 +46,8 @@ pub(crate) struct DebuggerHandler {
 
     terminal_spawned_tx: Option<oneshot::Sender<()>>,
     stopped_listener_tx: Option<oneshot::Sender<()>>,
+
+    source_reference_text: HashMap<i64, String>,
 }
 
 impl DebuggerHandler {
@@ -73,6 +75,8 @@ impl DebuggerHandler {
 
             terminal_spawned_tx: None,
             stopped_listener_tx: None,
+
+            source_reference_text: HashMap::new(),
         }
     }
 
@@ -252,10 +256,11 @@ impl DebuggerHandler {
                         .request_and_response(RequestArguments::threads(None))
                         .await?;
 
-                    if let ResponseResult::Success { ref body } = response_result {
-                        if let ResponseBody::threads(threads_body) = body {
-                            thread = threads_body.threads.iter().next().map(|thread| thread.id);
-                        }
+                    if let ResponseResult::Success {
+                        body: ResponseBody::threads(threads_body),
+                    } = response_result
+                    {
+                        thread = threads_body.threads.first().map(|thread| thread.id);
                     }
                 }
 
@@ -374,14 +379,11 @@ impl DebuggerHandler {
 
                 self.processor.send_msg(response).await?;
 
-                match self.terminal_spawned_tx.take() {
-                    Some(x) => {
-                        if let Err(_) = x.send(()) {
-                            bail!("Couldn't send terminal_spawned_tx");
-                        }
+                if let Some(x) = self.terminal_spawned_tx.take() {
+                    if x.send(()).is_err() {
+                        bail!("Couldn't send terminal_spawned_tx");
                     }
-                    None => {}
-                };
+                }
 
                 Ok(())
             }
@@ -438,7 +440,9 @@ impl DebuggerHandler {
                         }
                         self.display_output_info().await?;
                     }
-                    Err(_) => {}
+                    Err(e) => {
+                        bail!("Can't parse to integer: {}", e);
+                    }
                 }
             }
         } else if key == "enter" {
@@ -450,7 +454,9 @@ impl DebuggerHandler {
                         self.current_thread_id = Some(thread_id);
                         self.display_output_info().await?;
                     }
-                    Err(_) => {}
+                    Err(e) => {
+                        bail!("Can't parse to integer: {}", e);
+                    }
                 }
             }
         }
@@ -481,7 +487,7 @@ impl DebuggerHandler {
             // Surely never get a file with full path beginning with a space.
             if first_char != ' ' {
                 let found_file = line[0..line.len() - 1].to_string();
-                if &found_file == "" {
+                if found_file.is_empty() {
                     bail!("Can't find file in line: {:?}", file);
                 }
 
@@ -494,7 +500,7 @@ impl DebuggerHandler {
         let file =
             file.ok_or_else(|| anyhow!("Can't find file for breakpoint in lines: {:?}", lines))?;
 
-        let source_line = lines.iter().rev().next().ok_or_else(|| {
+        let source_line = lines.iter().next_back().ok_or_else(|| {
             anyhow!(
                 "Can't find source line for breakpoint in lines: {:?}",
                 lines
@@ -513,7 +519,7 @@ impl DebuggerHandler {
                 num.push(ch);
             }
 
-            if &num != "" && ch == ' ' {
+            if !num.is_empty() && ch == ' ' {
                 break;
             }
         }
@@ -562,90 +568,85 @@ impl DebuggerHandler {
                 .request_and_response(RequestArguments::threads(None))
                 .await?;
 
-            if let ResponseResult::Success { body } = response_result {
-                if let ResponseBody::threads(threads_body) = body {
-                    for thread in threads_body.threads {
-                        let thread_id = thread.id;
-                        let thread_name = &thread.name;
+            if let ResponseResult::Success {
+                body: ResponseBody::threads(threads_body),
+            } = response_result
+            {
+                for thread in threads_body.threads {
+                    let thread_id = thread.id;
+                    let thread_name = &thread.name;
 
-                        if current_thread_id == Some(thread_id) {
-                            call_stack_buffer_content
-                                .push(format!("{} - `{}` (*)", thread_id, thread_name));
-                        } else {
-                            call_stack_buffer_content
-                                .push(format!("{} - `{}`", thread_id, thread_name));
-                        }
+                    if current_thread_id == Some(thread_id) {
+                        call_stack_buffer_content
+                            .push(format!("{} - `{}` (*)", thread_id, thread_name));
+                    } else {
+                        call_stack_buffer_content
+                            .push(format!("{} - `{}`", thread_id, thread_name));
+                    }
 
-                        if self.stack_expanded_threads.contains(&thread_id) {
-                            let stack_trace_response = self
-                                .request_and_response(RequestArguments::stackTrace(
-                                    StackTraceArguments {
-                                        thread_id,
-                                        format: None,
-                                        levels: None,
-                                        start_frame: None,
-                                    },
-                                ))
-                                .await?;
+                    if self.stack_expanded_threads.contains(&thread_id) {
+                        let stack_trace_response = self
+                            .request_and_response(RequestArguments::stackTrace(
+                                StackTraceArguments {
+                                    thread_id,
+                                    format: None,
+                                    levels: None,
+                                    start_frame: None,
+                                },
+                            ))
+                            .await?;
 
-                            // Sometimes we don't get a body here as we get a message saying invalid thread,
-                            // normally when the thread is doing something in blocking.
-                            if let ResponseResult::Success { body } = stack_trace_response {
-                                if let ResponseBody::stackTrace(stack_trace_body) = body {
-                                    let frames = stack_trace_body.stack_frames;
+                        // Sometimes we don't get a body here as we get a message saying invalid thread,
+                        // normally when the thread is doing something in blocking.
+                        if let ResponseResult::Success {
+                            body: ResponseBody::stackTrace(stack_trace_body),
+                        } = stack_trace_response
+                        {
+                            let frames = stack_trace_body.stack_frames;
 
-                                    let top_frame = match frames.get(0) {
-                                        Some(frame) => frame,
-                                        None => {
-                                            call_stack_buffer_content
-                                                .push(format!("  (no frames)"));
-                                            continue;
-                                        }
-                                    };
-                                    let frame_id = top_frame.id;
-                                    self.current_frame_id = Some(frame_id);
+                            let top_frame = match frames.first() {
+                                Some(frame) => frame,
+                                None => {
+                                    call_stack_buffer_content.push("  (no frames)".to_string());
+                                    continue;
+                                }
+                            };
+                            let frame_id = top_frame.id;
+                            self.current_frame_id = Some(frame_id);
 
-                                    if current_output_window_type == VadreBufferType::Variables {
-                                        self.process_variables(frame_id).await?;
-                                    }
+                            if current_output_window_type == VadreBufferType::Variables {
+                                self.process_variables(frame_id).await?;
+                            }
 
-                                    if current_output_window_type == VadreBufferType::CallStack {
-                                        for frame in frames {
-                                            call_stack_buffer_content
-                                                .push(format!("+ {}", frame.name));
+                            if current_output_window_type == VadreBufferType::CallStack {
+                                for frame in frames {
+                                    call_stack_buffer_content.push(format!("+ {}", frame.name));
 
-                                            let line_number = frame.line;
-                                            let source =
-                                                frame.source.as_ref().ok_or_else(|| {
-                                                    anyhow!(
+                                    let line_number = frame.line;
+                                    let source = frame.source.as_ref().ok_or_else(|| {
+                                        anyhow!(
                                             "Couldn't get source from frame as expected: {:?}",
                                             frame
                                         )
-                                                })?;
-                                            if let Some(source_name) = &source.name {
-                                                if let Some(_) = source.path {
-                                                    call_stack_buffer_content.push(format!(
-                                                        "  - {}:{}",
-                                                        source_name, line_number
-                                                    ));
-                                                } else {
-                                                    call_stack_buffer_content.push(format!(
-                                                        "  - {}:{} (disassembled)",
-                                                        source_name, line_number
-                                                    ));
-                                                }
-                                            } else if let Some(source_path) = &source.path {
-                                                call_stack_buffer_content.push(format!(
-                                                    "  - {}:{}",
-                                                    source_path, line_number
-                                                ));
-                                            } else {
-                                                call_stack_buffer_content.push(format!(
-                                                    " - source not understood {:?}",
-                                                    source
-                                                ));
-                                            }
+                                    })?;
+                                    if let Some(source_name) = &source.name {
+                                        if source.path.is_some() {
+                                            call_stack_buffer_content.push(format!(
+                                                "  - {}:{}",
+                                                source_name, line_number
+                                            ));
+                                        } else {
+                                            call_stack_buffer_content.push(format!(
+                                                "  - {}:{} (disassembled)",
+                                                source_name, line_number
+                                            ));
                                         }
+                                    } else if let Some(source_path) = &source.path {
+                                        call_stack_buffer_content
+                                            .push(format!("  - {}:{}", source_path, line_number));
+                                    } else {
+                                        call_stack_buffer_content
+                                            .push(format!(" - source not understood {:?}", source));
                                     }
                                 }
                             }
@@ -687,7 +688,7 @@ impl DebuggerHandler {
         let source_breakpoints: Vec<SourceBreakpoint> = line_numbers
             .clone()
             .into_iter()
-            .map(|x| SourceBreakpoint::new(x))
+            .map(SourceBreakpoint::new)
             .collect::<Vec<SourceBreakpoint>>();
 
         let source = Source::new_file(file_name.clone(), file_path.clone());
@@ -701,39 +702,35 @@ impl DebuggerHandler {
             }))
             .await?;
 
-        if let ResponseResult::Success { body } = response_result {
-            if let ResponseBody::setBreakpoints(breakpoints_body) = body {
-                for (i, breakpoint_response) in breakpoints_body.breakpoints.into_iter().enumerate()
-                {
-                    let source_line_number = line_numbers
-                        .get(i)
-                        .ok_or_else(|| {
-                            anyhow!("Can't get {i}th line number from: {:?}", line_numbers)
-                        })?
-                        .clone();
+        if let ResponseResult::Success {
+            body: ResponseBody::setBreakpoints(breakpoints_body),
+        } = response_result
+        {
+            for (i, breakpoint_response) in breakpoints_body.breakpoints.into_iter().enumerate() {
+                let source_line_number = *line_numbers.get(i).ok_or_else(|| {
+                    anyhow!("Can't get {i}th line number from: {:?}", line_numbers)
+                })?;
 
-                    let breakpoint_is_resolved =
-                        self.breakpoint_is_resolved(&breakpoint_response)?;
+                let breakpoint_is_resolved = self.breakpoint_is_resolved(&breakpoint_response)?;
 
-                    if breakpoint_is_resolved {
-                        self.breakpoints
-                            .set_breakpoint_resolved(file_path.clone(), source_line_number)?;
-                    }
-
-                    if let Some(actual_line) = breakpoint_response.line {
-                        if let Some(breakpoint_id) = breakpoint_response.id {
-                            self.breakpoints.set_breakpoint_location(
-                                file_path.clone(),
-                                source_line_number,
-                                actual_line,
-                                breakpoint_id.to_string(),
-                            )?;
-                        }
-                    }
+                if breakpoint_is_resolved {
+                    self.breakpoints
+                        .set_breakpoint_resolved(file_path.clone(), source_line_number)?;
                 }
 
-                self.process_breakpoints_output().await?;
+                if let Some(actual_line) = breakpoint_response.line {
+                    if let Some(breakpoint_id) = breakpoint_response.id {
+                        self.breakpoints.set_breakpoint_location(
+                            file_path.clone(),
+                            source_line_number,
+                            actual_line,
+                            breakpoint_id.to_string(),
+                        )?;
+                    }
+                }
             }
+
+            self.process_breakpoints_output().await?;
         }
 
         Ok(())
@@ -748,7 +745,7 @@ impl DebuggerHandler {
 
         if let Some(listener_tx) = self.stopped_listener_tx.take() {
             // If we're here we're about to do more stepping so no need to do more
-            if let Err(_) = listener_tx.send(()) {
+            if listener_tx.send(()).is_err() {
                 tracing::error!("Couldn't send stopped_listener_tx");
                 self.neovim_vadre_window
                     .lock()
@@ -838,7 +835,7 @@ impl DebuggerHandler {
     }
 
     #[tracing::instrument]
-    async fn process_stopped(&self, thread_id: i64) -> Result<()> {
+    async fn process_stopped(&mut self, thread_id: i64) -> Result<()> {
         let stack_trace_response = self
             .request_and_response(RequestArguments::stackTrace(StackTraceArguments {
                 thread_id,
@@ -848,53 +845,76 @@ impl DebuggerHandler {
             }))
             .await?;
 
-        if let ResponseResult::Success { body } = stack_trace_response {
-            if let ResponseBody::stackTrace(stack_trace_body) = body {
-                let stack = stack_trace_body.stack_frames;
-                let current_frame = stack
-                    .get(0)
-                    .ok_or_else(|| anyhow!("stack should have a top frame: {:?}", stack))?;
-                let source = current_frame
-                    .source
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("stack should have a source: {:?}", current_frame))?;
-                let line_number = current_frame.line;
+        if let ResponseResult::Success {
+            body: ResponseBody::stackTrace(stack_trace_body),
+        } = stack_trace_response
+        {
+            let stack = stack_trace_body.stack_frames;
+            let current_frame = stack
+                .first()
+                .ok_or_else(|| anyhow!("stack should have a top frame: {:?}", stack))?;
+            let source = current_frame
+                .source
+                .as_ref()
+                .ok_or_else(|| anyhow!("stack should have a source: {:?}", current_frame))?;
+            let line_number = current_frame.line;
 
-                if let Some(source_file) = &source.path {
-                    self.neovim_vadre_window
-                        .lock()
-                        .await
-                        .set_code_buffer(
-                            CodeBufferContent::File(&source_file),
-                            line_number,
-                            &source_file,
-                            false,
+            if let Some(source_file) = &source.path {
+                self.neovim_vadre_window
+                    .lock()
+                    .await
+                    .set_code_buffer(
+                        CodeBufferContent::File(source_file),
+                        line_number,
+                        source_file,
+                        false,
+                    )
+                    .await?;
+            } else if let Some(source_reference_id) = source.source_reference {
+                // Sometimes these take ages, if so kill them, not worth hanging for ages
+                // for disassembled code.
+                if self
+                    .source_reference_text
+                    .get(&source_reference_id)
+                    .is_none()
+                {
+                    let source_reference_response = self
+                        .request_and_response_with_cancel_after_timeout(
+                            RequestArguments::source(SourceArguments {
+                                source: Some(source.clone()),
+                                source_reference: source_reference_id,
+                            }),
+                            Duration::new(2, 0),
                         )
                         .await?;
-                } else if let Some(source_reference_id) = source.source_reference {
-                    let source_reference_response = self
-                        .request_and_response(RequestArguments::source(SourceArguments {
-                            source: Some(source.clone()),
-                            source_reference: source_reference_id,
-                        }))
-                        .await?;
-                    if let ResponseResult::Success { body } = source_reference_response {
-                        if let ResponseBody::source(source_reference_body) = body {
-                            self.neovim_vadre_window
-                                .lock()
-                                .await
-                                .set_code_buffer(
-                                    CodeBufferContent::Content(source_reference_body.content),
-                                    line_number,
-                                    &format!("Disassembled Code {}", source_reference_id),
-                                    true,
-                                )
-                                .await?;
-                        }
+                    if let ResponseResult::Success {
+                        body: ResponseBody::source(source_reference_body),
+                    } = source_reference_response
+                    {
+                        self.source_reference_text
+                            .insert(source_reference_id, source_reference_body.content);
                     }
-                } else {
-                    bail!("Can't find any source to display");
                 }
+
+                match self.source_reference_text.get(&source_reference_id) {
+                    Some(text) => {
+                        self.neovim_vadre_window
+                            .lock()
+                            .await
+                            .set_code_buffer(
+                                CodeBufferContent::Content(text),
+                                line_number,
+                                &format!("Disassembled Code {}", source_reference_id),
+                                true,
+                            )
+                            .await?
+                    }
+                    None => {
+                        bail!("No text found for source reference id {source_reference_id}");
+                    }
+                }
+            } else {
+                bail!("Can't find any source to display");
             }
         }
 
@@ -911,44 +931,45 @@ impl DebuggerHandler {
             .request_and_response(RequestArguments::scopes(ScopesArguments { frame_id }))
             .await?;
 
-        if let ResponseResult::Success { body } = scopes_response_result {
-            if let ResponseBody::scopes(scopes_body) = body {
-                for scope in scopes_body.scopes {
-                    variable_content.push(format!("{}:", scope.name));
+        if let ResponseResult::Success {
+            body: ResponseBody::scopes(scopes_body),
+        } = scopes_response_result
+        {
+            for scope in scopes_body.scopes {
+                variable_content.push(format!("{}:", scope.name));
 
-                    let variables_response_result = self
-                        .request_and_response(RequestArguments::variables(VariablesArguments {
-                            count: None,
-                            filter: None,
-                            format: None,
-                            start: None,
-                            variables_reference: scope.variables_reference,
-                        }))
-                        .await?;
+                let variables_response_result = self
+                    .request_and_response(RequestArguments::variables(VariablesArguments {
+                        count: None,
+                        filter: None,
+                        format: None,
+                        start: None,
+                        variables_reference: scope.variables_reference,
+                    }))
+                    .await?;
 
-                    if let ResponseResult::Success { body } = variables_response_result {
-                        if let ResponseBody::variables(variables_body) = body {
-                            for variable in variables_body.variables {
-                                let name = variable.name;
-                                let value = variable.value;
+                if let ResponseResult::Success {
+                    body: ResponseBody::variables(variables_body),
+                } = variables_response_result
+                {
+                    for variable in variables_body.variables {
+                        let name = variable.name;
+                        let value = variable.value;
 
-                                if let Some(type_) = variable.type_ {
-                                    variable_content
-                                        .push(format!("+ ({}) {} = {:?}", type_, name, value));
-                                } else {
-                                    variable_content.push(format!("+ {} = {:?}", name, value));
-                                }
-                            }
+                        if let Some(type_) = variable.type_ {
+                            variable_content.push(format!("+ ({}) {} = {:?}", type_, name, value));
+                        } else {
+                            variable_content.push(format!("+ {} = {:?}", name, value));
                         }
                     }
                 }
-
-                self.neovim_vadre_window
-                    .lock()
-                    .await
-                    .set_variables_buffer(variable_content)
-                    .await?;
             }
+
+            self.neovim_vadre_window
+                .lock()
+                .await
+                .set_variables_buffer(variable_content)
+                .await?;
         }
 
         Ok(())
@@ -1007,7 +1028,7 @@ impl DebuggerHandler {
         &self,
         request_args: RequestArguments,
         tx: Option<oneshot::Sender<Response>>,
-    ) -> Result<()> {
+    ) -> Result<u32> {
         self.processor.request(request_args, tx).await
     }
 
@@ -1017,6 +1038,41 @@ impl DebuggerHandler {
         self.request(request_args, Some(tx)).await?;
 
         let response = rx.await?;
+
+        if !response.success {
+            bail!("Got unsuccessful response: {:?}", response);
+        }
+
+        Ok(response.result)
+    }
+
+    async fn request_and_response_with_cancel_after_timeout(
+        &self,
+        request_args: RequestArguments,
+        timeout_duration: Duration,
+    ) -> Result<ResponseResult> {
+        let (tx, rx) = oneshot::channel();
+
+        let request_id = self.request(request_args, Some(tx)).await?;
+
+        let response = match timeout(timeout_duration, rx).await {
+            Ok(response) => response?,
+            Err(e) => {
+                self.request(
+                    RequestArguments::cancel(CancelArguments {
+                        progress_id: None,
+                        request_id: Some(request_id as i64),
+                    }),
+                    None,
+                )
+                .await?;
+                bail!(
+                    "Timed out, sent cancellation for request {}: {:?}",
+                    request_id,
+                    e
+                );
+            }
+        };
 
         if !response.success {
             bail!("Got unsuccessful response: {:?}", response);

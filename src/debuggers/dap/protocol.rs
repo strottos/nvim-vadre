@@ -3,15 +3,16 @@
 #![allow(non_camel_case_types)]
 
 pub use super::schema::{
-    Breakpoint, BreakpointEventBody, Capabilities, CapabilitiesEventBody, ContinueArguments,
-    ContinueResponseBody, ContinuedEventBody, DisconnectArguments, ExitedEventBody,
-    InitializeRequestArguments, InvalidatedEventBody, ModuleEventBody, NextArguments,
-    OutputEventBody, PauseArguments, ProcessEventBody, RunInTerminalRequestArguments,
-    RunInTerminalResponseBody, ScopesArguments, ScopesResponseBody, SetBreakpointsArguments,
-    SetBreakpointsResponseBody, SetExceptionBreakpointsArguments, SetFunctionBreakpointsArguments,
-    Source, SourceArguments, SourceBreakpoint, SourceResponseBody, StackTraceArguments,
-    StackTraceResponseBody, StepInArguments, StoppedEventBody, TerminatedEventBody,
-    ThreadEventBody, ThreadsResponseBody, VariablesArguments, VariablesResponseBody,
+    Breakpoint, BreakpointEventBody, CancelArguments, Capabilities, CapabilitiesEventBody,
+    ContinueArguments, ContinueResponseBody, ContinuedEventBody, DisconnectArguments,
+    ExitedEventBody, InitializeRequestArguments, InvalidatedEventBody, ModuleEventBody,
+    NextArguments, OutputEventBody, PauseArguments, ProcessEventBody,
+    RunInTerminalRequestArguments, RunInTerminalResponseBody, ScopesArguments, ScopesResponseBody,
+    SetBreakpointsArguments, SetBreakpointsResponseBody, SetExceptionBreakpointsArguments,
+    SetFunctionBreakpointsArguments, Source, SourceArguments, SourceBreakpoint, SourceResponseBody,
+    StackTraceArguments, StackTraceResponseBody, StepInArguments, StoppedEventBody,
+    TerminatedEventBody, ThreadEventBody, ThreadsResponseBody, VariablesArguments,
+    VariablesResponseBody,
 };
 
 use std::{fmt::Write, io, str};
@@ -72,6 +73,7 @@ pub enum RequestArguments {
     initialize(InitializeRequestArguments),
     launch(serde_json::Value),
     attach(serde_json::Value),
+    cancel(CancelArguments),
     setBreakpoints(SetBreakpointsArguments),
     setFunctionBreakpoints(SetFunctionBreakpointsArguments),
     setExceptionBreakpoints(SetExceptionBreakpointsArguments),
