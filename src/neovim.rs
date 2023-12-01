@@ -538,16 +538,13 @@ impl NeovimVadreWindow {
             self.previous_buffer_hash = Some(content_hash);
         };
 
-        let pointer_sign_id = self.pointer_sign_id;
-        self.neovim
-            .exec(&format!("sign unplace {}", pointer_sign_id), false)
-            .await?;
+        self.unplace_code_pointer().await?;
 
         self.neovim
             .exec(
                 &format!(
                     "sign place {} line={} name=VadreDebugPointer buffer={}",
-                    pointer_sign_id,
+                    self.pointer_sign_id,
                     line_number,
                     code_buffer.get_number().await?,
                 ),
@@ -561,6 +558,13 @@ impl NeovimVadreWindow {
             .ok_or_else(|| anyhow!("Can't find Code window"))?;
         code_window.set_cursor((line_number, 0)).await?;
 
+        Ok(())
+    }
+
+    pub(crate) async fn unplace_code_pointer(&self) -> Result<()> {
+        self.neovim
+            .exec(&format!("sign unplace {}", self.pointer_sign_id), false)
+            .await?;
         Ok(())
     }
 

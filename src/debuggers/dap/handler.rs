@@ -182,6 +182,13 @@ impl DebuggerHandler {
     }
 
     pub(crate) async fn do_step(&mut self, step_type: DebuggerStepType, count: u64) -> Result<()> {
+        // Will be placed again when stopped again, but we're about to move so let people know
+        self.neovim_vadre_window
+            .lock()
+            .await
+            .unplace_code_pointer()
+            .await?;
+
         let thread_id = match self.current_thread_id {
             Some(thread_id) => thread_id,
             None => {
