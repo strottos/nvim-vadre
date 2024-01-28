@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Result};
 use nvim_rs::{compat::tokio::Compat, Buffer, Neovim, Value, Window};
-use tokio::io::Stdout;
+use tokio::fs::File as TokioFile;
 
 // Arbitrary number so no clashes with other plugins (hopefully)
 // TODO: Find a better solution (looked into a few times and not sure current neovim API supports
@@ -214,17 +214,17 @@ impl Display for VadreOutputBufferSelector {
 
 #[derive(Clone)]
 pub(crate) struct NeovimVadreWindow {
-    neovim: Neovim<Compat<Stdout>>,
+    neovim: Neovim<Compat<TokioFile>>,
     instance_id: usize,
     current_output: VadreBufferType,
-    windows: HashMap<VadreWindowType, Window<Compat<Stdout>>>,
-    buffers: HashMap<VadreBufferType, Buffer<Compat<Stdout>>>,
+    windows: HashMap<VadreWindowType, Window<Compat<TokioFile>>>,
+    buffers: HashMap<VadreBufferType, Buffer<Compat<TokioFile>>>,
     pointer_sign_id: usize,
     previous_buffer_hash: Option<u64>,
 }
 
 impl NeovimVadreWindow {
-    pub(crate) fn new(neovim: Neovim<Compat<Stdout>>, instance_id: usize) -> Self {
+    pub(crate) fn new(neovim: Neovim<Compat<TokioFile>>, instance_id: usize) -> Self {
         Self {
             neovim,
             instance_id,
@@ -641,7 +641,7 @@ impl NeovimVadreWindow {
 
     async fn write_to_buffer(
         &self,
-        buffer: &Buffer<Compat<Stdout>>,
+        buffer: &Buffer<Compat<TokioFile>>,
         start_line: i64,
         mut end_line: i64,
         msgs: Vec<String>,
@@ -670,7 +670,7 @@ impl NeovimVadreWindow {
 
     async fn set_vadre_buffer_options(
         &self,
-        buffer: &Buffer<Compat<Stdout>>,
+        buffer: &Buffer<Compat<TokioFile>>,
         buffer_type: &VadreBufferType,
     ) -> Result<()> {
         let buffer_name = self.get_buffer_name(buffer_type, None);
@@ -705,7 +705,7 @@ impl NeovimVadreWindow {
 
     async fn set_vadre_debugger_keys_for_buffer(
         &self,
-        buffer: &Buffer<Compat<Stdout>>,
+        buffer: &Buffer<Compat<TokioFile>>,
     ) -> Result<()> {
         // TODO: Configurable?
         for (key, action) in vec![
@@ -845,7 +845,7 @@ impl NeovimVadreWindow {
     }
 }
 
-pub(crate) async fn setup_signs(neovim: &Neovim<Compat<Stdout>>) -> Result<()> {
+pub(crate) async fn setup_signs(neovim: &Neovim<Compat<TokioFile>>) -> Result<()> {
     let sign_background_colour_output = neovim
         .get_hl(0.into(), vec![("name".into(), "SignColumn".into())])
         .await?;
@@ -943,7 +943,7 @@ pub(crate) async fn setup_signs(neovim: &Neovim<Compat<Stdout>>) -> Result<()> {
 }
 
 pub(crate) async fn toggle_breakpoint_sign(
-    neovim: &Neovim<Compat<Stdout>>,
+    neovim: &Neovim<Compat<TokioFile>>,
     line_number: i64,
 ) -> Result<bool> {
     let buffer_number_output = neovim.exec("echo bufnr()", true).await?;
@@ -976,7 +976,7 @@ pub(crate) async fn toggle_breakpoint_sign(
 }
 
 pub(crate) async fn line_is_breakpoint(
-    neovim: &Neovim<Compat<Stdout>>,
+    neovim: &Neovim<Compat<TokioFile>>,
     buffer_number: &str,
     line_number: i64,
 ) -> Result<Option<u64>> {

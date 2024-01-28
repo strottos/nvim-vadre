@@ -12,7 +12,7 @@ pub(crate) use debugger::Debugger;
 use anyhow::{bail, Result};
 use nvim_rs::{compat::tokio::Compat, Neovim};
 use tokio::{
-    io::Stdout,
+    fs::File as TokioFile,
     sync::{Mutex, RwLock},
     time::Instant,
 };
@@ -69,7 +69,7 @@ impl RequestTimeout {
 pub(crate) fn new_debugger(
     id: usize,
     debug_program_string: String,
-    neovim: Neovim<Compat<Stdout>>,
+    neovim: Neovim<Compat<TokioFile>>,
     debugger_type: String,
     breakpoints: Breakpoints,
 ) -> Result<Box<Debugger>> {

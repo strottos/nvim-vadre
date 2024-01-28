@@ -16,7 +16,7 @@ futures = "*"
 indexmap = "2.1.0"
 is_executable = "*"
 lazy_static = "*"
-nvim-rs = { version = "*", features = ["use_tokio"] }
+nvim-rs = { git = "https://github.com/KillTheMule/nvim-rs", branch = "nobufw", features = ["use_tokio"] }
 reqwest = "*"
 schemafy = "*"
 serde = { version = "*", features = ["derive"] }
@@ -39,3 +39,4 @@ rmp           = "*"
 rmpv          = "*"
 serde         = "*"
 serde_derive  = "*"
+pty-process   = { version = "*", features = ["async"] }

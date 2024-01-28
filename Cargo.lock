@@ -1201,9 +1201,8 @@ dependencies = [
 
 [[package]]
 name = "nvim-rs"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9156b04d79079937abae1eb912669c48c360fb5d86138052a9bbae9c5220a71e"
+version = "0.6.0-pre"
+source = "git+https://github.com/KillTheMule/nvim-rs?branch=nobufw#7ea91dc3983c9dd5fd8c3f229f79630d0637505d"
 dependencies = [
  "async-trait",
  "futures 0.3.28",
@@ -1213,6 +1212,7 @@ dependencies = [
  "rmpv",
  "tokio",
  "tokio-util",
+ "winapi",
 ]
 
 [[package]]
@@ -1236,6 +1236,7 @@ dependencies = [
  "is_executable",
  "lazy_static",
  "nvim-rs",
+ "pty-process",
  "reqwest",
  "rmp",
  "rmpv",
@@ -1454,6 +1455,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "134c189feb4956b20f6f547d2cf727d4c0fe06722b20a0eec87ed445a97f92da"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "pty-process"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8749b545e244c90bf74a5767764cc2194f1888bb42f84015486a64c82bea5cc0"
+dependencies = [
+ "libc",
+ "rustix",
+ "tokio",
 ]
 
 [[package]]
@@ -1682,6 +1694,7 @@ checksum = "745ecfa778e66b2b63c88a61cb36e0eea109e803b0b86bf9879fbc77c70e86ed"
 dependencies = [
  "bitflags 2.4.0",
  "errno",
+ "itoa",
  "libc",
  "linux-raw-sys",
  "windows-sys",

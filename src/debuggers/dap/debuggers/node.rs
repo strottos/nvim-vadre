@@ -20,7 +20,8 @@ use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use nvim_rs::{compat::tokio::Compat, Neovim};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Stdout},
+    fs::File as TokioFile,
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
     process::{Child, Command},
     sync::{mpsc, oneshot, Mutex},
@@ -225,7 +226,7 @@ impl Debugger {
         id: usize,
         command: String,
         command_args: Vec<String>,
-        neovim: Neovim<Compat<Stdout>>,
+        neovim: Neovim<Compat<TokioFile>>,
         _log_debugger: bool,
     ) -> Self {
         let (debugger_sender_tx, debugger_sender_rx) = mpsc::channel(1);

@@ -27,7 +27,7 @@ use async_trait::async_trait;
 use clap::Parser;
 use nvim_rs::{compat::tokio::Compat, create::tokio as create, Handler, Neovim, Value};
 use tokio::{
-    io::Stdout,
+    fs::File as TokioFile,
     sync::{Mutex, MutexGuard},
     time::timeout,
 };
@@ -81,7 +81,11 @@ impl NeovimHandler {
     }
 
     #[tracing::instrument(skip(self, neovim))]
-    async fn launch(&self, mut args: Vec<String>, neovim: Neovim<Compat<Stdout>>) -> VadreResult {
+    async fn launch(
+        &self,
+        mut args: Vec<String>,
+        neovim: Neovim<Compat<TokioFile>>,
+    ) -> VadreResult {
         if args.len() == 0 {
             tracing::debug!("Launching Vadre create Debugger UI");
 
@@ -161,7 +165,7 @@ impl NeovimHandler {
             async fn report_error(
                 msg: &str,
                 debugger: MutexGuard<'_, Box<Debugger>>,
-                neovim: Neovim<Compat<Stdout>>,
+                neovim: Neovim<Compat<TokioFile>>,
             ) -> anyhow::Result<()> {
                 tracing::error!("{}", msg);
                 if let Err(log_err) = debugger.log_msg(VadreLogLevel::CRITICAL, &msg).await {
@@ -226,7 +230,7 @@ impl NeovimHandler {
     }
 
     #[tracing::instrument(skip(self, neovim))]
-    async fn breakpoint(&self, neovim: Neovim<Compat<Stdout>>) -> VadreResult {
+    async fn breakpoint(&self, neovim: Neovim<Compat<TokioFile>>) -> VadreResult {
         let cursor_position = neovim
             .get_current_win()
             .await
@@ -506,7 +510,7 @@ impl NeovimHandler {
 
 #[async_trait]
 impl Handler for NeovimHandler {
-    type Writer = Compat<Stdout>;
+    type Writer = Compat<TokioFile>;
 
     // This function is either responsible for anything trivial (< 1 line) or handing requests
     // to their appropriate handlers.
@@ -517,7 +521,7 @@ impl Handler for NeovimHandler {
         &self,
         name: String,
         args: Vec<Value>,
-        neovim: Neovim<Compat<Stdout>>,
+        neovim: Neovim<Compat<TokioFile>>,
     ) -> VadreResult {
         tracing::debug!("Handling request: {} {:?}", name, args);
         match name.as_ref() {
@@ -676,7 +680,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Loading VADRE plugin");
     let handler: NeovimHandler = NeovimHandler::new();
-    let (neovim, io_handler) = create::new_parent(handler).await;
+    let (neovim, io_handler) = create::new_parent(handler).await?;
 
     crate::neovim::setup_signs(&neovim).await?;
 
