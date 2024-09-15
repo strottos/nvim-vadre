@@ -140,7 +140,7 @@ impl NeovimHandler {
             debugger_type
         );
 
-        let mut command_args = args.command_args.join(" ");
+        let mut command_args = args.command_args.clone();
 
         if let Some(file) = args.file_args {
             for line in fs::read_to_string(file)
@@ -148,7 +148,7 @@ impl NeovimHandler {
                 .map_err(|e| format!("Couldn't get args file: {e}"))?
                 .split("\n")
             {
-                command_args.push_str(&line);
+                command_args.push(line.to_string());
             }
         }
 
@@ -156,7 +156,7 @@ impl NeovimHandler {
 
         let debugger = match debuggers::new_debugger(
             instance_id,
-            command_args.clone(),
+            command_args.join(" "),
             neovim.clone(),
             debugger_type.clone(),
             pending_breakpoints,
@@ -197,7 +197,7 @@ impl NeovimHandler {
             match timeout(
                 Duration::new(args.launch_timeout, 0),
                 debugger_lock.setup(
-                    args.command_args,
+                    command_args.clone(),
                     environment_variables,
                     args.debugger_port,
                     args.attach,
@@ -229,7 +229,7 @@ impl NeovimHandler {
             neovim
                 .set_var(
                     &format!(r#"vadre_last_command_{}"#, debugger_type),
-                    command_args.into(),
+                    command_args.join(" ").into(),
                 )
                 .await
                 .unwrap_or_else(|e| {

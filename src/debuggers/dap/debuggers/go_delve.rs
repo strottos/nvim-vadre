@@ -23,7 +23,7 @@ use tokio::{
 use tracing::debug;
 use which::which;
 
-const VERSION: &str = "1.22.1";
+const VERSION: &str = "1.23.0";
 
 #[derive(Clone)]
 pub struct Debugger {
