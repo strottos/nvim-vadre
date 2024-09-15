@@ -27,7 +27,7 @@ use async_trait::async_trait;
 use clap::Parser;
 use nvim_rs::{compat::tokio::Compat, create::tokio as create, Handler, Neovim, Value};
 use tokio::{
-    fs::File as TokioFile,
+    fs::{self, File as TokioFile},
     sync::{Mutex, MutexGuard},
     time::timeout,
 };
@@ -49,6 +49,9 @@ struct LaunchArgs {
 
     #[arg(short = 'a', long)]
     attach: Option<i64>,
+
+    #[arg(short = 'f', long)]
+    file_args: Option<String>,
 
     #[arg(short = 'd', long)]
     dap_command: Option<String>,
@@ -137,7 +140,17 @@ impl NeovimHandler {
             debugger_type
         );
 
-        let command_args = args.command_args.join(" ");
+        let mut command_args = args.command_args.join(" ");
+
+        if let Some(file) = args.file_args {
+            for line in fs::read_to_string(file)
+                .await
+                .map_err(|e| format!("Couldn't get args file: {e}"))?
+                .split("\n")
+            {
+                command_args.push_str(&line);
+            }
+        }
 
         let pending_breakpoints = self.pending_breakpoints.lock().await.clone();
 

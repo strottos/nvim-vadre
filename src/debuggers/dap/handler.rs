@@ -802,23 +802,22 @@ impl DebuggerHandler {
             let breakpoint_is_resolved =
                 self.breakpoint_is_resolved(&breakpoint_event.breakpoint)?;
 
-            let (file_path, source_line_number) = self
-                .breakpoints
-                .get_breakpoint_for_id(&breakpoint_id)
-                .ok_or_else(|| anyhow!("Can't find breakpoint for id {}", breakpoint_id))?;
+            if let Some((file_path, source_line_number)) =
+                self.breakpoints.get_breakpoint_for_id(&breakpoint_id)
+            {
+                if breakpoint_is_resolved {
+                    self.breakpoints
+                        .set_breakpoint_resolved(file_path.clone(), source_line_number)?;
+                }
 
-            if breakpoint_is_resolved {
-                self.breakpoints
-                    .set_breakpoint_resolved(file_path.clone(), source_line_number)?;
-            }
-
-            if let Some(actual_line) = breakpoint_event.breakpoint.line {
-                self.breakpoints.set_breakpoint_location(
-                    file_path.clone(),
-                    source_line_number,
-                    actual_line,
-                    breakpoint_id.to_string(),
-                )?;
+                if let Some(actual_line) = breakpoint_event.breakpoint.line {
+                    self.breakpoints.set_breakpoint_location(
+                        file_path.clone(),
+                        source_line_number,
+                        actual_line,
+                        breakpoint_id.to_string(),
+                    )?;
+                }
             }
         }
 

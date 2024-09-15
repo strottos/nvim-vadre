@@ -540,7 +540,8 @@ impl NeovimVadreWindow {
 
         self.unplace_code_pointer().await?;
 
-        self.neovim
+        if let Err(e) = self
+            .neovim
             .exec(
                 &format!(
                     "sign place {} line={} name=VadreDebugPointer buffer={}",
@@ -550,7 +551,12 @@ impl NeovimVadreWindow {
                 ),
                 false,
             )
-            .await?;
+            .await
+        {
+            tracing::error!("Can't place pointer: {:?}", e);
+            self.log_msg(VadreLogLevel::ERROR, "Failed to place pointer")
+                .await?;
+        }
 
         let code_window = self
             .windows
