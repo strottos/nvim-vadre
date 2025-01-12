@@ -4,15 +4,15 @@
 
 pub use super::schema::{
     Breakpoint, BreakpointEventBody, CancelArguments, Capabilities, CapabilitiesEventBody,
-    ContinueArguments, ContinueResponseBody, ContinuedEventBody, ExitedEventBody,
-    InitializeRequest, InitializeRequestArguments, InitializeResponse, InvalidatedEventBody,
-    LaunchRequestArguments, ModuleEventBody, NextArguments, OutputEventBody, PauseArguments,
-    ProcessEventBody, RunInTerminalRequestArguments, RunInTerminalResponseBody, ScopesArguments,
-    ScopesResponseBody, SetBreakpointsArguments, SetBreakpointsResponseBody,
-    SetExceptionBreakpointsArguments, SetFunctionBreakpointsArguments, Source, SourceArguments,
-    SourceBreakpoint, SourceResponseBody, StackTraceArguments, StackTraceResponseBody,
-    StepInArguments, StoppedEventBody, TerminatedEventBody, ThreadEventBody, ThreadsResponseBody,
-    VariablesArguments, VariablesResponseBody,
+    ContinueArguments, ContinueResponseBody, ContinuedEventBody, DisconnectArguments,
+    ExitedEventBody, InitializeRequestArguments, InvalidatedEventBody, ModuleEventBody,
+    NextArguments, OutputEventBody, PauseArguments, ProcessEventBody,
+    RunInTerminalRequestArguments, RunInTerminalResponseBody, ScopesArguments, ScopesResponseBody,
+    SetBreakpointsArguments, SetBreakpointsResponseBody, SetExceptionBreakpointsArguments,
+    SetFunctionBreakpointsArguments, Source, SourceArguments, SourceBreakpoint, SourceResponseBody,
+    StackTraceArguments, StackTraceResponseBody, StepInArguments, StoppedEventBody,
+    TerminatedEventBody, ThreadEventBody, ThreadsResponseBody, VariablesArguments,
+    VariablesResponseBody,
 };
 
 use std::{fmt::Write, io, str};
@@ -71,7 +71,9 @@ pub enum ProtocolMessageType {
 #[serde(tag = "command", content = "arguments")]
 pub enum RequestArguments {
     initialize(InitializeRequestArguments),
-    launch(Either<LaunchRequestArguments, serde_json::Value>),
+    launch(serde_json::Value),
+    attach(serde_json::Value),
+    cancel(CancelArguments),
     setBreakpoints(SetBreakpointsArguments),
     setFunctionBreakpoints(SetFunctionBreakpointsArguments),
     setExceptionBreakpoints(SetExceptionBreakpointsArguments),
@@ -86,6 +88,7 @@ pub enum RequestArguments {
     scopes(ScopesArguments),
     source(SourceArguments),
     variables(VariablesArguments),
+    disconnect(DisconnectArguments),
     // Reverse
     runInTerminal(RunInTerminalRequestArguments),
     #[serde(other)]
@@ -120,6 +123,7 @@ pub enum ResponseResult {
 pub enum ResponseBody {
     initialize(Capabilities),
     launch(Option<Empty>),
+    attach(Option<Empty>),
     setBreakpoints(SetBreakpointsResponseBody),
     setFunctionBreakpoints(SetBreakpointsResponseBody),
     setExceptionBreakpoints(Option<Empty>),
@@ -134,6 +138,7 @@ pub enum ResponseBody {
     scopes(ScopesResponseBody),
     source(SourceResponseBody),
     variables(VariablesResponseBody),
+    disconnect(Option<Empty>),
     // Reverse
     runInTerminal(RunInTerminalResponseBody),
 }
@@ -218,7 +223,13 @@ impl codec::Decoder for DAPCodec {
                         self.state = State::ReadingHeaders;
                         self.content_len = 0;
 
-                        debug!("<-- {}", str::from_utf8(&message_bytes).unwrap());
+                        debug!(
+                            "<-- {}",
+                            str::from_utf8(&message_bytes).map_err(|e| io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("{:?}", e)
+                            ))?
+                        );
                         match serde_json::from_slice(&message_bytes) {
                             Ok(message) => return Ok(Some(Ok(message))),
                             Err(error) => {
@@ -245,11 +256,16 @@ impl codec::Encoder<ProtocolMessage> for DAPCodec {
         buffer: &mut BytesMut,
     ) -> Result<(), Self::Error> {
         tracing::trace!("encoding {:?} {:?}", message, buffer);
-        let message_bytes = serde_json::to_vec(&message).unwrap();
-        debug!("--> {}", str::from_utf8(&message_bytes).unwrap());
+        let message_bytes = serde_json::to_vec(&message)?;
+        debug!(
+            "--> {}",
+            str::from_utf8(&message_bytes)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{:?}", e)))?
+        );
 
         buffer.reserve(32 + message_bytes.len());
-        write!(buffer, "Content-Length: {}\r\n\r\n", message_bytes.len()).unwrap();
+        write!(buffer, "Content-Length: {}\r\n\r\n", message_bytes.len())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{:?}", e)))?;
         buffer.extend_from_slice(&message_bytes);
 
         Ok(())
@@ -275,7 +291,7 @@ mod tests {
         assert_matches!(
             request,
             ProtocolMessage {
-                seq: 1,
+                seq: Either::First(1),
                 type_: ProtocolMessageType::Request(RequestArguments::initialize(..))
             }
         );
@@ -284,7 +300,7 @@ mod tests {
         assert_matches!(
             response,
             ProtocolMessage {
-                seq: 2,
+                seq: Either::First(2),
                 type_: ProtocolMessageType::Response(Response {
                     result: ResponseResult::Success {
                         body: ResponseBody::initialize(..)
@@ -311,7 +327,7 @@ mod tests {
         assert_matches!(
             request,
             ProtocolMessage {
-                seq: 2,
+                seq: Either::First(2),
                 type_: ProtocolMessageType::Request(RequestArguments::launch(..))
             }
         );
@@ -321,10 +337,10 @@ mod tests {
         assert_matches!(
             response,
             ProtocolMessage {
-                seq: 3,
+                seq: Either::First(3),
                 type_: ProtocolMessageType::Response(Response {
                     result: ResponseResult::Success {
-                        body: ResponseBody::launch,
+                        body: ResponseBody::launch(..),
                     },
                     ..
                 })
@@ -338,8 +354,8 @@ mod tests {
         assert_matches!(
             event,
             ProtocolMessage {
-                seq: 0,
-                type_: ProtocolMessageType::Event(EventBody::initialized)
+                seq: Either::First(0),
+                type_: ProtocolMessageType::Event(EventBody::initialized(..))
             }
         );
 
@@ -347,7 +363,7 @@ mod tests {
         assert_matches!(
             event,
             ProtocolMessage {
-                seq: 0,
+                seq: Either::First(0),
                 type_: ProtocolMessageType::Event(EventBody::thread(..))
             }
         );
@@ -361,7 +377,7 @@ mod tests {
         assert_matches!(
             request,
             ProtocolMessage {
-                seq: 12,
+                seq: Either::First(12),
                 type_: ProtocolMessageType::Request(RequestArguments::scopes(..)),
             }
         );
@@ -370,9 +386,9 @@ mod tests {
         assert_matches!(
             response,
             ProtocolMessage {
-                seq: 34,
+                seq: Either::First(34),
                 type_: ProtocolMessageType::Response(Response {
-                    request_seq: 12,
+                    request_seq: Either::First(12),
                     success: true,
                     result: ResponseResult::Success {
                         body: ResponseBody::scopes(..),
@@ -390,7 +406,7 @@ mod tests {
         assert_matches!(
             request,
             ProtocolMessage {
-                seq: 12,
+                seq: Either::First(12),
                 type_: ProtocolMessageType::Request(RequestArguments::configurationDone(None)),
             }
         );
@@ -401,7 +417,7 @@ mod tests {
         assert_matches!(
             request,
             ProtocolMessage {
-                seq: 12,
+                seq: Either::First(12),
                 type_: ProtocolMessageType::Request(RequestArguments::configurationDone(Some(_)))
             }
         );
@@ -435,7 +451,7 @@ mod tests {
         assert_matches!(
             request,
             ProtocolMessage {
-                seq: 12,
+                seq: Either::First(12),
                 type_: ProtocolMessageType::Request(RequestArguments::unknown)
             }
         );

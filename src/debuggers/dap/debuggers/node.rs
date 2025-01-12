@@ -20,7 +20,8 @@ use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use nvim_rs::{compat::tokio::Compat, Neovim};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Stdout},
+    fs::File as TokioFile,
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
     process::{Child, Command},
     sync::{mpsc, oneshot, Mutex},
@@ -115,7 +116,7 @@ impl DebuggerAPI for Debugger {
         let ws_url = match existing_debugger_location {
             Some(ws_url) => ws_url,
             None => {
-                let port = get_unused_localhost_port();
+                let port = get_unused_localhost_port()?;
 
                 match self.launch(port).await {
                     Ok(ws_url) => ws_url,
@@ -225,7 +226,7 @@ impl Debugger {
         id: usize,
         command: String,
         command_args: Vec<String>,
-        neovim: Neovim<Compat<Stdout>>,
+        neovim: Neovim<Compat<TokioFile>>,
         _log_debugger: bool,
     ) -> Self {
         let (debugger_sender_tx, debugger_sender_rx) = mpsc::channel(1);
@@ -531,7 +532,7 @@ impl Debugger {
                             .expect("Can log to vim");
                     }
                     "Debugger.scriptParsed" => {
-                        Debugger::analyse_script_parsed(
+                        Debugger::analyze_script_parsed(
                             event,
                             pending_breakpoints,
                             debugger_sender_tx,
@@ -550,7 +551,7 @@ impl Debugger {
                                 data,
                             )
                             .await
-                            .expect("Can analyse pausing debugger");
+                            .expect("Can analyze pausing debugger");
                         });
                     }
                     "Debugger.resumed" => {}
@@ -579,7 +580,7 @@ impl Debugger {
         neovim_vadre_window,
         data
     ))]
-    async fn analyse_script_parsed(
+    async fn analyze_script_parsed(
         event: serde_json::Value,
         pending_breakpoints: Arc<Mutex<HashMap<String, HashSet<i64>>>>,
         debugger_sender_tx: mpsc::Sender<(

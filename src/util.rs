@@ -1,87 +1,11 @@
-use std::{env, net::TcpListener, path::PathBuf};
+use std::{
+    env, io,
+    net::TcpListener,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Result;
-
-// A helper macro to check if a result errored and return early if so. Prevents having to write
-// this kind of code all over the place:
-// ```
-// if let Err(e) = self.tcp_connect(port).await {
-//     return Err(format!("Error creating TCP connection to process: {}", e).into());
-// };
-// ```
-macro_rules! ret_err {
-    ($e:expr) => {
-        if let Err(e) = $e {
-            bail!("Generic error: {}", e);
-        }
-    };
-    ($e:expr, $msg:expr) => {
-        if let Err(e) = $e {
-            bail!("{}: {}", $msg, e);
-        }
-    };
-}
-pub(crate) use ret_err;
-
-// A helper macro to check if a result errored and return early if so and logs the error to Vadre
-// Log window.
-macro_rules! log_err {
-    ($e:expr, $logger:expr) => {
-        if let Err(e) = $e {
-            let msg = format!("Generic error: {}", e);
-            tracing::error!("{}", msg);
-            $logger
-                .lock()
-                .await
-                .log_msg(VadreLogLevel::ERROR, &msg)
-                .await
-                .expect("logs should be logged");
-        }
-    };
-    ($e:expr, $logger:expr, $msg:expr) => {
-        if let Err(e) = $e {
-            let msg = format!("{}: {}", $msg, e);
-            tracing::error!("{}", msg);
-            $logger
-                .lock()
-                .await
-                .log_msg(VadreLogLevel::ERROR, &msg)
-                .await
-                .expect("logs should be logged");
-        }
-    };
-}
-pub(crate) use log_err;
-
-// A helper macro to check if a result errored and return early if so and logs the error to Vadre
-// Log window.
-macro_rules! log_ret_err {
-    ($e:expr, $logger:expr) => {
-        if let Err(e) = $e {
-            let msg = format!("Generic error: {}", e);
-            ret_err!(
-                $logger
-                    .lock()
-                    .await
-                    .log_msg(VadreLogLevel::ERROR, &msg)
-                    .await
-            );
-        }
-    };
-    ($e:expr, $logger:expr, $msg:expr) => {
-        if let Err(e) = $e {
-            let msg = format!("{}: {}", $msg, e);
-            ret_err!(
-                $logger
-                    .lock()
-                    .await
-                    .log_msg(VadreLogLevel::ERROR, &msg)
-                    .await
-            );
-        }
-    };
-}
-pub(crate) use log_ret_err;
+use reqwest::Url;
 
 fn get_root_dir() -> Result<PathBuf> {
     let mut path = env::current_exe()?;
@@ -99,9 +23,9 @@ pub fn get_debuggers_dir() -> Result<PathBuf> {
 
 /// Get an unused port on the local system and return it. This port
 /// can subsequently be used.
-pub fn get_unused_localhost_port() -> u16 {
-    let listener = TcpListener::bind(format!("127.0.0.1:0")).unwrap();
-    listener.local_addr().unwrap().port()
+pub fn get_unused_localhost_port() -> Result<u16> {
+    let listener = TcpListener::bind(format!("127.0.0.1:0"))?;
+    Ok(listener.local_addr()?.port())
 }
 
 /// Translate the current machines os and arch to that required for downloading debugger adapters
@@ -137,4 +61,20 @@ pub(crate) fn merge_json(a: &mut serde_json::Value, b: serde_json::Value) {
     }
 
     *a = b;
+}
+
+// We just make this synchronous because although it slows things down, it makes it much
+// easier to do. If anyone wants to make this async and cool be my guest but it seems not
+// easy.
+#[tracing::instrument(skip(url))]
+pub(crate) async fn download_extract_zip(full_path: &Path, url: Url) -> Result<()> {
+    tracing::trace!("Downloading {} and unzipping to {:?}", url, full_path);
+    let zip_contents = reqwest::get(url).await?.bytes().await?;
+
+    let reader = io::Cursor::new(zip_contents);
+    let mut zip = zip::ZipArchive::new(reader)?;
+
+    zip.extract(full_path)?;
+
+    Ok(())
 }

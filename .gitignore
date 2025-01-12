@@ -7,3 +7,11 @@
 
 # Third party stuff
 /debuggers/
+/test_files/site
+
+# Logs
+nvim_log
+vadre_log
+
+# Lua stuff
+.luarc.json

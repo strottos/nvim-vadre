@@ -21,6 +21,8 @@ impl InitializeRequestArguments {
             supports_run_in_terminal_request: Some(true),
             supports_variable_type: Some(true),
             supports_variable_paging: Some(false),
+            supports_args_can_be_interpreted_by_shell: Some(false),
+            supports_start_debugging_request: Some(false),
         }
     }
 }
