@@ -20,7 +20,7 @@ use crate::{
     util::{download_extract_zip, get_debuggers_dir, get_os_and_cpu_architecture},
 };
 
-const VERSION: &str = "1.11.5";
+const VERSION: &str = "1.11.0";
 
 #[derive(Clone)]
 pub(crate) struct Debugger {
