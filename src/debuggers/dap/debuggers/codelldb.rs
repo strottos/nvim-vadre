@@ -54,7 +54,9 @@ impl Debugger {
             let url = Url::parse(&format!(
                 "https://github.com/vadimcn/vscode-lldb/releases/download/v{}\
                                  /codelldb-{}-{}.vsix",
-                VERSION, arch, os
+                VERSION,
+                os,
+                arch.replace("x86_64", "x64")
             ))?;
 
             download_extract_zip(path.as_path(), url).await?;
