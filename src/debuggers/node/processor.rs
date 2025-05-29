@@ -331,7 +331,7 @@ impl DebuggerProcessor {
                     }
                     Some(msg) = debugger_sender_rx.recv() => {
                         tracing::trace!("Sending message: {}", msg);
-                        let msg = WsMessage::Text(msg.to_string());
+                        let msg = WsMessage::Text(msg.to_string().into());
                         ws_stream.send(msg).await?;
                     }
                 }
